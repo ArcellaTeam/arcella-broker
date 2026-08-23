@@ -1,10 +1,10 @@
 [package]
 name = "arcella-broker"
 version = "0.1.0"
-authors.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
+authors = ["ArcellaTeam"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ArcellaTeam/arcella-broker"
 
 [lib]
 name = "arcella_broker"
@@ -16,17 +16,14 @@ path = "src/bin/arcella-broker.rs"
 required-features = ["server"]
 
 [dependencies]
-#arcella-types = { workspace = true }
-anyhow = { workspace = true }
-bytes = { workspace = true }
-clap = { workspace = true }
-dashmap = { workspace = true }
-#dirs = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
+anyhow = "1"
+bytes = "1.12"
+clap = { version = "4.6", features = ["derive"] }
+dashmap = "6.2"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tracing = "0.1"
-serde = { workspace = true }
-#serde_json = { workspace = true }
 
 
 [features]

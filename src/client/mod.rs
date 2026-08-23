@@ -1,4 +1,4 @@
-// arcella/arcella-broker/src/client/mod.rs
+// arcella-broker/src/client/mod.rs
 //
 // Copyright (c) 2026 Arcella Team
 //

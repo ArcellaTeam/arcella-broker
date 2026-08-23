@@ -1,4 +1,4 @@
-// arcella/arcella-broker/src/tests/load_test.rs
+// arcella-broker/src/tests/load_test.rs
 //
 // Copyright (c) 2026 Arcella Team
 //
