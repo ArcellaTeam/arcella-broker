@@ -12,7 +12,7 @@ use std::sync::Arc;
 mod subscriber;
 
 use crate::protocol::Message;
-use crate::registry::{LocalChannel, LocalRegistry};
+use crate::registry::{LocalChannel, LocalRegistry, RegistryError};
 use crate::transport::{in_memory::InMemoryTransport, Transport, TransportError, TransportResult};
 
 use subscriber::Subscriber;
@@ -32,18 +32,18 @@ impl BrokerClient {
         Self { registry, local }
     }
 
-    pub async fn subscribe(&self, address: String) -> Subscriber {
+    pub fn subscribe(&self, address: String) -> Result<Subscriber, RegistryError> {
         Subscriber::bind(address, self.registry.clone(), DEFAULT_CHANNEL_CAPACITY)
     }    
     
     /// Register itself as a receiver at the specified address.
-    pub async fn bind(&self, address: String, incoming_tx: LocalChannel) {
-        self.registry.register(address, incoming_tx);
+    pub fn bind(&self, address: String, incoming_tx: LocalChannel) -> Result<(), RegistryError> {
+        self.registry.register(address, incoming_tx)
     }
 
     /// Unregister a recipient at the specified address.
     /// This will close the receiver's channel, causing any pending `recv()` calls to return `None`.
-    pub async fn unbind(&self, address: &str) {
+    pub fn unbind(&self, address: &str) {
         self.registry.unregister(address);
     }    
 
@@ -74,7 +74,7 @@ mod tests {
 
         // 2. Prepare the receiver (Actor pattern)
         let target_address = "arcella:core:test:receiver".to_string();
-        let mut subscriber = client.subscribe(target_address.clone()).await;
+        let mut subscriber = client.subscribe(target_address.clone()).expect("Subscription should succeed");
 
         // 3. Create a test message
         let original_message = test_utils::dummy_in_only_message(Bytes::from("test:ping"),
@@ -126,7 +126,7 @@ mod tests {
 
         let mut subscribers = Vec::new();
         for addr in &addresses {
-            subscribers.push(client.subscribe(addr.to_string()).await);
+            subscribers.push(client.subscribe(addr.to_string()).expect("Subscription should succeed"));
         }
 
         // 3. Send mixed messages to different addresses
@@ -203,14 +203,14 @@ mod tests {
         assert!(client.send("arcella:test", msg.clone()).await.is_err());
 
         // Registration
-        let mut subscriber = client.subscribe("arcella:test".to_string()).await;
+        let mut subscriber = client.subscribe("arcella:test".to_string()).expect("Subscription should succeed");
 
         // Now sending should succeed
         assert!(client.send("arcella:test", msg).await.is_ok());
         assert!(subscriber.recv().await.is_some());
 
         // Unregistration
-        client.unbind("arcella:test").await;
+        client.unbind("arcella:test");
 
         // Should return an error again
         let msg2 = test_utils::dummy_in_only_message(Bytes::from_static(b"test2"),
@@ -226,15 +226,21 @@ mod tests {
         let addr = "arcella:test:duplicate";
 
         // 1. First subscription
-        let mut sub1 = client.subscribe(addr.to_string()).await;
+        let mut sub1 = client.subscribe(addr.to_string()).expect("First subscription should succeed");
         
         // 2. Second subscription to the same address 
-        let mut sub2 = client.subscribe(addr.to_string()).await;
+        let mut sub2_result = client.subscribe(addr.to_string());
+        assert!(
+            matches!(sub2_result, Err(RegistryError::AddressAlreadyOccupied(_))),
+            "Second subscription to the same address must be rejected with AddressAlreadyOccupied"
+        );
 
         // 3. sub1 goes out of scope
         drop(sub1);
         // Drop triggers: self.registry.unregister(&self.address);
         // Registry is now empty! tx2 (owned by sub2) is removed from the registry.
+
+        let mut sub3 = client.subscribe(addr.to_string()).expect("Subscription after drop should succeed");
 
         // 4. Attempt to send a message
         let msg = test_utils::dummy_in_only_message(
@@ -248,7 +254,7 @@ mod tests {
         
         // This assert proves the bug exists:
         assert!(!result.is_err(), "BUG CONFIRMED: sub2 is alive but registry is empty!");
-        assert!(sub2.try_recv().is_err(), "sub2 never received the message");
+        assert!(!sub3.try_recv().is_err(), "sub2 received the message");
     }
 
 }
