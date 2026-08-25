@@ -39,7 +39,7 @@ async fn test_high_throughput_in_memory_routing() {
         let addr = format!("arcella:perf:recv:{}", i);
         
         // Register the sender half in the broker registry
-        let mut subscriber = client.subscribe(addr).await;
+        let mut subscriber = client.subscribe(addr).expect("Can not subscribe channel");
         
         // Spawn a dedicated task for each receiver to consume messages
         let handle = tokio::spawn(async move {
@@ -96,7 +96,7 @@ async fn test_high_throughput_in_memory_routing() {
     // 5. Unbind receivers to close their channels and signal them to terminate
     for i in 0..NUM_RECEIVERS {
         let addr = format!("arcella:perf:recv:{}", i);
-        client.unbind(&addr).await;
+        client.unbind(&addr);
     }
 
     // 6. Wait for all receivers to finish processing and sum up received messages

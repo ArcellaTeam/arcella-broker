@@ -1,215 +1,467 @@
-    // arcella-broker/src/registry/mod.rs
-    //
-    // Copyright (c) 2026 Arcella Team
-    //
-    // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE>
-    // or the MIT license <LICENSE-MIT>, at your option.
-    // This file may not be copied, modified, or distributed
-    // except according to those terms.
+// arcella-broker/src/registry/mod.rs
+//
+// Copyright (c) 2026 Arcella Team
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE>
+// or the MIT license <LICENSE-MIT>, at your option.
+// This file may not be copied, modified, or distributed
+// except according to those terms.
 
-    use dashmap::DashMap;
-    use tokio::sync::mpsc;
-    use std::{
-        sync::RwLock,
-        collections::HashSet,
-    };
+//! Local recipient registry for the Arcella broker.
+//!
+//! This module provides an in-memory registry for routing messages to local recipients
+//! within a single process. It supports exact address matching and wildcard patterns
+//! under a strict **exclusive binding model**.
+//!
+//! # Wildcard Rules
+//! - `*` matches exactly one segment at its position (e.g., `arcella:*:users`).
+//! - `**` matches zero or more trailing segments and **must** be the last segment 
+//!   in the pattern (e.g., `arcella:core:**`).
+//! - Segments are separated by `:`.
+//!
+//! # Exclusive Binding
+//! Every address can have at most one recipient. Conflicting subscriptions 
+//! (e.g., registering a wildcard that covers an already registered exact address, 
+//! or vice versa) are rejected at registration time to prevent ambiguous routing.
 
-    use crate::protocol::Message;
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use tokio::sync::mpsc;
 
-    /// Channel type for local delivery
-    pub type LocalChannel = mpsc::Sender<Message>;
+use crate::protocol::Message;
 
-    /// Registry of local recipients (within a single process).
+/// Channel type for local message delivery.
+pub type LocalChannel = mpsc::Sender<Message>;
+
+/// Internal state of the registry, protected by a `RwLock`.
+/// Separates exact matches and wildcards for optimized lookup and conflict detection.
+#[derive(Default)]
+struct RegistryInner {
+    /// Exact address -> channel
+    exact: HashMap<String, LocalChannel>,
+    /// Wildcard pattern -> channel
+    wildcards: HashMap<String, LocalChannel>,
+}
+
+/// Registry of local recipients (within a single process).
+///
+/// Supports two subscription types:
+/// - **Exact**: `"arcella:core:users"` - receives only messages to this exact address.
+/// - **Wildcard**: patterns containing `*` (single segment) or ending with `**` (multi-segment).
+#[derive(Default)]
+pub struct LocalRegistry {
+    recipients: RwLock<RegistryInner>,
+}
+
+/// Errors that can occur during registry operations.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    /// Returned when attempting to register an address or pattern that is already registered.
+    #[error("Address or pattern '{0}' is already occupied")]
+    AddressAlreadyOccupied(String),
+    
+    /// Returned when a new wildcard pattern overlaps with an existing exact address.
+    #[error("Wildcard subscription '{0}' conflicts with existing exact address '{1}'")]
+    WildcardConflict(String, String),
+    
+    /// Returned when an exact address is registered that falls under an existing wildcard pattern.
+    #[error("Exact address '{0}' conflicts with existing wildcard subscription '{1}'")]
+    ConflictsWithWildcard(String, String),
+
+    /// Returned when a wildcard pattern violates syntax rules.
     /// 
-    /// Key — hierarchical address (e.g., "arcella:core:users").
-    /// Value — sender to the recipient's queue.
-    #[derive(Default)]
-    pub struct LocalRegistry {
-        /// All subscriptions (exact and wildcard) — base structure, unchanged.
-        recipients: DashMap<String, LocalChannel>,
-        /// Index of wildcard keys for fast lookup scanning.
-        /// Only contains keys that include '*' or "**".
-        wildcard_keys: RwLock<HashSet<String>>,
-        /// Global lock for register/unregister
-        register_lock: std::sync::Mutex<()>,
+    /// Common causes:
+    /// - Empty pattern or empty segments (e.g., `a::b`).
+    /// - `**` is not the last segment (e.g., `a:**:b`).
+    /// - Malformed segments containing `*` alongside other characters (e.g., `a*`, `*b`).
+    #[error("Invalid wildcard format: {0}")]
+    InvalidWildcardFormat(String),
+
+}
+
+impl LocalRegistry {
+    /// Creates a new, empty `LocalRegistry`.
+    pub fn new() -> Self {
+        Self {
+            recipients: RwLock::new(RegistryInner {
+                exact: HashMap::new(),
+                wildcards: HashMap::new(),
+            }),
+        }
     }
 
-    #[derive(Debug, thiserror::Error)]
-    pub enum RegistryError {
-        #[error("Address '{0}' is already occupied")]
-        AddressAlreadyOccupied (String),
-        
-        #[error("Wildcard subscription '{0}' conflicts with existing address '{1}'")]
-        WildcardConflict (String, String),
-        
-        #[error("Address '{0}' conflicts with existing wildcard subscription '{1}'")]
-        ConflictsWithWildcard (String, String),
+    /// Returns `true` if the address contains wildcard characters (`*`).
+    /// This is a fast, pre-validation check to route to the correct registration logic.
+    #[inline]
+    fn is_wildcard(address: &str) -> bool {
+        address.contains('*')
     }
 
-    impl LocalRegistry {
-        pub fn new() -> Self {
-            Self::default()
+    /// Validates wildcard pattern syntax according to Arcella routing rules.
+    ///
+    /// # Rules enforced:
+    /// 1. Pattern cannot be empty.
+    /// 2. No empty segments allowed (e.g., `a::b` or trailing `:`).
+    /// 3. `**` can only appear as the very last segment.
+    /// 4. Partial wildcards (e.g., `a*`, `*b`, `a*b`) are forbidden; `*` must be the entire segment.
+    fn validate_wildcard_pattern(pattern: &str) -> Result<(), RegistryError> {
+        if pattern.is_empty() {
+            return Err(RegistryError::InvalidWildcardFormat(
+                "Pattern cannot be empty".to_string(),
+            ));
         }
 
-        /// Returns true if the address contains wildcard characters.
-        #[inline]
-        fn is_wildcard(address: &str) -> bool {
-            address.contains('*')
-        }
+        let mut found_starstar = false;
 
-        /// Checks whether a concrete address matches a pattern.
-        ///
-        /// Rules:
-        /// - `*` matches exactly one segment at its position
-        /// - `**` (only valid as last segment) matches zero or more trailing segments
-        /// - Segments are separated by `:`
-        ///
-        /// Examples:
-        /// ```text
-        /// matches("arcella:core:users", "arcella:*:users")   → true
-        /// matches("arcella:core:users", "arcella:*:*")       → true
-        /// matches("arcella:core:users", "*:core:users")      → true
-        /// matches("arcella:core:users", "arcella:core:**")   → true
-        /// matches("arcella:core",       "arcella:core:**")   → true  (zero extra)
-        /// matches("arcella",            "arcella:core:**")   → false (too short)
-        /// matches("arcella:core:users", "arcella:core:*")    → true
-        /// matches("arcella:core:a:b",   "arcella:core:*")    → false (len mismatch)
-        /// matches("arcella:core:users", "arcella:web:*")     → false
-        /// ```
-        fn matches(address: &str, pattern: &str) -> bool {
-            let mut addr_iter = address.split(':');
-            let mut pat_iter = pattern.split(':');
-
-            loop {
-                let pat_seg = pat_iter.next();
-                let addr_seg = addr_iter.next(); 
-
-                match (pat_seg, addr_seg) {
-                    (Some("**"), _) => {
-                        return pat_iter.next().is_none();
-                    }    
-                    (Some(p), Some(a)) => {
-                        if p != "*" && p != a {
-                            return false;
-                        }    
-                    }
-                    (Some(_), None) => return false,
-                    (None, Some(_)) => return false,
-                    (None, None) => return true,
-                }   
+        for segment in pattern.split(':') {
+            // Check for empty segments (e.g., "arcella::*" or "*::users")
+            if segment.is_empty() {
+                return Err(RegistryError::InvalidWildcardFormat(
+                    format!("Empty segment in pattern '{}'", pattern),
+                ));
             }
 
+            // If we already found "**", any subsequent segment is invalid
+            if found_starstar {
+                return Err(RegistryError::InvalidWildcardFormat(
+                    format!("'**' must be the last segment in pattern '{}'", pattern),
+                ));
+            }
+
+            if segment == "**" {
+				// Mark if we found "**"
+                found_starstar = true;
+            } else if segment == "*" {
+                // Valid single-segment wildcard, continue checking
+            } else if segment.contains('*') {
+                // Found incorrect format, e.g., "a*", "*b", "a*b".
+                return Err(RegistryError::InvalidWildcardFormat(
+                    format!("Invalid wildcard segment '{}' in pattern '{}'", segment, pattern),
+                ));
+            }
         }
+
+        Ok(())
+    }
         
-        /// Register a recipient at the specified address
-        pub fn register(&self, address: String, channel: LocalChannel) -> Result<(), RegistryError> {
+    /// Core segment-by-segment comparison algorithm.
+    ///
+    /// # Arguments
+    /// * `pattern` - The pattern to match against (may contain `*` or `**`).
+    /// * `target` - The concrete address or another pattern to compare with.
+    /// * `allow_wildcard_both_sides` - If `true`, treats `**` in *either* string as a 
+    ///   universal matcher for the remainder of the comparison. Used for detecting 
+    ///   conflicts between two wildcard patterns. If `false`, only `pattern` is 
+    ///   treated as a wildcard, used for matching a concrete `target` address.
+    fn compare_segments<'a>(
+        pattern: &str,
+        target: &str,
+        allow_wildcard_both_sides: bool,
+    ) -> bool {
+        let mut pat_iter = pattern.split(':');
+        let mut tar_iter = target.split(':');
 
-            if Self::is_wildcard(&address) {
-                //TODO
-                Ok(())
-            } else {
-                self.register_exact(address, channel)
-            }
+        loop {
+            let seg1 = pat_iter.next();
+            let seg2 = tar_iter.next();
 
-        }
-
-        fn register_exact(
-            &self,
-            address: String,
-            channel: LocalChannel,
-        ) -> Result<(), RegistryError> {
-
-            let _guard = self.register_lock.lock().unwrap();
-
-            // 1. Exact duplicate check
-            if self.recipients.contains_key(&address) {
-                return Err(RegistryError::AddressAlreadyOccupied(address.clone()));
-            }
-
-            // 2. Check if any existing wildcard covers this address
-            let keys = self.wildcard_keys.read().unwrap();
-            for wc in keys.iter() {
-                if Self::matches(&address, wc) {
-                    return Err(RegistryError::ConflictsWithWildcard (
-                        address.clone(),
-                        wc.clone(),
-                    ));
-                }
-            }
-            drop(keys);
-
-            // 3. Atomic insert
-            match self.recipients.entry(address.clone()) {
-                dashmap::mapref::entry::Entry::Occupied(_) => {
-                    Err(RegistryError::AddressAlreadyOccupied(address))
-                }
-                dashmap::mapref::entry::Entry::Vacant(v) => {
-                    v.insert(channel);
-                    Ok(())
-                }
-            }
-
-        }
-        
-        /// Unregister a recipient
-        pub fn unregister(&self, address: &str) {
-
-            let _guard = self.register_lock.lock().unwrap();
-
-            self.recipients.remove(address);
-
-            if Self::is_wildcard(address) {
-                let mut keys = self.wildcard_keys.write().unwrap();
-                keys.remove(address);
-            }
-        }
-
-        /// Find a local channel for the given address.
-        /// Returns `Some(channel)` if the recipient exists in this process.
-        pub fn lookup(&self, address: &str) -> Option<LocalChannel> {
-            // 1. Exact match — highest priority
-            if let Some(entry) = self.recipients.get(address) {
-                return Some(entry.value().clone());
-            }
-
-            // 2. Scan wildcard index
-            let keys = self.wildcard_keys.read().unwrap();
-            let mut best: Option<(usize, LocalChannel)> = None;
-
-            for wc in keys.iter() {
-                if Self::matches(address, wc) {
-                    let specificity = wc
-                        .split(':')
-                        .filter(|s| *s != "**")
-                        .count();
-
-                    let should_update = match &best {
-                        None => true,
-                        Some((best_spec, _)) => specificity > *best_spec,
-                    };
-
-                    if should_update {
-                        if let Some(entry) = self.recipients.get(wc.as_str()) {
-                            best = Some((specificity, entry.value().clone()));
-                        }
+            match (seg1, seg2) {
+                (None, None) => return true,
+                
+                // Handle ** when checking pattern-to-pattern conflicts
+                (Some("**"), _) if allow_wildcard_both_sides => return true,
+                (_, Some("**")) if allow_wildcard_both_sides => return true,
+                // Handle ** when matching pattern to concrete address.
+                // Since ** must be at the end (enforced by validation), if we see it 
+                // in the pattern, it automatically matches the rest of the target.
+                (Some("**"), _) => return pat_iter.next().is_none(),
+                
+                // Length mismatch: one string has more segments than the other
+                (Some(_), None) | (None, Some(_)) => return false,
+                
+                // Compare individual segments
+                (Some(a), Some(b)) => {
+                    if a != "*" && b != "*" && a != b {
+                        return false;
                     }
                 }
             }
+        }
+    }     
 
-            best.map(|(_, ch)| ch)
+    /// Checks whether a concrete address matches a wildcard pattern.
+    ///
+    /// # Examples
+    /// ```text
+    /// matches("arcella:*:users",    "arcella:core:users")   - true
+    /// matches("arcella:*:*",        "arcella:core:users")   - true
+    /// matches("*:core:users",       "arcella:core:users")   - true
+    /// matches("arcella:core:**",    "arcella:core:users")   - true
+    /// matches("arcella:core:**",    "arcella:core")         - true  (zero extra segments)
+    /// matches("arcella:core:**",    "arcella")              - false (too short)
+    /// matches("arcella:core:*",     "arcella:core:users")   - true
+    /// matches("arcella:core:*",     "arcella:core:a:b")     - false (length mismatch)
+    /// matches("arcella:web:*",      "arcella:core:users")   - false
+    /// ```
+    fn matches(pattern: &str, address: &str) -> Result<bool, RegistryError> {
+        Self::validate_wildcard_pattern(pattern)?;
 
+        Ok(Self::compare_segments(pattern, address, false))
+
+    } 
+
+    /// Checks whether two wildcard patterns can ever match the same concrete address.
+    /// Used during registration to enforce the exclusive binding model.
+    fn patterns_conflict(pattern1: &str, pattern2: &str) -> Result<bool, RegistryError> {
+        Self::validate_wildcard_pattern(pattern1)?;
+        Self::validate_wildcard_pattern(pattern2)?;
+
+        Ok(Self::compare_segments(pattern1, pattern2, true))
+    }
+
+    /// Registers a recipient at the specified address.
+    ///
+    /// Automatically routes to `register_exact` or `register_wildcard` based on 
+    /// the presence of the `*` character.
+    pub fn register(&self, address: String, channel: LocalChannel) -> Result<(), RegistryError> {
+        if Self::is_wildcard(&address) {
+            self.register_wildcard(address, channel)
+        } else {
+            self.register_exact(address, channel)
+        }
+    }
+
+    /// Registers an exact, non-wildcard address.
+    fn register_exact(
+        &self,
+        address: String,
+        channel: LocalChannel,
+    ) -> Result<(), RegistryError> {
+
+        let mut recipients = self.recipients.write();
+
+        // 1. Exact duplicate check
+        if recipients.exact.contains_key(&address) {
+            return Err(RegistryError::AddressAlreadyOccupied(address.clone()));
         }
 
-        /// Check if a local recipient exists for the given address 
-        /// (exact match only)
-        pub fn has_local(&self, address: &str) -> bool {
-            self.recipients.contains_key(address)
+        // 2. Check if any existing wildcard covers this new exact address
+        for wc in recipients.wildcards.keys() {
+            if Self::matches(wc, &address)? {
+                return Err(RegistryError::ConflictsWithWildcard (
+                    address.clone(),
+                    wc.to_string(),
+                ));
+            }
         }
 
-        /// Check if a local recipient exists for the given address
-        /// (including wildcard matches).
-        pub fn has_route(&self, address: &str) -> bool {
-            self.lookup(address).is_some()
-        }
+        // 3. Insert - we hold an exclusive write lock, so no race conditions are possible
+        recipients.exact.insert(address, channel);
+        Ok(())
 
     }
+    
+    /// Registers a wildcard pattern.
+    fn register_wildcard(
+        &self,
+        pattern: String,
+        channel: LocalChannel,
+    ) -> Result<(), RegistryError> {
+        // 1. Validate wildcard format syntax
+        Self::validate_wildcard_pattern(&pattern)?;
+
+        let mut recipients = self.recipients.write();
+
+        // 2. Exact duplicate check (same pattern already registered)
+        if recipients.wildcards.contains_key(&pattern) {
+            return Err(RegistryError::AddressAlreadyOccupied(pattern));
+        }
+
+        // 3. Check conflicts with existing WILDCARDS
+        for existing_wc in recipients.wildcards.keys() {
+            if Self::patterns_conflict(existing_wc, &pattern)? {
+                return Err(RegistryError::WildcardConflict(pattern, existing_wc.to_string()));
+            }
+        }
+
+        // 4. Check conflicts with existing EXACT addresses
+        for existing_addr in recipients.exact.keys() {
+            if Self::matches(&pattern, existing_addr)? {
+                return Err(RegistryError::WildcardConflict(pattern, existing_addr.to_string()));
+            }
+        }
+
+        // 5. Insert
+        recipients.wildcards.insert(pattern, channel);
+        Ok(())
+    }
+
+    /// Unregisters a recipient by address or pattern.
+    ///
+    /// Note: This is a silent no-op if the address/pattern is not found, 
+    /// which is standard for cleanup operations.
+    pub fn unregister(&self, address: &str) {
+
+        let mut recipients = self.recipients.write();
+
+         if Self::is_wildcard(address) {
+            recipients.wildcards.remove(address);
+        } else {
+            recipients.exact.remove(address);
+        }
+    }
+
+    /// Finds a local channel for the given address.
+    ///
+    /// Returns `Some(channel)` if a recipient exists in this process.
+    /// Priority is given to exact matches, followed by wildcard matches.
+    pub fn lookup(&self, address: &str) -> Option<LocalChannel> {
+        let recipients = self.recipients.read();
+
+        // 1. Exact match  highest priority and fastest path (O(1))
+        if let Some(channel) = recipients.exact.get(address) {
+            return Some(channel.clone());
+        }
+
+        // 2. Scan wildcard index
+        let mut best: Option<(usize, LocalChannel)> = None;
+        for (pattern, channel) in &recipients.wildcards {
+            if Self::compare_segments(pattern, address, false) {
+                let specificity = pattern
+                    .split(':')
+                    .filter(|s| *s != "**")
+                    .count();
+
+                let should_update = match &best {
+                    None => true,
+                    Some((best_spec, _)) => specificity > *best_spec,
+                };
+
+                if should_update {
+                   best = Some((specificity, channel.clone()));
+                }
+            }
+        }
+
+        best.map(|(_, ch)| ch)
+
+    }
+
+    /// Checks if a local recipient exists for the given address (exact match only).
+    /// Useful for quick negative caching or routing decisions.
+    pub fn has_local(&self, address: &str) -> bool {
+        let recipients = self.recipients.read();
+        recipients.exact.contains_key(address)
+    }
+
+    /// Checks if a local recipient exists for the given address, including wildcard matches.
+    pub fn has_route(&self, address: &str) -> bool {
+        self.lookup(address).is_some()
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod matches {
+        use super::*;
+
+        // ============================================================
+        // 1. Exact matches
+        // ============================================================
+
+        #[test]
+        fn exact_match() {
+            assert!(LocalRegistry::matches("arcella", "arcella").unwrap());
+            assert!(LocalRegistry::matches("arcella:core:users", "arcella:core:users").unwrap());
+
+            assert!(!LocalRegistry::matches("arcella:core:users", "arcella:core:admin").unwrap());
+            assert!(!LocalRegistry::matches("Arcella", "arcella").unwrap()); // Case-sensitive
+        }
+
+        // ============================================================
+        // 2. Length mismatches (without wildcards)
+        // ============================================================
+
+        #[test]
+        fn length_mismatch() {
+            assert!(!LocalRegistry::matches("a:b:c", "a:b").unwrap());
+            assert!(!LocalRegistry::matches("a:b", "a:b:c").unwrap());
+        }
+
+        // ============================================================
+        // 3. Empty strings
+        // ============================================================
+
+            #[test]
+        fn empty_strings() {
+            assert!(LocalRegistry::matches("", "").is_err());
+            assert!(LocalRegistry::matches("a::b", "a:b").is_err());
+            assert!(LocalRegistry::matches("", "a:b").is_err());
+
+            assert!(!LocalRegistry::matches("a:b", "").unwrap());
+            assert!(!LocalRegistry::matches("a", "").unwrap());
+            assert!(!LocalRegistry::matches("a:b", "a::b").unwrap());
+        }
+
+        // ============================================================
+        // 4. Single-segment wildcard (*)
+        // ============================================================
+
+        #[test]
+        fn single_segment_wildcard() {
+            assert!(LocalRegistry::matches("*:b:c", "a:b:c").unwrap());
+            assert!(LocalRegistry::matches("a:*:c", "a:b:c").unwrap());
+            assert!(LocalRegistry::matches("a:b:*", "a:b:c").unwrap());
+            assert!(LocalRegistry::matches("*:*:*", "a:b:c").unwrap());
+
+            assert!(!LocalRegistry::matches("a:*:d", "a:b:c").unwrap());
+            assert!(!LocalRegistry::matches("a:*:d", "a:b:c:d").unwrap());
+            assert!(!LocalRegistry::matches("a:*:d", "a:d").unwrap());
+        }
+
+        // ============================================================
+        // 5. Multi-segment wildcard (**)
+        // ============================================================
+
+        #[test]
+        fn multi_segment_wildcard() {
+            assert!(LocalRegistry::matches("**",     "a").unwrap());
+            assert!(LocalRegistry::matches("a:**",   "a").unwrap());
+            assert!(LocalRegistry::matches("a:b:**", "a:b").unwrap());
+            assert!(LocalRegistry::matches("a:b:**", "a:b:c").unwrap());
+            assert!(LocalRegistry::matches("**",     "a:b:c:d").unwrap());
+            assert!(LocalRegistry::matches("a:b:**", "a:b:c:d:e").unwrap());
+            assert!(LocalRegistry::matches("a:**",   "a:b:c:d:e").unwrap());
+
+            assert!(!LocalRegistry::matches("a:b:**", "a").unwrap());
+            assert!(!LocalRegistry::matches("a:b:**", "x:b:c").unwrap());
+        }
+
+        // ============================================================
+        // 6. Combinations * & **
+        // ============================================================
+
+        #[test]
+        fn star_and_starstar_combined() {
+            assert!(LocalRegistry::matches("*:b:**", "a:b:c:d:e").unwrap());
+            assert!(LocalRegistry::matches("*:**", "x:y:z").unwrap());
+            
+            assert!(LocalRegistry::patterns_conflict("a:b:c:*", "a:**").unwrap());
+        }
+
+        // ============================================================
+        // 7. Invalid wildcard patterns
+        // ============================================================
+        #[test]
+        fn invalid_patterns() {
+            assert!(LocalRegistry::matches("a:**:b", "a:b").is_err());
+            assert!(LocalRegistry::matches("a:*:b:", "a:b").is_err());
+            assert!(LocalRegistry::matches("**:a:**", "a:b").is_err());
+            assert!(LocalRegistry::matches("a:**:**", "a:b").is_err());
+        }
+    }    
+
+}

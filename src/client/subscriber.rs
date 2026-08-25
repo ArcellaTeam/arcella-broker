@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::protocol::Message;
-use crate::registry::LocalRegistry;
+use crate::registry::{LocalRegistry, RegistryError};
 
 pub struct Subscriber {
     rx: mpsc::Receiver<Message>,
@@ -28,10 +28,14 @@ impl Subscriber {
         Self { rx, address, registry }
     }
 
-    pub fn bind(address: String, registry: Arc<LocalRegistry>, capacity: usize) -> Self {
+    pub fn bind(
+        address: String, 
+        registry: Arc<LocalRegistry>, 
+        capacity: usize
+    ) -> Result<Self, RegistryError> {
         let (tx, rx) = mpsc::channel::<Message>(capacity);
-        registry.register(address.clone(), tx);
-        Self { rx, address, registry }
+        registry.register(address.clone(), tx)?;
+        Ok(Self { rx, address, registry })
     }    
 
     pub async fn recv(&mut self) -> Option<Message> {
