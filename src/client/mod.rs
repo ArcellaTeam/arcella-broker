@@ -220,7 +220,7 @@ mod tests {
     }    
 
     #[tokio::test]
-    async fn test_duplicate_subscription_causes_premature_unregistration() {
+async fn test_subscription_cleanup_and_re_registration() {
         let registry = Arc::new(LocalRegistry::new());
         let client = BrokerClient::new(registry);
         let addr = "arcella:test:duplicate";
@@ -249,12 +249,11 @@ mod tests {
             Bytes::from("hello")
         );
         
-        // EXPECTATION: Send should succeed, as sub2 is alive and ready to receive.
+        // Send should succeed, as sub3 is alive and ready to receive.
         let result = client.send(addr, msg).await;
         
-        // This assert proves the bug exists:
-        assert!(!result.is_err(), "BUG CONFIRMED: sub2 is alive but registry is empty!");
-        assert!(!sub3.try_recv().is_err(), "sub2 received the message");
+        assert!(!result.is_err());
+        assert!(!sub3.try_recv().is_err(), "sub3 received the message");
     }
 
 }
