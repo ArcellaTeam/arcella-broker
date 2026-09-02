@@ -69,7 +69,7 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_message_delivery_in_only() {
         // 1. Initialize registry and client
-        let registry = Arc::new(LocalRegistry::new());
+        let registry = Arc::new(LocalRegistry::new(1024));
         let client = BrokerClient::new(registry);
 
         // 2. Prepare the receiver (Actor pattern)
@@ -97,7 +97,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_in_memory_message_delivery_to_unknown_address() {
-        let registry = Arc::new(LocalRegistry::new());
+        let registry = Arc::new(LocalRegistry::new(1024));
         let client = BrokerClient::new(registry);
 
         let msg = test_utils::dummy_in_only_message(Bytes::from("test:ping"),
@@ -114,7 +114,7 @@ mod tests {
     #[tokio::test]
     async fn test_multi_recipient_routing() {
         // 1. Initialize the broker
-        let registry = Arc::new(LocalRegistry::new());
+        let registry = Arc::new(LocalRegistry::new(1024));
         let client = BrokerClient::new(registry);
 
         // 2. Register multiple receivers with different addresses
@@ -189,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dynamic_registration() {
-        let registry = Arc::new(LocalRegistry::new());
+        let registry = Arc::new(LocalRegistry::new(1024));
         let client = BrokerClient::new(registry.clone());
 
         let address = Bytes::from_static(b"arcella:test");
@@ -220,8 +220,8 @@ mod tests {
     }    
 
     #[tokio::test]
-    async fn test_duplicate_subscription_causes_premature_unregistration() {
-        let registry = Arc::new(LocalRegistry::new());
+async fn test_subscription_cleanup_and_re_registration() {
+        let registry = Arc::new(LocalRegistry::new(1024));
         let client = BrokerClient::new(registry);
         let addr = "arcella:test:duplicate";
 
@@ -249,12 +249,11 @@ mod tests {
             Bytes::from("hello")
         );
         
-        // EXPECTATION: Send should succeed, as sub2 is alive and ready to receive.
+        // Send should succeed, as sub3 is alive and ready to receive.
         let result = client.send(addr, msg).await;
         
-        // This assert proves the bug exists:
-        assert!(!result.is_err(), "BUG CONFIRMED: sub2 is alive but registry is empty!");
-        assert!(!sub3.try_recv().is_err(), "sub2 received the message");
+        assert!(!result.is_err());
+        assert!(!sub3.try_recv().is_err(), "sub3 received the message");
     }
 
 }

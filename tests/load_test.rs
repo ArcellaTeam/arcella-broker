@@ -29,7 +29,7 @@ const TOTAL_MESSAGES: usize = NUM_SENDERS * MESSAGES_PER_SENDER;
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn test_high_throughput_in_memory_routing() {
     // 1. Initialize Broker
-    let registry = Arc::new(LocalRegistry::new());
+    let registry = Arc::new(LocalRegistry::new(1024));
     let client = Arc::new(BrokerClient::new(registry));
 
     // 2. Register Receivers and spawn receiver tasks

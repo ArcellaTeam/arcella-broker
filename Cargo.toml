@@ -5,6 +5,9 @@ authors = ["ArcellaTeam"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ArcellaTeam/arcella-broker"
+description = "High-performance message routing and local recipient registry for the Arcella WebAssembly application platform."
+keywords = ["wasm", "webassembly", "messaging", "routing", "arcella"]
+categories = ["network-programming", "asynchronous", "wasm"]
 
 [lib]
 name = "arcella_broker"
@@ -23,7 +26,7 @@ dashmap = "6.2"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2.0.20"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
 
 
