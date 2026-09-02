@@ -1,9 +1,8 @@
-```markdown
 # arcella-broker
 
 [![Crates.io](https://img.shields.io/crates/v/arcella-broker.svg)](https://crates.io/crates/arcella-broker)
 [![Documentation](https://docs.rs/arcella-broker/badge.svg)](https://docs.rs/arcella-broker)
-[![License: Apache-2.0/MIT](https://img.shields.io/badge/license-Apache%202.0%20%7C%20MIT-blue)] (https://github.com/ArcellaTeam/arcella-broker)
+[![License: Apache-2.0/MIT](https://img.shields.io/badge/license-Apache%202.0%20%7C%20MIT-blue)](https://github.com/ArcellaTeam/arcella-broker)
 
 A high-performance, hierarchical message micro-broker for the **Arcella** platform (a modular WebAssembly application platform).
 
