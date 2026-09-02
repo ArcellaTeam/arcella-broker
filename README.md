@@ -1,4 +1,4 @@
-# arcella-broker
+# `arcella-broker`
 
 [![Crates.io](https://img.shields.io/crates/v/arcella-broker.svg)](https://crates.io/crates/arcella-broker)
 [![Documentation](https://docs.rs/arcella-broker/badge.svg)](https://docs.rs/arcella-broker)
@@ -25,8 +25,6 @@ the message payload, ensuring data confidentiality and maximum throughput.
 > **Important:** WebAssembly modules **do not interact** with the broker directly. Interaction is performed exclusively through a connector library or trusted async components (`trusted = true`), which inject valid `session_token` and `message_id` values, preventing identity spoofing.
 
 ## Installation
-
-					
 
 Add the dependency to your `Cargo.toml`:
 
