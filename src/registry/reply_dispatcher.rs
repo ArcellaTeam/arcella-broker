@@ -134,5 +134,5 @@ impl ReplyDispatcher {
     pub fn remove_waiter(&self, message_id: &[u8; 16]) {
         let mut map = self.waiters.lock();
         map.remove(message_id);
-    }        
+    }
 }
