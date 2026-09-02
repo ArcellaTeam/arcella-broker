@@ -46,10 +46,10 @@ pub const FIXED_HEADER_SIZE: usize = 64;
 // ============================================================================
 
 /// Mask for extracting the transfer mode from the flags field (bit 0)
-pub const TRANSFER_MODE_MASK: u16 = 0x0001;
+pub const TRANSFER_MODE_MASK: u8 = 0x01;
 
 /// Shift for the transfer mode in the flags field
-pub const TRANSFER_MODE_SHIFT: u16 = 0;
+pub const TRANSFER_MODE_SHIFT: u8 = 0;
 
 // Reserved bits for future extensions:
 // Bits 1-15 are reserved and must be 0 in the current protocol version
@@ -67,7 +67,7 @@ pub enum ProtocolError {
     UnsupportedVersion(u16),
 
     #[error("Unknown transfer mode: {0}")]
-    UnknownTransferMode(u16),
+    UnknownTransferMode(u8),
 
     #[error("Message type length ({0}) exceeds limit {MAX_MSG_TYPE_LEN}")]
     MsgTypeTooLong(u8),
@@ -117,7 +117,7 @@ pub enum TransferMode {
 impl TransferMode {
 
     /// Extracts the transfer mode the from flags field (uses only bit 0)
-    pub fn from_flags(flags: u16) -> Result<Self, ProtocolError> {
+    pub fn from_flags(flags: u8) -> Result<Self, ProtocolError> {
         let mode_bits = flags & TRANSFER_MODE_MASK;
         
         match mode_bits {
@@ -129,8 +129,8 @@ impl TransferMode {
     }
 
     /// Converts the transfer mode to the flags field value
-    pub fn to_flags(self) -> u16 {
-        (self as u16) << TRANSFER_MODE_SHIFT
+    pub fn to_flags(self) -> u8 {
+        (self as u8) << TRANSFER_MODE_SHIFT
     }
 }
 
@@ -153,7 +153,8 @@ impl TransferMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixedHeader {
     pub version: u16,
-    pub flags: u16,
+    pub flags: u8,
+    pub priority: u8,
     pub session_token: [u8; SESSION_TOKEN_LEN],
     pub message_id: [u8; MESSAGE_ID_LEN],
     pub sub_message_id: [u8; SUB_MESSAGE_ID_LEN],
@@ -170,6 +171,7 @@ impl FixedHeader {
         session_token: [u8; SESSION_TOKEN_LEN],
         message_id: [u8; MESSAGE_ID_LEN],
         sub_message_id: [u8; SUB_MESSAGE_ID_LEN],
+        priority: u8,
         ttl: u8,
         msg_type_len: u8,
         address_len: u16,
@@ -191,6 +193,7 @@ impl FixedHeader {
         Ok(Self {
             version: PROTOCOL_VERSION,
             flags: flags,
+            priority: priority,
             session_token,
             message_id,
             sub_message_id,
@@ -212,9 +215,11 @@ impl FixedHeader {
             return Err(ProtocolError::UnsupportedVersion(version));
         }
 
-        let flags = buf.get_u16_le();
+        let flags = buf.get_u8();
         // Validate transfer mode immediately during parsing
         TransferMode::from_flags(flags)?;
+
+        let priority = buf.get_u8();
 
         let mut session_token = [0u8; SESSION_TOKEN_LEN];
         buf.copy_to_slice(&mut session_token);
@@ -244,6 +249,7 @@ impl FixedHeader {
         Ok(Self {
             version,
             flags,
+            priority,
             session_token,
             message_id,
             sub_message_id,
@@ -257,7 +263,8 @@ impl FixedHeader {
     /// Encodes the fixed header into a buffer
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
         buf.put_u16_le(self.version);
-        buf.put_u16_le(self.flags);
+        buf.put_u8(self.flags);
+        buf.put_u8(self.priority);
         buf.put_slice(&self.session_token);
         buf.put_slice(&self.message_id);
         buf.put_slice(&self.sub_message_id);
@@ -345,6 +352,7 @@ impl Message {
         session_token: [u8; SESSION_TOKEN_LEN],
         message_id: [u8; MESSAGE_ID_LEN],
         sub_message_id: [u8; SUB_MESSAGE_ID_LEN],
+        priority: u8,
         ttl: u8,
         msg_type: Bytes,
         address: Bytes,
@@ -374,6 +382,7 @@ impl Message {
             session_token,
             message_id,
             sub_message_id,
+            priority,
             ttl,
             msg_type.len() as u8,
             address.len() as u16,

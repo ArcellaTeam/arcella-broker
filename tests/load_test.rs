@@ -75,6 +75,7 @@ async fn test_high_throughput_in_memory_routing() {
                     [0u8; 32], // session_token
                     [0u8; 16], // message_id
                     [0u8; 4],
+                    0,        // priority
                     64,        // ttl
                     msg_type_str.clone(),
                     addr.clone(),

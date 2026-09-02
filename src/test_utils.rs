@@ -31,6 +31,7 @@ pub fn dummy_in_only_message(msg_type: Bytes, address: Bytes, payload: Bytes) ->
         [0u8; 32],
         [1u8; 16],
         [0u8; 4],
+        0,
         64,
         msg_type,
         address,
