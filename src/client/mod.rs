@@ -69,7 +69,7 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_message_delivery_in_only() {
         // 1. Initialize registry and client
-        let registry = Arc::new(LocalRegistry::new());
+        let registry = Arc::new(LocalRegistry::new(1024));
         let client = BrokerClient::new(registry);
 
         // 2. Prepare the receiver (Actor pattern)
@@ -97,7 +97,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_in_memory_message_delivery_to_unknown_address() {
-        let registry = Arc::new(LocalRegistry::new());
+        let registry = Arc::new(LocalRegistry::new(1024));
         let client = BrokerClient::new(registry);
 
         let msg = test_utils::dummy_in_only_message(Bytes::from("test:ping"),
@@ -114,7 +114,7 @@ mod tests {
     #[tokio::test]
     async fn test_multi_recipient_routing() {
         // 1. Initialize the broker
-        let registry = Arc::new(LocalRegistry::new());
+        let registry = Arc::new(LocalRegistry::new(1024));
         let client = BrokerClient::new(registry);
 
         // 2. Register multiple receivers with different addresses
@@ -189,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dynamic_registration() {
-        let registry = Arc::new(LocalRegistry::new());
+        let registry = Arc::new(LocalRegistry::new(1024));
         let client = BrokerClient::new(registry.clone());
 
         let address = Bytes::from_static(b"arcella:test");
@@ -221,7 +221,7 @@ mod tests {
 
     #[tokio::test]
 async fn test_subscription_cleanup_and_re_registration() {
-        let registry = Arc::new(LocalRegistry::new());
+        let registry = Arc::new(LocalRegistry::new(1024));
         let client = BrokerClient::new(registry);
         let addr = "arcella:test:duplicate";
 

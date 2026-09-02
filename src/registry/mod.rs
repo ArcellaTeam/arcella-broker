@@ -28,19 +28,27 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
+mod reply_dispatcher;
+
 use crate::protocol::Message;
+use reply_dispatcher::ReplyDispatcher;
 
 /// Channel type for local message delivery.
 pub type LocalChannel = mpsc::Sender<Message>;
+pub type LocalReceiver = mpsc::Receiver<Message>;
+
+pub const REPLY_WILDCARD_ADDRESS: &str = "arcella:reply:**";
+pub const DEFAULT_REPLY_CHANNEL_CAPACITY: usize = 1024;
 
 /// Internal state of the registry, protected by a `RwLock`.
 /// Separates exact matches and wildcards for optimized lookup and conflict detection.
-#[derive(Default)]
 struct RegistryInner {
     /// Exact address -> channel
     exact: HashMap<String, LocalChannel>,
     /// Wildcard pattern -> channel
     wildcards: HashMap<String, LocalChannel>,
+    /// Dispatcher for InOut (Request/Response) message correlations
+    reply_dispatcher: ReplyDispatcher,
 }
 
 /// Registry of local recipients (within a single process).
@@ -48,7 +56,6 @@ struct RegistryInner {
 /// Supports two subscription types:
 /// - **Exact**: `"arcella:core:users"` - receives only messages to this exact address.
 /// - **Wildcard**: patterns containing `*` (single segment) or ending with `**` (multi-segment).
-#[derive(Default)]
 pub struct LocalRegistry {
     recipients: RwLock<RegistryInner>,
 }
@@ -77,18 +84,41 @@ pub enum RegistryError {
     #[error("Invalid wildcard format: {0}")]
     InvalidWildcardFormat(String),
 
+    #[error("Waiter already exists")]
+    WaiterAlreadyExists,
 }
 
 impl LocalRegistry {
     /// Creates a new, empty `LocalRegistry`.
-    pub fn new() -> Self {
+    pub fn new(reply_channel_capacity: usize) -> Self {
+        assert!(
+            reply_channel_capacity > 0,
+            "reply_channel_capacity must be greater than 0"
+        );
+                
+        // Create channel for the reply wildcard subscription
+        let (reply_tx, reply_rx) = mpsc::channel(reply_channel_capacity);
+        
+        // Initialize ReplyDispatcher (starts background listener task)
+        let reply_dispatcher = ReplyDispatcher::new(reply_rx);
+
+        // Pre-register the reply wildcard in the wildcards map
+        let mut wildcards = HashMap::new();
+        wildcards.insert(REPLY_WILDCARD_ADDRESS.to_string(), reply_tx);        
+
         Self {
             recipients: RwLock::new(RegistryInner {
                 exact: HashMap::new(),
-                wildcards: HashMap::new(),
+                wildcards,
+                reply_dispatcher,
             }),
         }
     }
+
+    /// Returns a clone of the `ReplyDispatcher` for use in transport layers.
+    pub fn reply_dispatcher(&self) -> ReplyDispatcher {
+        self.recipients.read().reply_dispatcher.clone()
+    }    
 
     /// Returns `true` if the address contains wildcard characters (`*`).
     /// This is a fast, pre-validation check to route to the correct registration logic.
@@ -301,6 +331,9 @@ impl LocalRegistry {
     /// Note: This is a silent no-op if the address/pattern is not found, 
     /// which is standard for cleanup operations.
     pub fn unregister(&self, address: &str) {
+        if address == REPLY_WILDCARD_ADDRESS {
+            return;
+        }
 
         let mut recipients = self.recipients.write();
 
@@ -318,7 +351,7 @@ impl LocalRegistry {
     pub fn lookup(&self, address: &str) -> Option<LocalChannel> {
         let recipients = self.recipients.read();
 
-        // 1. Exact match  highest priority and fastest path (O(1))
+        // 1. Exact match - highest priority and fastest path (O(1))
         if let Some(channel) = recipients.exact.get(address) {
             return Some(channel.clone());
         }
@@ -359,6 +392,12 @@ impl LocalRegistry {
         self.lookup(address).is_some()
     }
 
+}
+
+impl Default for LocalRegistry {
+    fn default() -> Self {
+        Self::new(DEFAULT_REPLY_CHANNEL_CAPACITY)
+    }
 }
 
 #[cfg(test)]

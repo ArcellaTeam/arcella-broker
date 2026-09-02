@@ -12,7 +12,8 @@ use std::pin::Pin;
 
 pub mod in_memory;
 
-use crate::protocol::Message;
+use crate::protocol::{Message, ProtocolError};
+use crate::registry::RegistryError;
 
 /// Transport error
 #[derive(Debug, thiserror::Error)]
@@ -26,8 +27,11 @@ pub enum TransportError {
     #[error("Recipient not found: {0}")]
     RecipientNotFound(String),
     
+    #[error("Registry error: {0}")]
+    Registry(#[from] RegistryError),
+    
     #[error("Protocol error: {0}")]
-    Protocol(#[from] crate::protocol::ProtocolError),
+    Protocol(#[from] ProtocolError),
     
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

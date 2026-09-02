@@ -16,7 +16,7 @@ use crate::registry::LocalRegistry;
 
 /// Create a test client with a local reestr
 pub fn test_client() -> BrokerClient {
-    let registry = Arc::new(LocalRegistry::new());
+    let registry = Arc::new(LocalRegistry::new(1024));
     BrokerClient::new(registry)
 }
 
