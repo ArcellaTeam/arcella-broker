@@ -37,7 +37,7 @@ pub const MESSAGE_ID_LEN: usize = 16;
 pub const SUB_MESSAGE_ID_LEN: usize = 4;
 
 /// Size of the fixed header in bytes
-/// 2 (version) + 2 (flags) + 32 (token) + 16 (guid) + 4 (sub_id)+ 1 (ttl) 
+/// 2 (version) + 1 (flags) + 1 (priority) + 32 (token) + 16 (guid) + 4 (sub_id)+ 1 (ttl) 
 /// + 1 (type_len) + 2 (addr_len) + 4 (payload_len) = 64 bytes
 pub const FIXED_HEADER_SIZE: usize = 64;
 
