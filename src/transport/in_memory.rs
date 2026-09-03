@@ -68,7 +68,7 @@ impl Transport for InMemoryTransport {
                 Some(channel) => {
                     channel.send(message).await.map_err(|_| {
                         // If sending fails, we assume the recipient is unavailable
-                        TransportError::RecipientNotFound(address.to_string())
+                        TransportError::ConnectionClosed
                     })?;
                     Ok(())
                 }
