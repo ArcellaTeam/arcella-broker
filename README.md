@@ -121,11 +121,3 @@ The broker uses a strict binary protocol (Little-Endian):
 This project is distributed under a dual-license:
 - [Apache License, Version 2.0](LICENSE-APACHE)
 - [MIT License](LICENSE-MIT)
-
-			   
-   
-
-							 
-																																
-																																	 
-																																							

@@ -85,6 +85,9 @@ pub enum RegistryError {
 
     #[error("Waiter already exists")]
     WaiterAlreadyExists,
+
+    #[error("Address is reserved")]
+    ReservedAddress
 }
 
 impl LocalRegistry {
@@ -329,9 +332,9 @@ impl LocalRegistry {
     ///
     /// Note: This is a silent no-op if the address/pattern is not found, 
     /// which is standard for cleanup operations.
-    pub fn unregister(&self, address: &str) {
+    pub fn unregister(&self, address: &str) -> Result<(), RegistryError>{
         if address == REPLY_WILDCARD_ADDRESS {
-            return;
+            return Err(RegistryError::ReservedAddress);
         }
 
         let mut recipients = self.recipients.write();
@@ -341,6 +344,7 @@ impl LocalRegistry {
         } else {
             recipients.exact.remove(address);
         }
+        Ok(())
     }
 
     /// Finds a local channel for the given address.

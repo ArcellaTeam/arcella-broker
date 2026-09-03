@@ -106,7 +106,7 @@ pub enum ProtocolError {
 
 /// Message transfer mode, defining the interaction semantics
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
+#[repr(u8)]
 pub enum TransferMode {
     /// Asynchronous send without waiting for a response (Tell, fire-and-forget)
     InOnly = 0,
@@ -142,7 +142,8 @@ impl TransferMode {
 /// 
 /// Structure (all numbers in Little-Endian):
 /// - version: u16 — protocol version
-/// - flags: u16 — flags (transfer mode)
+/// - flags: u8 — flags (transfer mode)
+/// - priority: u8 — message priority
 /// - session_token: [u8; SESSION_TOKEN_LEN] — session token (SHA-256/BLAKE3)
 /// - message_id: [u8; MESSAGE_ID_LEN] — unique message identifier (GUID)
 /// - sub_message_id: [u8; SUB_MESSAGE_ID_LEN] — unique submessage identifier (GUID)
