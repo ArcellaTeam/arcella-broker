@@ -12,9 +12,9 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use arcella_broker::{
-    client::BrokerClient,
+    broker::Broker,
+    config::SubscriberConfig,
     protocol::{Message, TransferMode},
-    registry::LocalRegistry,
 };
 
 // ============================================================================
@@ -28,18 +28,21 @@ const TOTAL_MESSAGES: usize = NUM_SENDERS * MESSAGES_PER_SENDER;
 /// High-throughput load test for the in-memory broker routing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn test_high_throughput_in_memory_routing() {
-    // 1. Initialize Broker
-    let registry = Arc::new(LocalRegistry::new(1024));
-    let client = Arc::new(BrokerClient::new(registry));
+    // 1. Initialize config, broker and client
+    let config = Broker::default_config();
+    let broker = Arc::new(Broker::new(config));
+    let client = broker.client();
 
     // 2. Register Receivers and spawn receiver tasks
     let mut receiver_handles = Vec::with_capacity(NUM_RECEIVERS);
+
+    let subscriber_config = SubscriberConfig::new();
     
     for i in 0..NUM_RECEIVERS {
         let addr = format!("arcella:perf:recv:{}", i);
         
         // Register the sender half in the broker registry
-        let mut subscriber = client.subscribe(addr).expect("Can not subscribe channel");
+        let mut subscriber = client.subscribe(addr, subscriber_config.clone()).expect("Can not subscribe channel");
         
         // Spawn a dedicated task for each receiver to consume messages
         let handle = tokio::spawn(async move {
@@ -58,8 +61,8 @@ async fn test_high_throughput_in_memory_routing() {
     let mut sender_handles = Vec::with_capacity(NUM_SENDERS);
     
     for i in 0..NUM_SENDERS {
-        let client = client.clone();
-        
+        let client = broker.client();
+
         let handle = tokio::spawn(async move {
             // Route messages to a specific receiver (with an offset to test routing logic)
             let target_idx = (i + 50) % NUM_RECEIVERS;

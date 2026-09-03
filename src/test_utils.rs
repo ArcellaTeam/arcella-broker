@@ -11,18 +11,15 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 use crate::client::BrokerClient;
+use crate::broker::Broker;
 use crate::protocol::{Message, TransferMode};
-use crate::registry::LocalRegistry;
 
 /// Create a test client with a local reestr
 pub fn test_client() -> BrokerClient {
-    let registry = Arc::new(LocalRegistry::new(1024));
-    BrokerClient::new(registry)
-}
-
-/// Create a test client with a shared reestr (for multiple clients)
-pub fn test_client_with_shared_registry(registry: Arc<LocalRegistry>) -> BrokerClient {
-    BrokerClient::new(registry)
+    // 1. Initialize config, broker and client
+    let config = Broker::default_config();
+    let broker = Arc::new(Broker::new(config));
+    broker.client()
 }
 
 pub fn dummy_in_only_message(msg_type: Bytes, address: Bytes, payload: Bytes) -> Message {
