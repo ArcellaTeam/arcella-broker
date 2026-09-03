@@ -12,6 +12,7 @@ This library provides ultra-fast, secure, and deterministic message routing betw
 
 - **Hierarchical Addressing:** Strict routing via addresses formatted as `level1:level2:level3`, with support for wildcard patterns (`*` for a single segment, `**` for multiple trailing segments).
 - **High Performance:** Zero-copy binary protocol parsing using the `bytes` crate, minimal allocations, and `parking_lot` for highly concurrent registry access.
+- **Priority Routing:** 256 levels of message priority (0 = critical, 255 = background) embedded directly into the 64-byte fixed header without performance overhead.
 - **Two Delivery Modes:**  
   - `InOnly` (Fire-and-forget): Asynchronous sending without waiting for a response.
   - `InOut` (Request/Response): Sending with response awaiting and correlation via `message_id`.
@@ -93,6 +94,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The broker uses a strict binary protocol (Little-Endian):
 1. **Fixed Header (64 bytes):** version, mode flags, tokens, identifiers, and field lengths.
+- version (u16)
+- flags (u8): Transfer mode (InOnly/InOut) + reserved bits.
+- priority (u8): Message priority (0 = critical, 255 = background).
+- session_token (32 bytes)
+- message_id (16 bytes)
+- sub_message_id (4 bytes)
+- ttl (u8)
+- msg_type_len (u8)
+- address_len (u16)
+- payload_len (u32)
 2. **Variable Header:** message type (UTF-8, up to 255 bytes) and recipient address (UTF-8, up to 1024 bytes).
 3. **Payload:** binary data completely transparent to the broker (up to 1 MB).
 
@@ -110,11 +121,3 @@ The broker uses a strict binary protocol (Little-Endian):
 This project is distributed under a dual-license:
 - [Apache License, Version 2.0](LICENSE-APACHE)
 - [MIT License](LICENSE-MIT)
-
-			   
-   
-
-							 
-																																
-																																	 
-																																							

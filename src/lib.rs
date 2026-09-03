@@ -10,6 +10,8 @@
 #![deny(unsafe_code)]
 //#![warn(missing_docs)]
 
+pub mod config;
+pub mod broker;
 pub mod error;
 pub mod protocol;
 pub mod registry;

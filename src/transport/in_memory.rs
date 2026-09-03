@@ -14,9 +14,12 @@
 //! the sender and receiver are within the same process, ensuring
 //! minimal latency and zero serialization overhead.
 
-use std::sync::Arc;
-use std::future::Future;
-use std::pin::Pin;
+use std::{
+    sync::Arc,
+    future::Future,
+    pin::Pin,
+    time::Duration,
+};
 use tokio::time;
 
 use crate::protocol::Message;
@@ -32,6 +35,7 @@ use super::{Transport, TransportError, TransportResult};
 pub struct InMemoryTransport {
     /// Local registry for looking up recipient channels by address.
     registry: Arc<LocalRegistry>,
+    request_timeout: Duration,
 }
 
 impl InMemoryTransport {
@@ -39,8 +43,8 @@ impl InMemoryTransport {
     ///
     /// # Arguments
     /// * `registry` - a shared reference to the local routing registry.
-    pub fn new(registry: Arc<LocalRegistry>) -> Self {
-        Self { registry }
+    pub fn new(registry: Arc<LocalRegistry>, request_timeout: Duration) -> Self {
+        Self { registry, request_timeout }
     }
 }
 
@@ -64,7 +68,7 @@ impl Transport for InMemoryTransport {
                 Some(channel) => {
                     channel.send(message).await.map_err(|_| {
                         // If sending fails, we assume the recipient is unavailable
-                        TransportError::RecipientNotFound(address.to_string())
+                        TransportError::ConnectionClosed
                     })?;
                     Ok(())
                 }
@@ -100,8 +104,7 @@ impl Transport for InMemoryTransport {
             self.send(address, message).await?;
 
             // Set the response wait timeout (30 seconds)
-            let timeout_duration = time::Duration::from_secs(30);
-            match time::timeout(timeout_duration, receiver).await {
+            match time::timeout(self.request_timeout, receiver).await {
                 Ok(Ok(response)) => Ok(response),
                 Ok(Err(_)) => Err(TransportError::ConnectionClosed),
                 Err(_) => Err(TransportError::Timeout),

@@ -35,13 +35,14 @@ impl Subscriber {
     ) -> Result<Self, RegistryError> {
         let (tx, rx) = mpsc::channel::<Message>(capacity);
         registry.register(address.clone(), tx)?;
-        Ok(Self { rx, address, registry })
+        Ok(Self::new(rx, address, registry))
     }    
 
     pub async fn recv(&mut self) -> Option<Message> {
         self.rx.recv().await
     }
 
+    #[must_use = "The result must be handled, otherwise the message will be dropped"]
     pub fn try_recv(&mut self) -> Result<Message, mpsc::error::TryRecvError> {
         self.rx.try_recv()
     }  

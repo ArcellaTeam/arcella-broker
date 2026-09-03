@@ -38,7 +38,6 @@ pub type LocalChannel = mpsc::Sender<Message>;
 pub type LocalReceiver = mpsc::Receiver<Message>;
 
 pub const REPLY_WILDCARD_ADDRESS: &str = "arcella:reply:**";
-pub const DEFAULT_REPLY_CHANNEL_CAPACITY: usize = 1024;
 
 /// Internal state of the registry, protected by a `RwLock`.
 /// Separates exact matches and wildcards for optimized lookup and conflict detection.
@@ -86,11 +85,14 @@ pub enum RegistryError {
 
     #[error("Waiter already exists")]
     WaiterAlreadyExists,
+
+    #[error("Address is reserved")]
+    ReservedAddress
 }
 
 impl LocalRegistry {
     /// Creates a new, empty `LocalRegistry`.
-    pub fn new(reply_channel_capacity: usize) -> Self {
+    pub(crate) fn new(reply_channel_capacity: usize) -> Self {
         assert!(
             reply_channel_capacity > 0,
             "reply_channel_capacity must be greater than 0"
@@ -330,9 +332,9 @@ impl LocalRegistry {
     ///
     /// Note: This is a silent no-op if the address/pattern is not found, 
     /// which is standard for cleanup operations.
-    pub fn unregister(&self, address: &str) {
+    pub fn unregister(&self, address: &str) -> Result<(), RegistryError>{
         if address == REPLY_WILDCARD_ADDRESS {
-            return;
+            return Err(RegistryError::ReservedAddress);
         }
 
         let mut recipients = self.recipients.write();
@@ -342,6 +344,7 @@ impl LocalRegistry {
         } else {
             recipients.exact.remove(address);
         }
+        Ok(())
     }
 
     /// Finds a local channel for the given address.
@@ -392,12 +395,6 @@ impl LocalRegistry {
         self.lookup(address).is_some()
     }
 
-}
-
-impl Default for LocalRegistry {
-    fn default() -> Self {
-        Self::new(DEFAULT_REPLY_CHANNEL_CAPACITY)
-    }
 }
 
 #[cfg(test)]
