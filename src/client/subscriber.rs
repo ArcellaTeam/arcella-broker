@@ -42,6 +42,7 @@ impl Subscriber {
         self.rx.recv().await
     }
 
+    #[must_use = "The result must be handled, otherwise the message will be dropped"]
     pub fn try_recv(&mut self) -> Result<Message, mpsc::error::TryRecvError> {
         self.rx.try_recv()
     }  
