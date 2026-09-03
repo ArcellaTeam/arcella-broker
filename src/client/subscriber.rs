@@ -35,7 +35,7 @@ impl Subscriber {
     ) -> Result<Self, RegistryError> {
         let (tx, rx) = mpsc::channel::<Message>(capacity);
         registry.register(address.clone(), tx)?;
-        Ok(Self { rx, address, registry })
+        Ok(Self::new(rx, address, registry))
     }    
 
     pub async fn recv(&mut self) -> Option<Message> {
