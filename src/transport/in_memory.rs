@@ -23,9 +23,37 @@ use std::{
 use tokio::time;
 
 use crate::protocol::Message;
-use crate::registry::LocalRegistry;
+use crate::registry::{LocalChannel, LocalRegistry};
 
-use super::{Transport, TransportError, TransportResult};
+use super::{Endpoint, ResolvedEndpoint, Transport, TransportError, TransportResult};
+
+pub struct InMemoryEndpoint {
+    channel: LocalChannel,
+}
+
+impl InMemoryEndpoint {
+    pub(crate) fn new(channel: LocalChannel) -> Self {
+        Self { channel }
+    }
+}
+
+impl Endpoint for InMemoryEndpoint {
+    fn send<'a>(
+        &'a self,
+        message: Message,
+    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.channel.send(message).await.map_err(|_| {
+                TransportError::ConnectionClosed
+            })
+        })
+    }
+    
+    fn is_alive(&self) -> bool {
+        // mpsc::Sender считается живым, пока существует хотя бы один активный Receiver.
+        !self.channel.is_closed()
+    }
+}
 
 /// Transport for in-process delivery.
 /// 
@@ -46,9 +74,51 @@ impl InMemoryTransport {
     pub fn new(registry: Arc<LocalRegistry>, request_timeout: Duration) -> Self {
         Self { registry, request_timeout }
     }
+
+    async fn perform_request(
+        &self,
+        send_action: impl Future<Output = TransportResult<()>>,
+        msg_id: [u8; 16],
+    ) -> TransportResult<Message> {
+        let dispatcher = self.registry.reply_dispatcher();
+        let (_guard, receiver) = dispatcher.register_waiter(msg_id)
+            .map_err(TransportError::Registry)?;
+
+        send_action.await?;
+
+        match time::timeout(self.request_timeout, receiver).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(TransportError::ConnectionClosed),
+            Err(_) => Err(TransportError::Timeout),
+        }
+    }
+
 }
 
 impl Transport for InMemoryTransport {
+    /// Resolve address for the recipient at the specified address.
+    ///
+    /// # Arguments
+    /// * `address` - the string address of the recipient.
+    ///
+    /// # Returns
+    /// `Ok(ResolvedEndpoint)` if the address is successfully resolved, or an error if
+    /// the recipient is not found or the channel is closed.
+    fn resolve<'a>(
+        &'a self,
+        address: &'a str,
+    ) -> Pin<Box<dyn Future<Output = TransportResult<ResolvedEndpoint>> + Send + 'a>> {
+        Box::pin(async move {
+            match self.registry.lookup(address) {
+                Some(channel) => {
+                    // Создаем type-erased endpoint
+                    Ok(ResolvedEndpoint::new(InMemoryEndpoint::new(channel)))
+                }
+                None => Err(TransportError::RecipientNotFound(address.to_string())),
+            }
+        })
+    }
+    
     /// Asynchronously sends a message to the specified address.
     ///
     /// # Arguments
@@ -66,6 +136,10 @@ impl Transport for InMemoryTransport {
         Box::pin(async move {
             match self.registry.lookup(address) {
                 Some(channel) => {
+					// IMPORTANT: Using .await on mpsc::Sender provides natural backpressure.
+					// If the receiver's queue is full, the sender will be blocked, preventing
+					// unbounded memory growth (OOM) with slow consumers or DoS attacks.																	 
+															   
                     channel.send(message).await.map_err(|_| {
                         // If sending fails, we assume the recipient is unavailable
                         TransportError::ConnectionClosed
@@ -76,6 +150,26 @@ impl Transport for InMemoryTransport {
             }
         })
     }
+
+    /// Send a message to resolved endpoint
+    ///
+    /// # Arguments
+    /// * `endpoint` - the endpoint for resolved address of the recipient.
+    /// * `message` - the message to be sent.
+    ///
+    /// # Returns
+    /// `Ok(())` if the message is successfully queued in the channel, or an error if
+    /// the recipient is not found or the channel is closed.
+    fn send_to<'a>(
+        &'a self,
+        endpoint: &'a ResolvedEndpoint,
+        message: Message,
+    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // Делегируем отправку самому endpoint'у
+            endpoint.send(message).await
+        })
+    }    
 
     /// Sends a request and waits for a response with a timeout.
     ///
@@ -93,24 +187,23 @@ impl Transport for InMemoryTransport {
         message: Message,
     ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
         Box::pin(async move {
-            let dispatcher = self.registry.reply_dispatcher();
-            let msg_id = message.header.message_id;
-
-            // Register waiting for a response and get the receiver
-            let (_guard, receiver) = dispatcher.register_waiter(msg_id)
-                .map_err(TransportError::Registry)?;
-
-            // Send the original message
-            self.send(address, message).await?;
-
-            // Set the response wait timeout (30 seconds)
-            match time::timeout(self.request_timeout, receiver).await {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(_)) => Err(TransportError::ConnectionClosed),
-                Err(_) => Err(TransportError::Timeout),
-            }
+            let message_id = message.header.message_id;
+            let send_future = self.send(address, message); 
+            self.perform_request(send_future, message_id).await 
         })
     }
+
+    fn request_to<'a>(
+        &'a self,
+        endpoint: &'a ResolvedEndpoint,
+        message: Message,
+    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
+        Box::pin(async move { 
+            let message_id = message.header.message_id; 
+            let send_future = endpoint.send(message); 
+            self.perform_request(send_future, message_id).await 
+        })
+    }    
 
     /// Method for receiving messages (stub for this implementation).
     ///
