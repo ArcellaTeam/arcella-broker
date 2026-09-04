@@ -46,8 +46,8 @@ impl BrokerClient {
 
     /// Unregister a recipient at the specified address.
     /// This will close the receiver's channel, causing any pending `recv()` calls to return `None`.
-    pub fn unbind(&self, address: &str) {
-        self.broker.registry.unregister(address);
+    pub fn unbind(&self, address: &str) -> Result<(), RegistryError> {
+        self.broker.registry.unregister(address)
     }    
 
     /// Send a message (InOnly).
@@ -217,7 +217,7 @@ mod tests {
         assert!(subscriber.recv().await.is_some());
 
         // Unregistration
-        client.unbind("arcella:test");
+        assert!(client.unbind("arcella:test").is_ok());
 
         // Should return an error again
         let msg2 = test_utils::dummy_in_only_message(Bytes::from_static(b"test2"),
