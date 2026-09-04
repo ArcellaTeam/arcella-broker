@@ -36,6 +36,10 @@ use super::{
 /// Upon creation, it registers an `oneshot::Sender` in the dispatcher.
 /// Upon destruction (going out of scope or panicking), it automatically 
 /// removes the registration from the dispatcher, preventing memory leaks in the `HashMap`.
+///
+/// IMPORTANT: This mechanism is critical for the WebAssembly environment, where instances
+/// can be destroyed asynchronously or due to a trap. It guarantees the absence of
+/// "zombie" waits and memory leaks.
 pub struct WaiterGuard {
     /// Reference to the dispatcher for cleanup upon drop.
     dispatcher: ReplyDispatcher,

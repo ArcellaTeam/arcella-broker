@@ -37,8 +37,8 @@ pub const MESSAGE_ID_LEN: usize = 16;
 pub const SUB_MESSAGE_ID_LEN: usize = 4;
 
 /// Size of the fixed header in bytes
-/// 2 (version) + 1 (flags) + 1 (priority) + 32 (token) + 16 (guid) + 4 (sub_id)+ 1 (ttl) 
-/// + 1 (type_len) + 2 (addr_len) + 4 (payload_len) = 64 bytes
+/// 2 (version) + 1 (flags) + 1 (priority) + 32 (token) + 16 (guid) + 4 (sub_id)
+/// + 1 (ttl) + 1 (type_len) + 2 (addr_len) + 4 (payload_len) = 64 bytes
 pub const FIXED_HEADER_SIZE: usize = 64;
 
 // ============================================================================
@@ -146,7 +146,7 @@ impl TransferMode {
 /// - priority: u8 — message priority
 /// - session_token: [u8; SESSION_TOKEN_LEN] — session token (SHA-256/BLAKE3)
 /// - message_id: [u8; MESSAGE_ID_LEN] — unique message identifier (GUID)
-/// - sub_message_id: [u8; SUB_MESSAGE_ID_LEN] — unique submessage identifier (GUID)
+/// - sub_message_id: [u8; SUB_MESSAGE_ID_LEN] — unique submessage identifier
 /// - ttl: u8 — routing counter (Time To Live)
 /// - msg_type_len: u8 — message type length
 /// - address_len: u16 — recipient address length
@@ -409,9 +409,8 @@ impl Message {
             return Err(ProtocolError::IncompleteMsgType);
         }
         let msg_type = buf.copy_to_bytes(msg_type_len);
-        //let msg_type = str::from_utf8(&msg_type_bytes)
-        //    .map_err(|_| ProtocolError::InvalidMsgTypeUtf8)?
-        //    .to_string();
+        let _msg_type = str::from_utf8(&msg_type)
+            .map_err(|_| ProtocolError::InvalidMsgTypeUtf8)?;
 
         // 3. Read the recipient address
         let address_len = header.address_len as usize;
@@ -419,16 +418,11 @@ impl Message {
             return Err(ProtocolError::IncompleteAddress);
         }
         let address = buf.copy_to_bytes(address_len);
-        //let address = str::from_utf8(&address_bytes)
-        //    .map_err(|_| ProtocolError::InvalidAddressUtf8)?
-        //    .to_string();
-
-        // 4. Validate address
         let address_str = str::from_utf8(&address)
             .map_err(|_| ProtocolError::InvalidAddressUtf8)?;
-        validate_address(&address_str)?;
+        validate_address(address_str)?;
 
-        // 5. Read payload (zero-copy via Bytes)
+        // 4. Read payload (zero-copy via Bytes)
         let payload_len = header.payload_len as usize;
         if buf.remaining() < payload_len {
             return Err(ProtocolError::IncompletePayload);

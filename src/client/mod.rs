@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 mod subscriber;
+mod publisher;
 
 use crate::config::SubscriberConfig;
 use crate::broker::Broker;
@@ -18,16 +19,18 @@ use crate::registry::{LocalChannel, RegistryError};
 use crate::transport::{in_memory::InMemoryTransport, Transport, TransportResult};
 
 use subscriber::Subscriber;
+use publisher::Publisher;
 
 pub struct BrokerClient {
     broker: Arc<Broker>,
-    local: InMemoryTransport,
+    local: Arc<InMemoryTransport>,
     // remote: Option<IpcTransport>,  // Will be added in stage 2
 }
 
 impl BrokerClient {
     pub(crate) fn new(broker: Arc<Broker>) -> Self {
-        let local = InMemoryTransport::new(broker.registry.clone(), broker.config.request_timeout());
+        let transport = InMemoryTransport::new(broker.registry.clone(), broker.config.request_timeout());
+        let local = Arc::new(transport);
         Self { broker, local }
     }
 
@@ -43,11 +46,16 @@ impl BrokerClient {
     pub fn bind(&self, address: String, incoming_tx: LocalChannel) -> Result<(), RegistryError> {
         self.broker.registry.register(address, incoming_tx)
     }
+    
 
     /// Unregister a recipient at the specified address.
     /// This will close the receiver's channel, causing any pending `recv()` calls to return `None`.
-    pub fn unbind(&self, address: &str) {
-        self.broker.registry.unregister(address);
+    pub fn unbind(&self, address: &str) -> Result<(), RegistryError> {
+        self.broker.registry.unregister(address)
+    }    
+
+    pub fn publisher(&self, address: String) -> Publisher {
+        Publisher::new(address, self.local.clone()) 
     }    
 
     /// Send a message (InOnly).
@@ -217,7 +225,7 @@ mod tests {
         assert!(subscriber.recv().await.is_some());
 
         // Unregistration
-        client.unbind("arcella:test");
+        assert!(client.unbind("arcella:test").is_ok());
 
         // Should return an error again
         let msg2 = test_utils::dummy_in_only_message(Bytes::from_static(b"test2"),

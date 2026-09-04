@@ -34,16 +34,40 @@ async fn test_high_throughput_in_memory_routing() {
     let client = broker.client();
 
     // 2. Register Receivers and spawn receiver tasks
+    let mut receiver_addresses = Vec::with_capacity(NUM_RECEIVERS);
+    let mut message_templates = Vec::with_capacity(NUM_RECEIVERS);    
     let mut receiver_handles = Vec::with_capacity(NUM_RECEIVERS);
 
-    let subscriber_config = SubscriberConfig::new();
+    let subscriber_config = SubscriberConfig::new().with_channel_capacity(4096);
     
     for i in 0..NUM_RECEIVERS {
-        let addr = format!("arcella:perf:recv:{}", i);
+        let addr_str = format!("arcella:perf:recv:{}", i);
+        let addr_bytes = Bytes::from(addr_str.clone());
         
-        // Register the sender half in the broker registry
-        let mut subscriber = client.subscribe(addr, subscriber_config.clone()).expect("Can not subscribe channel");
-        
+        receiver_addresses.push(addr_str);
+
+        let msg = Message::new(
+            TransferMode::InOnly,
+            [0u8; 32], // session_token (в реальном сценарии выдается коннектором)
+            [0u8; 16], // message_id (будет перезаписан в цикле для уникальности)
+            [0u8; 4],  // sub_message_id
+            0,         // priority
+            64,        // ttl
+            Bytes::from_static(b"perf:test"),
+            addr_bytes,
+            Bytes::from_static(b"performance test payload data"),
+        ).expect("Message creation should not fail");
+
+        message_templates.push(msg);
+    }
+
+    for i in 0..NUM_RECEIVERS {
+
+        let addr = receiver_addresses[i].clone(); 
+
+        let mut subscriber = client.subscribe(addr, subscriber_config.clone())
+            .expect("Failed to subscribe");
+
         // Spawn a dedicated task for each receiver to consume messages
         let handle = tokio::spawn(async move {
             let mut count = 0;
@@ -60,32 +84,25 @@ async fn test_high_throughput_in_memory_routing() {
     let start_time = Instant::now();
     let mut sender_handles = Vec::with_capacity(NUM_SENDERS);
     
-    for i in 0..NUM_SENDERS {
+    for sender_id in 0..NUM_SENDERS {
         let client = broker.client();
+        let target_idx = (sender_id + 50) % NUM_RECEIVERS;
+        let addr_str = format!("arcella:perf:recv:{}", target_idx);
+
+        let publisher = client.publisher(addr_str.clone());
+        let base_msg = message_templates[target_idx].clone();
 
         let handle = tokio::spawn(async move {
-            // Route messages to a specific receiver (with an offset to test routing logic)
-            let target_idx = (i + 50) % NUM_RECEIVERS;
-            let addr_str = format!("arcella:perf:recv:{}", target_idx);
-            let addr = Bytes::from(addr_str.clone());
-            let msg_type_str = Bytes::from_static(b"perf:test");
-            let payload = Bytes::from_static(b"performance test payload data data");
-            
-            for _j in 0..MESSAGES_PER_SENDER {
-                // Using Bytes::from_static to avoid payload allocation overhead
-                let msg = Message::new(
-                    TransferMode::InOnly,
-                    [0u8; 32], // session_token
-                    [0u8; 16], // message_id
-                    [0u8; 4],
-                    0,        // priority
-                    64,        // ttl
-                    msg_type_str.clone(),
-                    addr.clone(),
-                    payload.clone(),
-                ).expect("Message creation should not fail in test");
                 
-                client.send(&addr_str, msg).await.expect("Send should succeed");
+            for seq in 0..MESSAGES_PER_SENDER {
+
+                let mut msg = base_msg.clone();
+                msg.header.message_id[0] = (sender_id % 256) as u8;
+                msg.header.message_id[1] = ((seq >> 16) & 0xFF) as u8;
+                msg.header.message_id[2] = ((seq >> 8) & 0xFF) as u8;
+                msg.header.message_id[3] = (seq & 0xFF) as u8;
+                
+                publisher.send(msg).await.expect("Send should succeed");
             }
         });
         sender_handles.push(handle);
@@ -100,7 +117,7 @@ async fn test_high_throughput_in_memory_routing() {
     // 5. Unbind receivers to close their channels and signal them to terminate
     for i in 0..NUM_RECEIVERS {
         let addr = format!("arcella:perf:recv:{}", i);
-        client.unbind(&addr);
+        client.unbind(&addr).unwrap();
     }
 
     // 6. Wait for all receivers to finish processing and sum up received messages
