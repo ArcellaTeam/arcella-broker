@@ -90,7 +90,7 @@ async fn test_high_throughput_in_memory_routing() {
         let addr_str = format!("arcella:perf:recv:{}", target_idx);
 
         let publisher = client.publisher(addr_str.clone());
-        let mut base_msg = message_templates[target_idx].clone();
+        let base_msg = message_templates[target_idx].clone();
 
         let handle = tokio::spawn(async move {
                 

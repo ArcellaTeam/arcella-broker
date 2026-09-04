@@ -42,7 +42,7 @@ impl Publisher {
         // 2. Slow endpoint check
         let resolved_ep = self.transport.resolve(&self.address).await?;
 
-        let mut guard = self.cached_endpoint.upgradable_read();
+        let guard = self.cached_endpoint.upgradable_read();
 
         if let Some(ep) = guard.as_ref() {
             if ep.is_alive() {

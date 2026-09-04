@@ -56,6 +56,6 @@ impl Subscriber {
 impl Drop for Subscriber {
     fn drop(&mut self) {
         // Automatic cleanup when going out of scope
-        self.registry.unregister(&self.address);
+        self.registry.unregister(&self.address).unwrap();
     }
 }
