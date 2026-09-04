@@ -23,6 +23,12 @@
 //! Every address can have at most one recipient. Conflicting subscriptions 
 //! (e.g., registering a wildcard that covers an already registered exact address, 
 //! or vice versa) are rejected at registration time to prevent ambiguous routing.
+//! 
+//! # Architectural Note (Performance)
+//! In the current implementation, wildcard address lookup in the lookup method is 
+//! performed via linear scanning (O(N), where N is the number of wildcard rules).
+//! To achieve the O(L) performance specified in the requirements (where L is the address length),
+//! future versions plan to migrate the wildcards index to a Radix Tree (Trie) data structure.   
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
