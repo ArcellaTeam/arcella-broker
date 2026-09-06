@@ -56,6 +56,8 @@ impl Subscriber {
 impl Drop for Subscriber {
     fn drop(&mut self) {
         // Automatic cleanup when going out of scope
-        self.registry.unregister(&self.address).unwrap();
+        if let Err(e) = self.registry.unregister(&self.address) {
+            tracing::warn!(address = %self.address, error = %e, "Failed to unregister subscriber on drop");
+        }
     }
 }
