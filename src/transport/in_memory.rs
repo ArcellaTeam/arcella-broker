@@ -212,7 +212,7 @@ impl Transport for InMemoryTransport {
     /// # Note
     /// In the current architecture, `InMemoryTransport` is used primarily 
     /// for sending (send/request). Message reception is usually handled 
-    /// by the component directly via `MessageReciever` obtained during registration.
+    /// by the component directly via `MessageReceiver` obtained during registration.
     fn receive<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
