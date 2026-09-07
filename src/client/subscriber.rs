@@ -12,16 +12,18 @@ use tokio::sync::mpsc;
 
 use crate::protocol::Message;
 use crate::registry::{LocalRegistry, RegistryError};
+use crate::transport::channel::{MessageSender, MessageReceiver};
+
 
 pub struct Subscriber {
-    rx: mpsc::Receiver<Message>,
+    rx: MessageReceiver,
     address: String,
     registry: Arc<LocalRegistry>,
 }
 
 impl Subscriber {
     pub(crate) fn new(
-        rx: mpsc::Receiver<Message>,
+        rx: MessageReceiver,
         address: String,
         registry: Arc<LocalRegistry>,
     ) -> Self {
@@ -34,8 +36,10 @@ impl Subscriber {
         capacity: usize
     ) -> Result<Self, RegistryError> {
         let (tx, rx) = mpsc::channel::<Message>(capacity);
-        registry.register(address.clone(), tx)?;
-        Ok(Self::new(rx, address, registry))
+        let sender = MessageSender::new(tx);
+        let reciever = MessageReceiver::new(rx);
+        registry.register(address.clone(), sender)?;
+        Ok(Self::new(reciever, address, registry))
     }    
 
     pub async fn recv(&mut self) -> Option<Message> {

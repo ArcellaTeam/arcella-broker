@@ -13,6 +13,13 @@ use crate::protocol::ProtocolError;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BrokerError {
+
+    #[error("Channel is closed")]
+    ChannelClosed,
+
+    #[error("Channel is full")]
+    ChannelFull,
+
     #[error("Arcella broker protocol error: {0}")]
     ProtocolError (#[from] ProtocolError),
 }
