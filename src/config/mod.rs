@@ -53,11 +53,6 @@ impl Default for BrokerConfig {
 }
 
 impl BrokerConfig {
-    /// Creates a new configuration with default values.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Sets the capacity of the reply channel (InOut).
     #[must_use]
     pub fn with_reply_channel_capacity(mut self, capacity: usize) -> Result<Self, ConfigError> {
@@ -110,11 +105,6 @@ impl Default for SubscriberConfig {
 }
 
 impl SubscriberConfig {
-    /// Creates a new subscriber configuration with default values.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Modifies the channel capacity (builder pattern).
     #[must_use]
     pub fn with_channel_capacity(mut self, channel_capacity: usize)  -> Result<Self, ConfigError> {

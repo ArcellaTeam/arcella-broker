@@ -90,7 +90,7 @@ mod tests {
 
         // 2. Prepare the receiver (Actor pattern)
         let target_address = "arcella:core:test:receiver".to_string();
-        let subscriber_config = SubscriberConfig::new();
+        let subscriber_config = SubscriberConfig::default();
         let mut subscriber = client.subscribe(target_address.clone(), subscriber_config).expect("Subscription should succeed");
 
         // 3. Create a test message
@@ -140,7 +140,7 @@ mod tests {
             "arcella:batch:processor",
         ];
 
-        let subscriber_config = SubscriberConfig::new();
+        let subscriber_config = SubscriberConfig::default();
 
         let mut subscribers = Vec::new();
         for addr in &addresses {
@@ -220,7 +220,7 @@ mod tests {
         
         assert!(client.send("arcella:test", msg.clone()).await.is_err());
 
-        let subscriber_config = SubscriberConfig::new();
+        let subscriber_config = SubscriberConfig::default();
 
         // Registration
         let mut subscriber = client.subscribe("arcella:test".to_string(), subscriber_config).expect("Subscription should succeed");
@@ -246,7 +246,7 @@ async fn test_subscription_cleanup_and_re_registration() {
         
         let addr = "arcella:test:duplicate";
 
-        let subscriber_config = SubscriberConfig::new();
+        let subscriber_config = SubscriberConfig::default();
 
         // 1. First subscription
         let sub1 = client.subscribe(addr.to_string(), subscriber_config.clone()).expect("First subscription should succeed");

@@ -38,7 +38,7 @@ async fn test_high_throughput_in_memory_routing() {
     let mut message_templates = Vec::with_capacity(NUM_RECEIVERS);    
     let mut receiver_handles = Vec::with_capacity(NUM_RECEIVERS);
 
-    let subscriber_config = SubscriberConfig::new()
+    let subscriber_config = SubscriberConfig::default()
         .with_channel_capacity(4096)
         .expect("Channel capacity 4096 should be valid");
     
