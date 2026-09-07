@@ -8,8 +8,26 @@
 // except according to those terms.
 
 use tokio::sync::mpsc;
+
 use crate::protocol::Message;
 use crate::error::BrokerError;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TryRecvError {
+    #[error("Channel is empty")]
+    Empty,
+    #[error("Channel is disconnected")]
+    Disconnected,
+}
+
+impl From<mpsc::error::TryRecvError> for TryRecvError {
+    fn from(err: mpsc::error::TryRecvError) -> Self {
+        match err {
+            mpsc::error::TryRecvError::Empty => TryRecvError::Empty,
+            mpsc::error::TryRecvError::Disconnected => TryRecvError::Disconnected,
+        }
+    }
+}
 
 /// Типобезопасный отправитель сообщений.
 #[derive(Clone)]
@@ -73,8 +91,8 @@ impl MessageReceiver {
     }
 
     /// Неблокирующая попытка получения.
-    pub fn try_recv(&mut self) -> Result<Message, mpsc::error::TryRecvError> {
-        self.inner.try_recv()
+    pub fn try_recv(&mut self) -> Result<Message, TryRecvError> {
+        self.inner.try_recv().map_err(Into::into)
     }
 
     /// Получение с таймаутом (критично для Wasm-среды).
