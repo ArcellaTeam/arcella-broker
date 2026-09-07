@@ -29,7 +29,7 @@ impl Broker {
     }
 
     pub fn default_config() -> BrokerConfig {
-        BrokerConfig::new()
+        BrokerConfig::default()
     }
 
     pub fn client(self: &Arc<Self>) -> crate::client::BrokerClient {
@@ -39,6 +39,6 @@ impl Broker {
 
 impl Default for Broker {
     fn default() -> Self {
-        Self::new(BrokerConfig::new())
+        Self::new(BrokerConfig::default())
     }
 }

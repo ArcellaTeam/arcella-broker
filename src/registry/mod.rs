@@ -103,10 +103,10 @@ impl LocalRegistry {
         // Create channel for the reply wildcard subscription
         let (reply_tx, reply_rx) = mpsc::channel(reply_channel_capacity);
         let sender = MessageSender::new(reply_tx);
-        let reciever = MessageReceiver::new(reply_rx);
+        let receiver = MessageReceiver::new(reply_rx);
         
         // Initialize ReplyDispatcher (starts background listener task)
-        let reply_dispatcher = ReplyDispatcher::new(reciever);
+        let reply_dispatcher = ReplyDispatcher::new(receiver);
 
         // Pre-register the reply wildcard in the wildcards map
         let mut wildcards = HashMap::new();

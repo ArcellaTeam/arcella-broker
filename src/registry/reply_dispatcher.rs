@@ -100,7 +100,7 @@ impl ReplyDispatcher {
     /// Creates a new dispatcher and starts the background listening task.
     ///
     /// # Arguments
-    /// * `rx` - the receiver (`MessageReciever`) from which incoming responses are read.
+    /// * `rx` - the receiver (`MessageReceiver`) from which incoming responses are read.
     pub(crate) fn new(rx: MessageReceiver) -> Self {
         let waiters: Arc<Mutex<HashMap<[u8; 16], oneshot::Sender<Message>>>> = Arc::new(Mutex::new(HashMap::new()));
         let waiters_clone = waiters.clone(); 

@@ -8,10 +8,28 @@
 // except according to those terms.
 
 use tokio::sync::mpsc;
+
 use crate::protocol::Message;
 use crate::error::BrokerError;
 
-/// Типобезопасный отправитель сообщений.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TryRecvError {
+    #[error("Channel is empty")]
+    Empty,
+    #[error("Channel is disconnected")]
+    Disconnected,
+}
+
+impl From<mpsc::error::TryRecvError> for TryRecvError {
+    fn from(err: mpsc::error::TryRecvError) -> Self {
+        match err {
+            mpsc::error::TryRecvError::Empty => TryRecvError::Empty,
+            mpsc::error::TryRecvError::Disconnected => TryRecvError::Disconnected,
+        }
+    }
+}
+
+/// Type-safe message sender.
 #[derive(Clone)]
 pub struct MessageSender {
     inner: mpsc::Sender<Message>,
@@ -22,32 +40,34 @@ impl MessageSender {
         Self { inner }
     }
 
-    /// Асинхронная отправка с естественным backpressure.
-    /// Если очередь получателя переполнена — вызывающая задача будет приостановлена.
+    /// Asynchronous send with natural backpressure.
+    /// If the receiver's queue is full, the calling task will be suspended.
     pub async fn send(&self, message: Message) -> Result<(), BrokerError> {
         self.inner
             .send(message)
             .await
-            .map_err(|_| BrokerError::ChannelClosed)
-    }
-
-    /// Неблокирующая попытка отправки.
-    /// Возвращает сообщение обратно, если очередь переполнена.
-    pub fn try_send(&self, message: Message) -> Result<(), (BrokerError, Message)> {
-        self.inner
-            .try_send(message)
             .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(msg) => (BrokerError::ChannelFull, msg),
-                mpsc::error::TrySendError::Closed(msg) => (BrokerError::ChannelClosed, msg),
+                mpsc::error::SendError(msg) => BrokerError::ChannelClosed(msg),
             })
     }
 
-    /// Проверка живости получателя.
+    /// Non-blocking send attempt.
+    /// Returns the message back if the queue is full.
+    pub fn try_send(&self, message: Message) -> Result<(), BrokerError> {
+        self.inner
+            .try_send(message)
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(msg) => BrokerError::ChannelFull(msg),
+                mpsc::error::TrySendError::Closed(msg) => BrokerError::ChannelClosed(msg),
+            })
+    }
+
+    /// Checks whether the receiver is alive.
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
 
-    /// Текущая загруженность канала (для метрик/телеметрии).
+    /// Current channel utilization (for metrics/telemetry).
     pub fn load(&self) -> ChannelLoad {
         ChannelLoad {
             capacity: self.inner.capacity(),
@@ -56,7 +76,7 @@ impl MessageSender {
     }
 }
 
-/// Типобезопасный получатель сообщений.
+/// Type-safe message receiver.
 pub struct MessageReceiver {
     inner: mpsc::Receiver<Message>,
 }
@@ -66,18 +86,18 @@ impl MessageReceiver {
         Self { inner }
     }
 
-    /// Асинхронное получение следующего сообщения.
-    /// Возвращает `None`, если все отправители были удалены (канал закрыт).
+    /// Asynchronously receives the next message.
+    /// Returns `None` if all senders have been dropped (channel closed).
     pub async fn recv(&mut self) -> Option<Message> {
         self.inner.recv().await
     }
 
-    /// Неблокирующая попытка получения.
-    pub fn try_recv(&mut self) -> Result<Message, mpsc::error::TryRecvError> {
-        self.inner.try_recv()
+    /// Non-blocking receive attempt.
+    pub fn try_recv(&mut self) -> Result<Message, TryRecvError> {
+        self.inner.try_recv().map_err(Into::into)
     }
 
-    /// Получение с таймаутом (критично для Wasm-среды).
+    /// Receive with a timeout (critical for Wasm environments).
     pub async fn recv_timeout(
         &mut self,
         timeout: std::time::Duration,
@@ -89,7 +109,7 @@ impl MessageReceiver {
     }
 }
 
-/// Информация о загруженности канала (для метрик).
+/// Channel utilization information (for metrics).
 pub struct ChannelLoad {
     pub capacity: usize,
     pub max_capacity: usize,
