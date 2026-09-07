@@ -13,6 +13,7 @@ use std::{
     sync::Arc,
 };
 
+pub mod channel;
 pub mod in_memory;
 
 use crate::protocol::{Message, ProtocolError};

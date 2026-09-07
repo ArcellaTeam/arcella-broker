@@ -36,12 +36,8 @@ use tokio::sync::mpsc;
 
 mod reply_dispatcher;
 
-use crate::protocol::Message;
+use crate::transport::channel::{MessageSender, MessageReceiver};
 use reply_dispatcher::ReplyDispatcher;
-
-/// Channel type for local message delivery.
-pub type LocalChannel = mpsc::Sender<Message>;
-pub type LocalReceiver = mpsc::Receiver<Message>;
 
 pub const REPLY_WILDCARD_ADDRESS: &str = "arcella:reply:**";
 
@@ -49,9 +45,9 @@ pub const REPLY_WILDCARD_ADDRESS: &str = "arcella:reply:**";
 /// Separates exact matches and wildcards for optimized lookup and conflict detection.
 struct RegistryInner {
     /// Exact address -> channel
-    exact: HashMap<String, LocalChannel>,
+    exact: HashMap<String, MessageSender>,
     /// Wildcard pattern -> channel
-    wildcards: HashMap<String, LocalChannel>,
+    wildcards: HashMap<String, MessageSender>,
     /// Dispatcher for InOut (Request/Response) message correlations
     reply_dispatcher: ReplyDispatcher,
 }
@@ -106,13 +102,15 @@ impl LocalRegistry {
                 
         // Create channel for the reply wildcard subscription
         let (reply_tx, reply_rx) = mpsc::channel(reply_channel_capacity);
+        let sender = MessageSender::new(reply_tx);
+        let reciever = MessageReceiver::new(reply_rx);
         
         // Initialize ReplyDispatcher (starts background listener task)
-        let reply_dispatcher = ReplyDispatcher::new(reply_rx);
+        let reply_dispatcher = ReplyDispatcher::new(reciever);
 
         // Pre-register the reply wildcard in the wildcards map
         let mut wildcards = HashMap::new();
-        wildcards.insert(REPLY_WILDCARD_ADDRESS.to_string(), reply_tx);        
+        wildcards.insert(REPLY_WILDCARD_ADDRESS.to_string(), sender);        
 
         Self {
             recipients: RwLock::new(RegistryInner {
@@ -261,7 +259,7 @@ impl LocalRegistry {
     ///
     /// Automatically routes to `register_exact` or `register_wildcard` based on 
     /// the presence of the `*` character.
-    pub fn register(&self, address: String, channel: LocalChannel) -> Result<(), RegistryError> {
+    pub fn register(&self, address: String, channel: MessageSender) -> Result<(), RegistryError> {
         if Self::is_wildcard(&address) {
             self.register_wildcard(address, channel)
         } else {
@@ -273,7 +271,7 @@ impl LocalRegistry {
     fn register_exact(
         &self,
         address: String,
-        channel: LocalChannel,
+        channel: MessageSender,
     ) -> Result<(), RegistryError> {
 
         let mut recipients = self.recipients.write();
@@ -303,7 +301,7 @@ impl LocalRegistry {
     fn register_wildcard(
         &self,
         pattern: String,
-        channel: LocalChannel,
+        channel: MessageSender,
     ) -> Result<(), RegistryError> {
         // 1. Validate wildcard format syntax
         Self::validate_wildcard_pattern(&pattern)?;
@@ -357,7 +355,7 @@ impl LocalRegistry {
     ///
     /// Returns `Some(channel)` if a recipient exists in this process.
     /// Priority is given to exact matches, followed by wildcard matches.
-    pub fn lookup(&self, address: &str) -> Option<LocalChannel> {
+    pub fn lookup(&self, address: &str) -> Option<MessageSender> {
         let recipients = self.recipients.read();
 
         // 1. Exact match - highest priority and fastest path (O(1))
@@ -366,7 +364,7 @@ impl LocalRegistry {
         }
 
         // 2. Scan wildcard index
-        let mut best: Option<(usize, LocalChannel)> = None;
+        let mut best: Option<(usize, MessageSender)> = None;
         for (pattern, channel) in &recipients.wildcards {
             if Self::compare_segments(pattern, address, false) {
                 let specificity = pattern

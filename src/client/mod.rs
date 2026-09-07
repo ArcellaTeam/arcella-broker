@@ -15,8 +15,13 @@ mod publisher;
 use crate::config::SubscriberConfig;
 use crate::broker::Broker;
 use crate::protocol::Message;
-use crate::registry::{LocalChannel, RegistryError};
-use crate::transport::{in_memory::InMemoryTransport, Transport, TransportResult};
+use crate::registry::RegistryError;
+use crate::transport::{
+    channel::MessageSender,
+    in_memory::InMemoryTransport, 
+    Transport, 
+    TransportResult,
+};
 
 use subscriber::Subscriber;
 use publisher::Publisher;
@@ -43,8 +48,8 @@ impl BrokerClient {
     }    
     
     /// Register itself as a receiver at the specified address.
-    pub fn bind(&self, address: String, incoming_tx: LocalChannel) -> Result<(), RegistryError> {
-        self.broker.registry.register(address, incoming_tx)
+    pub fn bind(&self, address: String, sender: MessageSender) -> Result<(), RegistryError> {
+        self.broker.registry.register(address, sender)
     }
     
 

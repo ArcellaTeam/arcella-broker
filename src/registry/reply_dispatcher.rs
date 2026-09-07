@@ -24,12 +24,12 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::protocol::Message;
-
-use super::{
-    LocalReceiver, 
-    RegistryError,
+use crate::{
+    protocol::Message, 
+    transport::channel::MessageReceiver,
 };
+
+use super::RegistryError;
 
 /// RAII guard for managing the lifetime of a response wait.
 /// 
@@ -100,8 +100,8 @@ impl ReplyDispatcher {
     /// Creates a new dispatcher and starts the background listening task.
     ///
     /// # Arguments
-    /// * `rx` - the receiver (`LocalReceiver`) from which incoming responses are read.
-    pub(crate) fn new(rx: LocalReceiver) -> Self {
+    /// * `rx` - the receiver (`MessageReciever`) from which incoming responses are read.
+    pub(crate) fn new(rx: MessageReceiver) -> Self {
         let waiters: Arc<Mutex<HashMap<[u8; 16], oneshot::Sender<Message>>>> = Arc::new(Mutex::new(HashMap::new()));
         let waiters_clone = waiters.clone(); 
 

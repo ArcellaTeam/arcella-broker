@@ -23,16 +23,18 @@ use std::{
 use tokio::time;
 
 use crate::protocol::Message;
-use crate::registry::{LocalChannel, LocalRegistry};
+use crate::registry::LocalRegistry;
+use crate::transport::channel::MessageSender;
+
 
 use super::{Endpoint, ResolvedEndpoint, Transport, TransportError, TransportResult};
 
 pub struct InMemoryEndpoint {
-    channel: LocalChannel,
+    channel: MessageSender,
 }
 
 impl InMemoryEndpoint {
-    pub(crate) fn new(channel: LocalChannel) -> Self {
+    pub(crate) fn new(channel: MessageSender) -> Self {
         Self { channel }
     }
 }
@@ -210,7 +212,7 @@ impl Transport for InMemoryTransport {
     /// # Note
     /// In the current architecture, `InMemoryTransport` is used primarily 
     /// for sending (send/request). Message reception is usually handled 
-    /// by the component directly via `LocalReceiver` obtained during registration.
+    /// by the component directly via `MessageReciever` obtained during registration.
     fn receive<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
