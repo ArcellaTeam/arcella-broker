@@ -8,11 +8,26 @@
 // except according to those terms.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 pub const DEFAULT_REPLY_CHANNEL_CAPACITY: usize = 1024;
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
+pub const MAX_CHANNEL_CAPACITY: usize = 65_536;
+pub const MAX_REPLY_CHANNEL_CAPACITY: usize = 65_536;
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_TTL: u8 = 64;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ConfigError {
+    #[error("Channel capacity must be greater than 0")]
+    ZeroCapacity,
+
+    #[error("Channel capacity {0} exceeds maximum allowed value {MAX_CHANNEL_CAPACITY}")]
+    CapacityExceedsLimit(usize),
+
+    #[error("Reply channel capacity {0} exceeds maximum allowed value {MAX_REPLY_CHANNEL_CAPACITY}")]
+    ReplyCapacityExceedsLimit(usize),
+}
 
 /// Global configuration for the Arcella message broker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,10 +60,15 @@ impl BrokerConfig {
 
     /// Sets the capacity of the reply channel (InOut).
     #[must_use]
-    pub fn with_reply_channel_capacity(mut self, capacity: usize) -> Self {
-        assert!(capacity > 0, "reply_channel_capacity must be greater than 0");
+    pub fn with_reply_channel_capacity(mut self, capacity: usize) -> Result<Self, ConfigError> {
+        if capacity == 0 {
+            return Err(ConfigError::ZeroCapacity);
+        }
+        if capacity > MAX_REPLY_CHANNEL_CAPACITY {
+            return Err(ConfigError::ReplyCapacityExceedsLimit(capacity));
+        }
         self.reply_channel_capacity = capacity;
-        self
+        Ok(self)
     }
 
     /// Sets the request timeout in milliseconds.
@@ -97,9 +117,14 @@ impl SubscriberConfig {
 
     /// Modifies the channel capacity (builder pattern).
     #[must_use]
-    pub fn with_channel_capacity(mut self, channel_capacity: usize) -> Self {
-        assert!(channel_capacity > 0, "channel_capacity must be greater than 0");
+    pub fn with_channel_capacity(mut self, channel_capacity: usize)  -> Result<Self, ConfigError> {
+        if channel_capacity == 0 {
+            return Err(ConfigError::ZeroCapacity);
+        }
+        if channel_capacity > MAX_CHANNEL_CAPACITY {
+            return Err(ConfigError::CapacityExceedsLimit(channel_capacity));
+        }
         self.channel_capacity = channel_capacity;
-        self
+        Ok(self)
     }    
 }
