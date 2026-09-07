@@ -334,7 +334,7 @@ pub fn validate_address(address: &str) -> Result<(), ProtocolError> {
 /// Full microbroker message
 /// 
 /// Consists of:
-/// 1. Fixed header (60 bytes)
+/// 1. Fixed header (64 bytes)
 /// 2. Message type (UTF-8 string, < 255 bytes)
 /// 3. Recipient address (UTF-8 string, < 1024 bytes)
 /// 4. Payload (bincode, transparent to the broker)
