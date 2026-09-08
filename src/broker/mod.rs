@@ -9,7 +9,8 @@
 
 use std::sync::Arc;
 use crate::client::BrokerClient;
-use crate::config::BrokerConfig;
+use crate::config::{BrokerConfig, ClientConfig};
+use crate::error::BrokerError;
 use crate::registry::LocalRegistry;
 
 pub struct Broker {
@@ -23,7 +24,7 @@ pub struct Broker {
 impl Broker {
     pub fn new(config: BrokerConfig) -> Self {
         let config = Arc::new(config);
-        let registry = Arc::new(LocalRegistry::new(config.reply_channel_capacity));
+        let registry = Arc::new(LocalRegistry::new());
         
         Self { config, registry }
     }
@@ -32,8 +33,8 @@ impl Broker {
         BrokerConfig::default()
     }
 
-    pub fn client(self: &Arc<Self>) -> crate::client::BrokerClient {
-        BrokerClient::new(self.clone())
+    pub fn client(self: &Arc<Self>, config: ClientConfig, client_address: String) -> Result<BrokerClient, BrokerError> {
+         Ok(BrokerClient::new(self.clone(), config, client_address)?)
     }         
 }
 

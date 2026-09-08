@@ -13,7 +13,7 @@ use bytes::Bytes;
 
 use arcella_broker::{
     broker::Broker,
-    config::SubscriberConfig,
+    config::{ClientConfig, SubscriberConfig},
     protocol::{Message, TransferMode},
 };
 
@@ -29,9 +29,10 @@ const TOTAL_MESSAGES: usize = NUM_SENDERS * MESSAGES_PER_SENDER;
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn test_high_throughput_in_memory_routing() {
     // 1. Initialize config, broker and client
-    let config = Broker::default_config();
-    let broker = Arc::new(Broker::new(config));
-    let client = broker.client();
+    let broker_config = Broker::default_config();
+    let broker = Arc::new(Broker::new(broker_config));
+    let client_config = ClientConfig::default();
+    let client = broker.client(client_config.clone(), "load:test".to_string()).unwrap();
 
     // 2. Register Receivers and spawn receiver tasks
     let mut receiver_addresses = Vec::with_capacity(NUM_RECEIVERS);
@@ -57,6 +58,7 @@ async fn test_high_throughput_in_memory_routing() {
             64,        // ttl
             Bytes::from_static(b"perf:test"),
             addr_bytes,
+            Bytes::new(),
             Bytes::from_static(b"performance test payload data"),
         ).expect("Message creation should not fail");
 
@@ -87,7 +89,8 @@ async fn test_high_throughput_in_memory_routing() {
     let mut sender_handles = Vec::with_capacity(NUM_SENDERS);
     
     for sender_id in 0..NUM_SENDERS {
-        let client = broker.client();
+        let sender_addr = format!("arcella:load:test:{}", sender_id);
+        let client = broker.client(client_config.clone(), sender_addr).unwrap();
         let target_idx = (sender_id + 50) % NUM_RECEIVERS;
         let addr_str = format!("arcella:perf:recv:{}", target_idx);
 

@@ -32,14 +32,9 @@
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use thiserror::Error;
 
-mod reply_dispatcher;
-
-use crate::transport::channel::{MessageSender, MessageReceiver};
-use reply_dispatcher::ReplyDispatcher;
-
-pub const REPLY_WILDCARD_ADDRESS: &str = "arcella:reply:**";
+use crate::transport::channel::MessageSender;
 
 /// Internal state of the registry, protected by a `RwLock`.
 /// Separates exact matches and wildcards for optimized lookup and conflict detection.
@@ -48,8 +43,6 @@ struct RegistryInner {
     exact: HashMap<String, MessageSender>,
     /// Wildcard pattern -> channel
     wildcards: HashMap<String, MessageSender>,
-    /// Dispatcher for InOut (Request/Response) message correlations
-    reply_dispatcher: ReplyDispatcher,
 }
 
 /// Registry of local recipients (within a single process).
@@ -62,7 +55,7 @@ pub struct LocalRegistry {
 }
 
 /// Errors that can occur during registry operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum RegistryError {
     /// Returned when attempting to register an address or pattern that is already registered.
     #[error("Address or pattern '{0}' is already occupied")]
@@ -87,44 +80,19 @@ pub enum RegistryError {
 
     #[error("Waiter already exists")]
     WaiterAlreadyExists,
-
-    #[error("Address is reserved")]
-    ReservedAddress
 }
 
 impl LocalRegistry {
     /// Creates a new, empty `LocalRegistry`.
-    pub(crate) fn new(reply_channel_capacity: usize) -> Self {
-        assert!(
-            reply_channel_capacity > 0,
-            "reply_channel_capacity must be greater than 0"
-        );
-                
-        // Create channel for the reply wildcard subscription
-        let (reply_tx, reply_rx) = mpsc::channel(reply_channel_capacity);
-        let sender = MessageSender::new(reply_tx);
-        let receiver = MessageReceiver::new(reply_rx);
-        
-        // Initialize ReplyDispatcher (starts background listener task)
-        let reply_dispatcher = ReplyDispatcher::new(receiver);
-
-        // Pre-register the reply wildcard in the wildcards map
-        let mut wildcards = HashMap::new();
-        wildcards.insert(REPLY_WILDCARD_ADDRESS.to_string(), sender);        
+    pub(crate) fn new() -> Self {
 
         Self {
             recipients: RwLock::new(RegistryInner {
                 exact: HashMap::new(),
-                wildcards,
-                reply_dispatcher,
+                wildcards: HashMap::new(),
             }),
         }
     }
-
-    /// Returns a clone of the `ReplyDispatcher` for use in transport layers.
-    pub fn reply_dispatcher(&self) -> ReplyDispatcher {
-        self.recipients.read().reply_dispatcher.clone()
-    }    
 
     /// Returns `true` if the address contains wildcard characters (`*`).
     /// This is a fast, pre-validation check to route to the correct registration logic.
@@ -189,7 +157,7 @@ impl LocalRegistry {
     ///   universal matcher for the remainder of the comparison. Used for detecting 
     ///   conflicts between two wildcard patterns. If `false`, only `pattern` is 
     ///   treated as a wildcard, used for matching a concrete `target` address.
-    fn compare_segments<'a>(
+    fn compare_segments(
         pattern: &str,
         target: &str,
         allow_wildcard_both_sides: bool,
@@ -337,10 +305,6 @@ impl LocalRegistry {
     /// Note: This is a silent no-op if the address/pattern is not found, 
     /// which is standard for cleanup operations.
     pub fn unregister(&self, address: &str) -> Result<(), RegistryError>{
-        if address == REPLY_WILDCARD_ADDRESS {
-            return Err(RegistryError::ReservedAddress);
-        }
-
         let mut recipients = self.recipients.write();
 
          if Self::is_wildcard(address) {

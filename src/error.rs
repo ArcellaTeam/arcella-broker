@@ -9,7 +9,10 @@
 
 use thiserror::Error;
 
-use crate::protocol::{ProtocolError, Message};
+use crate::{
+    protocol::{ProtocolError, Message},
+    registry::RegistryError,
+};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BrokerError {
@@ -19,6 +22,9 @@ pub enum BrokerError {
 
     #[error("Channel is full")]
     ChannelFull(Message),
+
+    #[error("Arcella broker registry error: {0}")]
+    RegistryError (#[from] RegistryError),
 
     #[error("Arcella broker protocol error: {0}")]
     ProtocolError (#[from] ProtocolError),

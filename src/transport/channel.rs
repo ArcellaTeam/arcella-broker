@@ -114,3 +114,8 @@ pub struct ChannelLoad {
     pub capacity: usize,
     pub max_capacity: usize,
 }
+
+pub fn create_channel(capacity: usize) -> (MessageSender, MessageReceiver) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Message>(capacity);
+    (MessageSender::new(tx), MessageReceiver::new(rx))
+}
