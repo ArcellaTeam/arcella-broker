@@ -32,9 +32,6 @@ pub enum ConfigError {
 /// Global configuration for the Arcella message broker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerConfig {
-    /// Capacity of the internal channel for dispatching responses in InOut (Request/Response) mode.
-    pub reply_channel_capacity: usize,
-
     /// Default timeout for InOut operations in milliseconds.
     pub request_timeout_ms: u64,
 
@@ -45,7 +42,6 @@ pub struct BrokerConfig {
 impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
-            reply_channel_capacity: DEFAULT_REPLY_CHANNEL_CAPACITY,
             request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
             default_ttl: DEFAULT_TTL,
         }
@@ -53,19 +49,6 @@ impl Default for BrokerConfig {
 }
 
 impl BrokerConfig {
-    /// Sets the capacity of the reply channel (InOut).
-    #[must_use]
-    pub fn with_reply_channel_capacity(mut self, capacity: usize) -> Result<Self, ConfigError> {
-        if capacity == 0 {
-            return Err(ConfigError::ZeroCapacity);
-        }
-        if capacity > MAX_REPLY_CHANNEL_CAPACITY {
-            return Err(ConfigError::ReplyCapacityExceedsLimit(capacity));
-        }
-        self.reply_channel_capacity = capacity;
-        Ok(self)
-    }
-
     /// Sets the request timeout in milliseconds.
     #[must_use]
     pub fn with_request_timeout_ms(mut self, timeout_ms: u64) -> Self {
@@ -84,7 +67,35 @@ impl BrokerConfig {
     pub fn request_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.request_timeout_ms)
     }
+}
 
+/// Configuration for an individual subscriber (specific channel).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientConfig {
+    /// Capacity of the client channel for dispatching responses in InOut (Request/Response) mode.
+    pub reply_channel_capacity: usize,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            reply_channel_capacity: DEFAULT_REPLY_CHANNEL_CAPACITY,
+        }
+    }
+}
+
+impl ClientConfig {
+    /// Sets the capacity of the reply channel (InOut).
+    pub fn with_reply_channel_capacity(mut self, capacity: usize) -> Result<Self, ConfigError> {
+        if capacity == 0 {
+            return Err(ConfigError::ZeroCapacity);
+        }
+        if capacity > MAX_REPLY_CHANNEL_CAPACITY {
+            return Err(ConfigError::ReplyCapacityExceedsLimit(capacity));
+        }
+        self.reply_channel_capacity = capacity;
+        Ok(self)
+    }
 }
 
 /// Configuration for an individual subscriber (specific channel).
@@ -106,7 +117,6 @@ impl Default for SubscriberConfig {
 
 impl SubscriberConfig {
     /// Modifies the channel capacity (builder pattern).
-    #[must_use]
     pub fn with_channel_capacity(mut self, channel_capacity: usize)  -> Result<Self, ConfigError> {
         if channel_capacity == 0 {
             return Err(ConfigError::ZeroCapacity);

@@ -7,37 +7,57 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use bytes::Bytes;
 use std::sync::Arc;
 
-mod subscriber;
 mod publisher;
+mod reply_dispatcher;
+pub mod subscriber;
 
-use crate::config::SubscriberConfig;
-use crate::broker::Broker;
-use crate::protocol::Message;
-use crate::registry::RegistryError;
-use crate::transport::{
-    channel::MessageSender,
-    in_memory::InMemoryTransport, 
-    Transport, 
-    TransportResult,
+use crate::{
+    broker::Broker,
+    config::{ClientConfig, SubscriberConfig},
+    protocol::Message,
+    registry::RegistryError,
+    transport::{
+        channel::MessageSender,
+        in_memory::InMemoryTransport, 
+        Transport,
+        TransportError, 
+        TransportResult,
+    }
 };
 
 use subscriber::Subscriber;
 use publisher::Publisher;
+use reply_dispatcher::ReplyDispatcher;
 
 pub struct BrokerClient {
     broker: Arc<Broker>,
     local: Arc<InMemoryTransport>,
-    // remote: Option<IpcTransport>,  // Will be added in stage 2
+    client_address: String,
+    reply_dispatcher: ReplyDispatcher,
 }
 
 impl BrokerClient {
-    pub(crate) fn new(broker: Arc<Broker>) -> Self {
-        let transport = InMemoryTransport::new(broker.registry.clone(), broker.config.request_timeout());
+    pub(crate) fn new(broker: Arc<Broker>, config: ClientConfig, client_address: String) -> Result<Self, RegistryError> {
+
+        let reply_subscriber = Subscriber::bind(client_address.clone(), broker.registry.clone(), config.reply_channel_capacity)?;
+        let reply_dispatcher = ReplyDispatcher::new(reply_subscriber);
+
+        let transport = InMemoryTransport::new(broker.registry.clone());
         let local = Arc::new(transport);
-        Self { broker, local }
+        Ok(Self { 
+            broker, 
+            local,
+            client_address,
+            reply_dispatcher,
+        })
     }
+
+    pub fn client_address(&self) -> &str {
+        &self.client_address
+    }    
 
     pub fn subscribe(
         &self,
@@ -69,10 +89,40 @@ impl BrokerClient {
     }
 
     /// Send a request and wait for a response (InOut).
-    pub async fn request(&self, address: &str, message: Message) -> TransportResult<Message> {
-        self.local.request(address, message).await
+    /// Note: This method takes ownership of the message and will overwrite the reply_to field for security.
+    pub async fn request(&self, address: &str, mut message: Message) -> TransportResult<Message> {
+        let message_id = message.header.message_id;
+
+        // Force override of reply_to to ensure security and correct response routing.
+        // Ignore any value that the calling code might have passed.
+        message.reply_to = Bytes::from(self.client_address.clone());
+
+        let (_guard, receiver) = self.reply_dispatcher
+            .register_waiter(message_id)
+            .map_err(TransportError::Registry)?; 
+
+        self.local.send(address, message).await?;       
+
+        match tokio::time::timeout(self.broker.config.request_timeout(), receiver).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(TransportError::ConnectionClosed),
+            Err(_) => Err(TransportError::Timeout),
+        }
     }
 
+}
+
+impl Drop for BrokerClient {
+    fn drop(&mut self) {
+        // Synchronously clean up the client address from the registry BEFORE
+        // the ReplyDispatcher begins its asynchronous task cleanup.
+        // This prevents a race condition when quickly recreating a client with the same address.
+        if let Err(e) = self.broker.registry.unregister(&self.client_address) {
+            // Ignore the error if the address was already removed (e.g., during a panic),
+            // but log it for debugging purposes.
+            tracing::debug!(address = %self.client_address, error = %e, "Client address already unregistered or cleanup race");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -86,7 +136,7 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_message_delivery_in_only() {
         // 1. Initialize client
-        let client = test_utils::test_client();
+        let client = test_utils::test_client("test".to_string()).unwrap();
 
         // 2. Prepare the receiver (Actor pattern)
         let target_address = "arcella:core:test:receiver".to_string();
@@ -115,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_message_delivery_to_unknown_address() {
         // 1. Initialize client
-        let client = test_utils::test_client();
+        let client = test_utils::test_client("test".to_string()).unwrap();
 
         let msg = test_utils::dummy_in_only_message(Bytes::from("test:ping"),
             Bytes::from("arcella:unknown:address"),
@@ -131,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn test_multi_recipient_routing() {
         // 1. Initialize client
-        let client = test_utils::test_client();
+        let client = test_utils::test_client("test".to_string()).unwrap();
 
         // 2. Register multiple receivers with different addresses
         let addresses = vec![
@@ -208,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn test_dynamic_registration() {
         // 1. Initialize client
-        let client = test_utils::test_client();
+        let client = test_utils::test_client("test".to_string()).unwrap();
 
         let address = Bytes::from_static(b"arcella:test");
         let payload = Bytes::from_static(b"");
@@ -242,7 +292,7 @@ mod tests {
     #[tokio::test]
 async fn test_subscription_cleanup_and_re_registration() {
         // 1. Initialize client
-        let client = test_utils::test_client();
+        let client = test_utils::test_client("test".to_string()).unwrap();
         
         let addr = "arcella:test:duplicate";
 

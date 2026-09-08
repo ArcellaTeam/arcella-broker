@@ -39,6 +39,9 @@ pub const SUB_MESSAGE_ID_LEN: usize = 4;
 /// Size of the fixed header in bytes
 /// 2 (version) + 1 (flags) + 1 (priority) + 32 (token) + 16 (guid) + 4 (sub_id)
 /// + 1 (ttl) + 1 (type_len) + 2 (addr_len) + 4 (payload_len) = 64 bytes
+///
+/// Note: reply_to is stored in the variable part of the message and 
+/// is not included in the fixed header size.
 pub const FIXED_HEADER_SIZE: usize = 64;
 
 // ============================================================================
@@ -75,6 +78,9 @@ pub enum ProtocolError {
     #[error("Address length ({0}) exceeds limit {MAX_ADDRESS_LEN}")]
     AddressTooLong(u16),
 
+    #[error("ReplyTo length ({0}) exceeds limit {MAX_ADDRESS_LEN}")]
+    ReplyToTooLong(u16),
+
     #[error("Payload size ({0}) exceeds limit {MAX_PAYLOAD_LEN}")]
     PayloadTooLarge(u32),
 
@@ -84,11 +90,17 @@ pub enum ProtocolError {
     #[error("Insufficient data to read address")]
     IncompleteAddress,
 
+    #[error("Insufficient data to read reply_to address")]
+    IncompleteReplyTo,
+
     #[error("Insufficient data to read payload")]
     IncompletePayload,
 
     #[error("Invalid UTF-8 in message type")]
     InvalidMsgTypeUtf8,
+
+    #[error("Invalid UTF-8 in reply_to address")]
+    InvalidReplyToUtf8,
 
     #[error("Invalid UTF-8 in address")]
     InvalidAddressUtf8,
@@ -98,6 +110,12 @@ pub enum ProtocolError {
 
     #[error("Empty level in address (double colon)")]
     EmptyAddressLevel,
+
+    #[error("InOut mode requires a non-empty reply_to address")]
+    MissingReplyToForInOut,
+
+    #[error("InOnly mode must have an empty reply_to address")]
+    UnexpectedReplyToForInOnly,
 }
 
 // ============================================================================
@@ -193,8 +211,8 @@ impl FixedHeader {
 
         Ok(Self {
             version: PROTOCOL_VERSION,
-            flags: flags,
-            priority: priority,
+            flags,
+            priority,
             session_token,
             message_id,
             sub_message_id,
@@ -279,16 +297,6 @@ impl FixedHeader {
     pub fn transfer_mode(&self) -> Result<TransferMode, ProtocolError> {
         TransferMode::from_flags(self.flags)
     }
-
-    /// Returns the total size of the variable part of the header
-    pub fn variable_header_size(&self) -> usize {
-        self.msg_type_len as usize + self.address_len as usize
-    }
-
-    /// Returns the total size of the entire message (header + variable part + payload)
-    pub fn total_message_size(&self) -> usize {
-        FIXED_HEADER_SIZE + self.variable_header_size() + self.payload_len as usize
-    }
 }
 
 // ============================================================================
@@ -343,6 +351,7 @@ pub struct Message {
     pub header: FixedHeader,
     pub msg_type: Bytes,
     pub address: Bytes,
+    pub reply_to: Bytes,
     pub payload: Bytes,
 }
 
@@ -357,12 +366,33 @@ impl Message {
         ttl: u8,
         msg_type: Bytes,
         address: Bytes,
+        reply_to: Bytes,
         payload: Bytes,
     ) -> Result<Self, ProtocolError> {
+        // Строгая проверка: для InOut reply_to обязателен, для InOnly — запрещен
+        match mode {
+            TransferMode::InOut => {
+                if reply_to.is_empty() {
+                    return Err(ProtocolError::MissingReplyToForInOut);
+                }
+            }
+            TransferMode::InOnly => {
+                if !reply_to.is_empty() {
+                    return Err(ProtocolError::UnexpectedReplyToForInOnly);
+                }
+            }
+        }
+
         // Address validation
         let address_str = str::from_utf8(&address)
             .map_err(|_| ProtocolError::InvalidAddressUtf8)?;
-        validate_address(&address_str)?;
+        validate_address(address_str)?;
+
+        // Валидация reply_to (если не пустой)
+        if !reply_to.is_empty() {
+            let reply_to_str = str::from_utf8(&reply_to).map_err(|_| ProtocolError::InvalidReplyToUtf8)?;
+            validate_address(reply_to_str)?;
+        }
 
         // Length validation
         if msg_type.len() > MAX_MSG_TYPE_LEN {
@@ -371,6 +401,10 @@ impl Message {
 
         if address.len() > MAX_ADDRESS_LEN {
             return Err(ProtocolError::AddressTooLong(address.len() as u16));
+        }
+
+        if reply_to.len() > MAX_ADDRESS_LEN {
+            return Err(ProtocolError::ReplyToTooLong(reply_to.len() as u16));
         }
 
         let payload_len = payload.len() as u32;
@@ -394,6 +428,7 @@ impl Message {
             header,
             msg_type,
             address,
+            reply_to,
             payload,
         })
     }
@@ -402,6 +437,7 @@ impl Message {
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, ProtocolError> {
         // 1. Read the fixed header
         let header = FixedHeader::decode(buf)?;
+        let mode = header.transfer_mode()?;
 
         // 2. Read the message type
         let msg_type_len = header.msg_type_len as usize;
@@ -422,7 +458,33 @@ impl Message {
             .map_err(|_| ProtocolError::InvalidAddressUtf8)?;
         validate_address(address_str)?;
 
-        // 4. Read payload (zero-copy via Bytes)
+        // 4. Reply-to (only for InOut)
+        let reply_to = if mode == TransferMode::InOut {
+            // Read length reply_to from next 2 byte
+            if buf.remaining() < 2 {
+                return Err(ProtocolError::IncompleteReplyTo);
+            }
+            let reply_to_len = buf.get_u16_le() as usize;
+            
+            if reply_to_len == 0 {
+                return Err(ProtocolError::MissingReplyToForInOut);
+            }
+            if reply_to_len > MAX_ADDRESS_LEN {
+                return Err(ProtocolError::ReplyToTooLong(reply_to_len as u16));
+            }
+            
+            if buf.remaining() < reply_to_len {
+                return Err(ProtocolError::IncompleteReplyTo);
+            }
+            let reply_to_bytes = buf.copy_to_bytes(reply_to_len);
+            let reply_to_str = str::from_utf8(&reply_to_bytes).map_err(|_| ProtocolError::InvalidReplyToUtf8)?;
+            validate_address(reply_to_str)?;
+            reply_to_bytes
+        } else {
+            Bytes::new() // Для InOnly reply_to пустой
+        };        
+
+        // 5. Read payload (zero-copy via Bytes)
         let payload_len = header.payload_len as usize;
         if buf.remaining() < payload_len {
             return Err(ProtocolError::IncompletePayload);
@@ -433,6 +495,7 @@ impl Message {
             header,
             msg_type,
             address,
+            reply_to,
             payload,
         })
     }
@@ -448,7 +511,13 @@ impl Message {
         // 3. Recipient address
         buf.put_slice(&self.address);
 
-        // 4. Payload
+        // 4. Reply-to (only for InOut)
+        if self.header.transfer_mode() == Ok(TransferMode::InOut) {
+            buf.put_u16_le(self.reply_to.len() as u16);
+            buf.put_slice(&self.reply_to);
+        }        
+
+        // 5. Payload
         buf.put_slice(&self.payload);
     }
 
@@ -457,8 +526,18 @@ impl Message {
         self.header.transfer_mode()
     }
 
+    /// Returns the total size of the variable part of the header
+    pub fn variable_header_size(&self) -> usize {
+        let reply_to_overhead = if self.transfer_mode() == Ok(TransferMode::InOut) {
+            2 + self.reply_to.len()
+        } else {
+            0
+        };
+        self.header.msg_type_len as usize + self.header.address_len as usize + reply_to_overhead
+    }
+
     /// Returns the total message size in bytes
     pub fn size(&self) -> usize {
-        self.header.total_message_size()
+        FIXED_HEADER_SIZE + self.variable_header_size() + self.header.payload_len as usize
     }
 }

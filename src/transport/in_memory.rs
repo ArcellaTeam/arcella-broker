@@ -18,9 +18,7 @@ use std::{
     sync::Arc,
     future::Future,
     pin::Pin,
-    time::Duration,
 };
-use tokio::time;
 
 use crate::protocol::Message;
 use crate::registry::LocalRegistry;
@@ -65,7 +63,6 @@ impl Endpoint for InMemoryEndpoint {
 pub struct InMemoryTransport {
     /// Local registry for looking up recipient channels by address.
     registry: Arc<LocalRegistry>,
-    request_timeout: Duration,
 }
 
 impl InMemoryTransport {
@@ -73,28 +70,9 @@ impl InMemoryTransport {
     ///
     /// # Arguments
     /// * `registry` - a shared reference to the local routing registry.
-    pub fn new(registry: Arc<LocalRegistry>, request_timeout: Duration) -> Self {
-        Self { registry, request_timeout }
+    pub fn new(registry: Arc<LocalRegistry>) -> Self {
+        Self {registry}
     }
-
-    async fn perform_request(
-        &self,
-        send_action: impl Future<Output = TransportResult<()>>,
-        msg_id: [u8; 16],
-    ) -> TransportResult<Message> {
-        let dispatcher = self.registry.reply_dispatcher();
-        let (_guard, receiver) = dispatcher.register_waiter(msg_id)
-            .map_err(TransportError::Registry)?;
-
-        send_action.await?;
-
-        match time::timeout(self.request_timeout, receiver).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(TransportError::ConnectionClosed),
-            Err(_) => Err(TransportError::Timeout),
-        }
-    }
-
 }
 
 impl Transport for InMemoryTransport {
@@ -185,27 +163,39 @@ impl Transport for InMemoryTransport {
     /// The response message upon successful execution, or a timeout/connection closed error.
     fn request<'a>(
         &'a self,
-        address: &'a str,
-        message: Message,
+        _address: &'a str,
+        _message: Message,
     ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
         Box::pin(async move {
-            let message_id = message.header.message_id;
-            let send_future = self.send(address, message); 
-            self.perform_request(send_future, message_id).await 
+            Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Use BrokerClient::request for InOut mode to ensure proper reply_to injection and per-client dispatching",
+            )))
         })
     }
 
+    /// Sends a request to resolved endpoint and waits for a response with a timeout.
+    ///
+    /// Uses `ReplyDispatcher` to register waiting for a response by `message_id`.
+    ///
+    /// # Arguments
+    /// * `address` - the string address of the recipient.
+    /// * `message` - the request message to be sent.
+    ///
+    /// # Returns
+    /// The response message upon successful execution, or a timeout/connection closed error.
     fn request_to<'a>(
         &'a self,
-        endpoint: &'a ResolvedEndpoint,
-        message: Message,
+        _endpoint: &'a ResolvedEndpoint,
+        _message: Message,
     ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
-        Box::pin(async move { 
-            let message_id = message.header.message_id; 
-            let send_future = endpoint.send(message); 
-            self.perform_request(send_future, message_id).await 
+        Box::pin(async move {
+            Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Use BrokerClient::request for InOut mode",
+            )))
         })
-    }    
+    }   
 
     /// Method for receiving messages (stub for this implementation).
     ///

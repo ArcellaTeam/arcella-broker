@@ -8,11 +8,10 @@
 // except according to those terms.
 
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 use crate::protocol::Message;
 use crate::registry::{LocalRegistry, RegistryError};
-use crate::transport::channel::{TryRecvError, MessageSender, MessageReceiver};
+use crate::transport::channel::{self, MessageReceiver, TryRecvError};
 
 pub struct Subscriber {
     rx: MessageReceiver,
@@ -34,9 +33,7 @@ impl Subscriber {
         registry: Arc<LocalRegistry>, 
         capacity: usize
     ) -> Result<Self, RegistryError> {
-        let (tx, rx) = mpsc::channel::<Message>(capacity);
-        let sender = MessageSender::new(tx);
-        let receiver = MessageReceiver::new(rx);
+        let (sender, receiver) = channel::create_channel(capacity);
         registry.register(address.clone(), sender)?;
         Ok(Self::new(receiver, address, registry))
     }    

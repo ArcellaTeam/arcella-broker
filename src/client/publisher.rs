@@ -32,10 +32,9 @@ impl Publisher {
         // 1. Fast endpoint check
         {
             let guard = self.cached_endpoint.read();
-            if let Some(ep) = guard.as_ref() {
-                if ep.is_alive() {
-                    return Ok(ep.clone());
-                }
+            if let Some(ep) = guard.as_ref()
+                && ep.is_alive() {
+                return Ok(ep.clone());
             }
         }
 
@@ -44,18 +43,16 @@ impl Publisher {
 
         let guard = self.cached_endpoint.upgradable_read();
 
-        if let Some(ep) = guard.as_ref() {
-            if ep.is_alive() {
-                return Ok(ep.clone());
-            }
+        if let Some(ep) = guard.as_ref() 
+            && ep.is_alive() {
+            return Ok(ep.clone());
         }
 
         // 3. Resolve address fron transport
         let mut write_guard = RwLockUpgradableReadGuard::upgrade(guard);
-        if let Some(ep) = write_guard.as_ref() {
-            if ep.is_alive() {
-                return Ok(ep.clone());
-            }
+        if let Some(ep) = write_guard.as_ref() 
+            && ep.is_alive() {
+            return Ok(ep.clone());
         }
         *write_guard = Some(resolved_ep.clone());
         
@@ -74,17 +71,6 @@ impl Publisher {
             other => other,
         }
     }    
-
-    pub async fn request(&self, message: Message) -> TransportResult<Message> {
-        let ep = self.get_or_resolve_endpoint().await?;
-        match self.transport.request_to(&ep, message).await {
-            Err(TransportError::ConnectionClosed) => {
-                *self.cached_endpoint.write() = None; // Явная инвалидация
-                Err(TransportError::ConnectionClosed)
-            }
-            other => other,
-        }
-    }
 
     pub fn address(&self) -> &str {
         &self.address
