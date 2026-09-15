@@ -20,13 +20,16 @@ required-features = ["server"]
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1.9"
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive"] }
+iradix = "0.3"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2.0.20"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "serde"] }
 
 [features]
 default = ["client"]

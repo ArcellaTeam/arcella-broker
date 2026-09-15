@@ -21,18 +21,16 @@ use std::{
 };
 
 use crate::protocol::Message;
-use crate::registry::LocalRegistry;
-use crate::transport::channel::MessageSender;
-
+use crate::registry::{LocalRegistry, SubscriptionSlot};
 
 use super::{Endpoint, ResolvedEndpoint, Transport, TransportError, TransportResult};
 
 pub struct InMemoryEndpoint {
-    channel: MessageSender,
+    channel: Arc<SubscriptionSlot>,
 }
 
 impl InMemoryEndpoint {
-    pub(crate) fn new(channel: MessageSender) -> Self {
+    pub(crate) fn new(channel: Arc<SubscriptionSlot>) -> Self {
         Self { channel }
     }
 }
@@ -43,16 +41,28 @@ impl Endpoint for InMemoryEndpoint {
         message: Message,
     ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.channel.send(message).await.map_err(|_| {
-                TransportError::ConnectionClosed
-            })
+            let (sender, _) = self.channel.load();
+            match sender {
+                Some(sender) => {
+                    sender.send(message).await.map_err(|_| {
+                        TransportError::ConnectionClosed
+                    })
+                }
+                None => {
+                    Err(TransportError::ConnectionClosed)
+                }
+            }
         })
     }
     
     fn is_alive(&self) -> bool {
-        // mpsc::Sender считается живым, пока существует хотя бы один активный Receiver.
+        // An mpsc::Sender is considered alive as long as at least one active Receiver exists.
         !self.channel.is_closed()
     }
+
+    fn version(&self) -> u64 {
+        0
+    }    
 }
 
 /// Transport for in-process delivery.
@@ -91,7 +101,7 @@ impl Transport for InMemoryTransport {
         Box::pin(async move {
             match self.registry.lookup(address) {
                 Some(channel) => {
-                    // Создаем type-erased endpoint
+                    // Create a type-erased endpoint
                     Ok(ResolvedEndpoint::new(InMemoryEndpoint::new(channel)))
                 }
                 None => Err(TransportError::RecipientNotFound(address.to_string())),
@@ -119,11 +129,17 @@ impl Transport for InMemoryTransport {
 					// IMPORTANT: Using .await on mpsc::Sender provides natural backpressure.
 					// If the receiver's queue is full, the sender will be blocked, preventing
 					// unbounded memory growth (OOM) with slow consumers or DoS attacks.																	 
-															   
-                    channel.send(message).await.map_err(|_| {
-                        // If sending fails, we assume the recipient is unavailable
-                        TransportError::ConnectionClosed
-                    })?;
+                    let (sender, _) = channel.load();
+                    match sender {
+                        Some(sender) => {
+                            sender.send(message).await.map_err(|_| {
+                                TransportError::ConnectionClosed
+                            })
+                        }
+                        None => {
+                            Err(TransportError::ConnectionClosed)
+                        }
+                    }?;
                     Ok(())
                 }
                 None => Err(TransportError::RecipientNotFound(address.to_string())),
@@ -146,7 +162,7 @@ impl Transport for InMemoryTransport {
         message: Message,
     ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            // Делегируем отправку самому endpoint'у
+            // Delegate the sending to the endpoint itself
             endpoint.send(message).await
         })
     }    

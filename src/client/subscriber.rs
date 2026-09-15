@@ -33,6 +33,7 @@ impl Subscriber {
         registry: Arc<LocalRegistry>, 
         capacity: usize
     ) -> Result<Self, RegistryError> {
+        tracing::debug!("bind: {}", address);
         let (sender, receiver) = channel::create_channel(capacity);
         registry.register(address.clone(), sender)?;
         Ok(Self::new(receiver, address, registry))
@@ -55,6 +56,7 @@ impl Subscriber {
 
 impl Drop for Subscriber {
     fn drop(&mut self) {
+        tracing::debug!("drop: {}", self.address);
         // Automatic cleanup when going out of scope
         if let Err(e) = self.registry.unregister(&self.address) {
             tracing::warn!(address = %self.address, error = %e, "Failed to unregister subscriber on drop");

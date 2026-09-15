@@ -79,7 +79,7 @@ impl BrokerClient {
         self.broker.registry.unregister(address)
     }    
 
-    pub fn publisher(&self, address: String) -> Publisher {
+    pub fn publisher(&self, address: String) -> Publisher<InMemoryTransport> {
         Publisher::new(address, self.local.clone()) 
     }    
 

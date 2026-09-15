@@ -48,7 +48,6 @@ pub type TransportResult<T> = Result<T, TransportError>;
 /// Each transport implements its own type of Endpoint,
 /// encapsulating delivery specifics (channel, IPC connection, TCP stream, etc.).
 /// Transport does NOT know about the internals of Endpoint — it simply calls `send`.
-
 pub trait Endpoint: Send + Sync {
     /// Sends a message to this delivery endpoint.
     fn send<'a>(
@@ -58,9 +57,12 @@ pub trait Endpoint: Send + Sync {
 
     /// Checks whether the delivery endpoint is alive (not closed).
     fn is_alive(&self) -> bool;
+
+    /// Returns the current version of the endpoint
+    fn version(&self) -> u64;    
 }
 
-/// Type-erased обёртка над конкретной реализацией Endpoint.
+/// Type-erased wrapper over a specific Endpoint implementation.
 /// 
 /// The client (Publisher) caches ResolvedEndpoint and uses it for repeated sends,
 /// without knowing or caring which transport is behind it.
@@ -86,6 +88,10 @@ impl ResolvedEndpoint {
     /// Checks whether the delivery endpoint is alive.
     pub fn is_alive(&self) -> bool {
         self.inner.is_alive()
+    }
+
+    pub fn version(&self) -> u64 {
+        self.inner.version()
     }
 }
 

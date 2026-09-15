@@ -37,12 +37,14 @@ pub struct MessageSender {
 
 impl MessageSender {
     pub(crate) fn new(inner: mpsc::Sender<Message>) -> Self {
+        tracing::debug!("new");
         Self { inner }
     }
 
     /// Asynchronous send with natural backpressure.
     /// If the receiver's queue is full, the calling task will be suspended.
     pub async fn send(&self, message: Message) -> Result<(), BrokerError> {
+        tracing::trace!("send");
         self.inner
             .send(message)
             .await
@@ -54,6 +56,7 @@ impl MessageSender {
     /// Non-blocking send attempt.
     /// Returns the message back if the queue is full.
     pub fn try_send(&self, message: Message) -> Result<(), BrokerError> {
+        tracing::trace!("try_send");
         self.inner
             .try_send(message)
             .map_err(|e| match e {
@@ -76,6 +79,12 @@ impl MessageSender {
     }
 }
 
+impl Drop for MessageSender {
+    fn drop(&mut self) {
+        tracing::debug!("drop");
+    }
+}
+
 /// Type-safe message receiver.
 pub struct MessageReceiver {
     inner: mpsc::Receiver<Message>,
@@ -83,17 +92,20 @@ pub struct MessageReceiver {
 
 impl MessageReceiver {
     pub(crate) fn new(inner: mpsc::Receiver<Message>) -> Self {
+        tracing::debug!("new");
         Self { inner }
     }
 
     /// Asynchronously receives the next message.
     /// Returns `None` if all senders have been dropped (channel closed).
     pub async fn recv(&mut self) -> Option<Message> {
+        tracing::trace!("recv");
         self.inner.recv().await
     }
 
     /// Non-blocking receive attempt.
     pub fn try_recv(&mut self) -> Result<Message, TryRecvError> {
+        tracing::trace!("try_recv");
         self.inner.try_recv().map_err(Into::into)
     }
 
@@ -106,6 +118,12 @@ impl MessageReceiver {
             Ok(msg) => msg,
             Err(_) => None,
         }
+    }
+}
+
+impl Drop for MessageReceiver {
+    fn drop(&mut self) {
+        tracing::debug!("drop");
     }
 }
 
