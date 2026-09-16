@@ -369,7 +369,7 @@ impl Message {
         reply_to: Bytes,
         payload: Bytes,
     ) -> Result<Self, ProtocolError> {
-        // Строгая проверка: для InOut reply_to обязателен, для InOnly — запрещен
+        // Strict check: reply_to is mandatory for InOut, forbidden for InOnly
         match mode {
             TransferMode::InOut => {
                 if reply_to.is_empty() {
@@ -388,7 +388,7 @@ impl Message {
             .map_err(|_| ProtocolError::InvalidAddressUtf8)?;
         validate_address(address_str)?;
 
-        // Валидация reply_to (если не пустой)
+        // Validate reply_to (if not empty)
         if !reply_to.is_empty() {
             let reply_to_str = str::from_utf8(&reply_to).map_err(|_| ProtocolError::InvalidReplyToUtf8)?;
             validate_address(reply_to_str)?;
@@ -481,7 +481,7 @@ impl Message {
             validate_address(reply_to_str)?;
             reply_to_bytes
         } else {
-            Bytes::new() // Для InOnly reply_to пустой
+            Bytes::new() // For InOnly, reply_to is empty
         };        
 
         // 5. Read payload (zero-copy via Bytes)

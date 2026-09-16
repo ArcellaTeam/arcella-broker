@@ -71,6 +71,8 @@ impl WaiterGuard {
     ) -> Result<(Self, oneshot::Receiver<Message>), RegistryError> {
         let (tx, rx) = oneshot::channel();
         let mut map = waiters.lock();
+
+        tracing::debug!("new");
         
         // Protection against duplicate registrations (unlikely with correct UUID generation, but necessary)
 		if map.contains_key(&message_id) {
@@ -88,6 +90,7 @@ impl WaiterGuard {
 impl Drop for WaiterGuard {
     /// Automatically removes the wait from the dispatcher when the guard is destroyed.
     fn drop(&mut self) {
+        tracing::debug!("drop");
         self.waiters.lock().remove(&self.message_id);
     }
 }
@@ -122,8 +125,12 @@ impl ReplyDispatcher {
             Arc::new(Mutex::new(HashMap::new()));
         let waiters_clone = waiters.clone(); 
 
+        tracing::debug!("new: {}", subscriber.address());
+
         // Background task that runs for the entire lifetime of the dispatcher
         let listener_task = tokio::spawn(async move {
+    
+            tracing::debug!("start task: {}", subscriber.address());
             // Read messages from the channel until it is closed
             while let Some(response) = subscriber.recv().await {
                 let msg_id = response.header.message_id;
@@ -136,6 +143,7 @@ impl ReplyDispatcher {
                     let _ = sender.send(response);    
                 };
             }
+            tracing::debug!("end task: {}", subscriber.address());
         });
 
         Self {
@@ -174,6 +182,7 @@ impl Drop for ReplyDispatcher {
         //    allowing the client to correctly handle connection breakage (e.g.,
         //    transforming it into a `TransportError::ConnectionClosed`), without waiting
         //    for asynchronous completion of the background task and release of the `subscriber`.
+        tracing::debug!("drop");
         self.listener_task.abort();
         self.waiters.lock().clear();
     }

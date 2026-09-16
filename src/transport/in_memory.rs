@@ -16,42 +16,55 @@
 
 use std::{
     sync::Arc,
+    sync::atomic::Ordering,
     future::Future,
-    pin::Pin,
 };
 
 use crate::protocol::Message;
-use crate::registry::LocalRegistry;
-use crate::transport::channel::MessageSender;
+use crate::registry::{LocalRegistry, SubscriptionSlot};
 
-
-use super::{Endpoint, ResolvedEndpoint, Transport, TransportError, TransportResult};
+use super::{
+    channel::MessageSender,
+    Endpoint, 
+    ResolvedEndpoint, 
+    Transport, 
+    TransportError, 
+    TransportResult,
+};
 
 pub struct InMemoryEndpoint {
-    channel: MessageSender,
+    slot: Arc<SubscriptionSlot>,
+    sender: MessageSender,
+    cached_version: u64,
 }
 
 impl InMemoryEndpoint {
-    pub(crate) fn new(channel: MessageSender) -> Self {
-        Self { channel }
+    pub(crate) fn new(slot: Arc<SubscriptionSlot>) -> Self {
+        let (sender, version) = slot.load();
+        Self { 
+            slot,
+            sender: sender.expect("Slot must have a valid sender upon resolve"), 
+            cached_version: version, 
+        }
     }
 }
 
 impl Endpoint for InMemoryEndpoint {
-    fn send<'a>(
-        &'a self,
+    fn send(
+        &self,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
-        Box::pin(async move {
-            self.channel.send(message).await.map_err(|_| {
-                TransportError::ConnectionClosed
-            })
-        })
+    ) -> impl Future<Output = TransportResult<()>> + Send {
+        async move {
+            // Use cached sender without clone
+            self.sender.send(message).await.map_err(|_| TransportError::ConnectionClosed)
+        }
     }
     
-    fn is_alive(&self) -> bool {
-        // mpsc::Sender считается живым, пока существует хотя бы один активный Receiver.
-        !self.channel.is_closed()
+    fn is_valid(&self) -> bool {
+        let current_version = self.slot.version.load(Ordering::Acquire);
+
+        // Check actual status
+        current_version == self.cached_version && !self.sender.is_closed()
     }
 }
 
@@ -75,7 +88,7 @@ impl InMemoryTransport {
     }
 }
 
-impl Transport for InMemoryTransport {
+impl Transport<InMemoryEndpoint> for InMemoryTransport {
     /// Resolve address for the recipient at the specified address.
     ///
     /// # Arguments
@@ -87,16 +100,16 @@ impl Transport for InMemoryTransport {
     fn resolve<'a>(
         &'a self,
         address: &'a str,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<ResolvedEndpoint>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = TransportResult<ResolvedEndpoint<InMemoryEndpoint>>> + Send + 'a {
+        async move {
             match self.registry.lookup(address) {
                 Some(channel) => {
-                    // Создаем type-erased endpoint
+                    // Create a type-erased endpoint
                     Ok(ResolvedEndpoint::new(InMemoryEndpoint::new(channel)))
                 }
                 None => Err(TransportError::RecipientNotFound(address.to_string())),
             }
-        })
+        }
     }
     
     /// Asynchronously sends a message to the specified address.
@@ -112,23 +125,29 @@ impl Transport for InMemoryTransport {
         &'a self,
         address: &'a str,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
+        async move {
             match self.registry.lookup(address) {
                 Some(channel) => {
 					// IMPORTANT: Using .await on mpsc::Sender provides natural backpressure.
 					// If the receiver's queue is full, the sender will be blocked, preventing
 					// unbounded memory growth (OOM) with slow consumers or DoS attacks.																	 
-															   
-                    channel.send(message).await.map_err(|_| {
-                        // If sending fails, we assume the recipient is unavailable
-                        TransportError::ConnectionClosed
-                    })?;
+                    let (sender, _) = channel.load();
+                    match sender {
+                        Some(sender) => {
+                            sender.send(message).await.map_err(|_| {
+                                TransportError::ConnectionClosed
+                            })
+                        }
+                        None => {
+                            Err(TransportError::ConnectionClosed)
+                        }
+                    }?;
                     Ok(())
                 }
                 None => Err(TransportError::RecipientNotFound(address.to_string())),
             }
-        })
+        }
     }
 
     /// Send a message to resolved endpoint
@@ -142,13 +161,13 @@ impl Transport for InMemoryTransport {
     /// the recipient is not found or the channel is closed.
     fn send_to<'a>(
         &'a self,
-        endpoint: &'a ResolvedEndpoint,
+        endpoint: &'a ResolvedEndpoint<InMemoryEndpoint>,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
-        Box::pin(async move {
-            // Делегируем отправку самому endpoint'у
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
+        async move {
+            // Delegate the sending to the endpoint itself
             endpoint.send(message).await
-        })
+        }
     }    
 
     /// Sends a request and waits for a response with a timeout.
@@ -165,13 +184,13 @@ impl Transport for InMemoryTransport {
         &'a self,
         _address: &'a str,
         _message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a {
+        async move {
             Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "Use BrokerClient::request for InOut mode to ensure proper reply_to injection and per-client dispatching",
             )))
-        })
+        }
     }
 
     /// Sends a request to resolved endpoint and waits for a response with a timeout.
@@ -186,15 +205,15 @@ impl Transport for InMemoryTransport {
     /// The response message upon successful execution, or a timeout/connection closed error.
     fn request_to<'a>(
         &'a self,
-        _endpoint: &'a ResolvedEndpoint,
+        _endpoint: &'a ResolvedEndpoint<InMemoryEndpoint>,
         _message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a {
+        async move {
             Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "Use BrokerClient::request for InOut mode",
             )))
-        })
+        }
     }   
 
     /// Method for receiving messages (stub for this implementation).
@@ -205,12 +224,12 @@ impl Transport for InMemoryTransport {
     /// by the component directly via `MessageReceiver` obtained during registration.
     fn receive<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a {
+        async move {
             // TODO: Implement if a unified receive interface is needed 
             // for all transport types. For now, return a connection closed error.
             Err(TransportError::ConnectionClosed)
-        })
+        }
     }
 
     /// Closes the transport.
@@ -219,7 +238,7 @@ impl Transport for InMemoryTransport {
     /// as the lifetime of channels is managed by memory management rules and the registry's `Drop`.
     fn close<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
+        async move { Ok(()) }
     }
 }

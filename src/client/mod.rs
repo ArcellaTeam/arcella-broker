@@ -21,7 +21,10 @@ use crate::{
     registry::RegistryError,
     transport::{
         channel::MessageSender,
-        in_memory::InMemoryTransport, 
+        in_memory::{
+            InMemoryTransport, 
+            InMemoryEndpoint,
+        },
         Transport,
         TransportError, 
         TransportResult,
@@ -79,7 +82,7 @@ impl BrokerClient {
         self.broker.registry.unregister(address)
     }    
 
-    pub fn publisher(&self, address: String) -> Publisher {
+    pub fn publisher(&self, address: String) -> Publisher<InMemoryTransport, InMemoryEndpoint> {
         Publisher::new(address, self.local.clone()) 
     }    
 

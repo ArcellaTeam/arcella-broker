@@ -9,7 +9,6 @@
 
 use std::{
     future::Future,
-    pin::Pin,
     sync::Arc,
 };
 
@@ -48,31 +47,36 @@ pub type TransportResult<T> = Result<T, TransportError>;
 /// Each transport implements its own type of Endpoint,
 /// encapsulating delivery specifics (channel, IPC connection, TCP stream, etc.).
 /// Transport does NOT know about the internals of Endpoint — it simply calls `send`.
-
 pub trait Endpoint: Send + Sync {
     /// Sends a message to this delivery endpoint.
-    fn send<'a>(
-        &'a self,
+    fn send(
+        &self,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<()>> + Send;
 
-    /// Checks whether the delivery endpoint is alive (not closed).
-    fn is_alive(&self) -> bool;
+    /// Проверяет, можно ли использовать эндпоинт для отправки.
+    /// Возвращает true, если канал жив И версия актуальна.
+    fn is_valid(&self) -> bool;
 }
 
-/// Type-erased обёртка над конкретной реализацией Endpoint.
+/// Type-erased wrapper over a specific Endpoint implementation.
 /// 
 /// The client (Publisher) caches ResolvedEndpoint and uses it for repeated sends,
 /// without knowing or caring which transport is behind it.
-#[derive(Clone)]
-pub struct ResolvedEndpoint {
-    inner: Arc<dyn Endpoint>,
+pub struct ResolvedEndpoint<E: Endpoint> {
+    inner: Arc<E>,
 }
 
-impl ResolvedEndpoint {
-    /// Creates a ResolvedEndpoint from a concrete Endpoint implementation.
-    /// Used only inside Transport implementations.
-    pub(crate) fn new<E: Endpoint + 'static>(endpoint: E) -> Self {
+impl<E: Endpoint> Clone for ResolvedEndpoint<E> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<E: Endpoint> ResolvedEndpoint<E> {
+    pub(crate) fn new(endpoint: E) -> Self {
         Self {
             inner: Arc::new(endpoint),
         }
@@ -83,14 +87,13 @@ impl ResolvedEndpoint {
         self.inner.send(message).await
     }
     
-    /// Checks whether the delivery endpoint is alive.
-    pub fn is_alive(&self) -> bool {
-        self.inner.is_alive()
+    pub fn is_valid(&self) -> bool {
+        self.inner.is_valid()
     }
 }
 
 /// Abstract transport for sending and receiving messages.
-pub trait Transport: Send + Sync {
+pub trait Transport<E: Endpoint>: Send + Sync {
     /// Resolve address for the recipient at the specified address.
     ///
     /// # Arguments
@@ -102,7 +105,7 @@ pub trait Transport: Send + Sync {
     fn resolve<'a>(
         &'a self,
         address: &'a str,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<ResolvedEndpoint>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<ResolvedEndpoint<E>>> + Send + 'a;
 
     /// Send a message to a recipient at the specified address.
     ///
@@ -117,7 +120,7 @@ pub trait Transport: Send + Sync {
         &'a self,
         address: &'a str,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a;
 
     /// Send a message to resolved endpoint
     ///
@@ -130,9 +133,9 @@ pub trait Transport: Send + Sync {
     /// the recipient is not found or the channel is closed.
     fn send_to<'a>(
         &'a self,
-        endpoint: &'a ResolvedEndpoint,
+        endpoint: &'a ResolvedEndpoint<E>,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a;
 
     /// Send a request and wait for a response (InOut mode) to a recipient at the specified address.
     ///
@@ -148,7 +151,7 @@ pub trait Transport: Send + Sync {
         &'a self,
         address: &'a str,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a;
 
     /// Send a request and wait for a response (InOut mode) to resolved endpoint.
     ///
@@ -161,17 +164,17 @@ pub trait Transport: Send + Sync {
     /// the recipient is not found or the channel is closed.
     fn request_to<'a>(
         &'a self,
-        endpoint: &'a ResolvedEndpoint,
+        endpoint: &'a ResolvedEndpoint<E>,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a;
 
     /// Receive the next incoming message (used on the server side).
     fn receive<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a;
 
     /// Close the transport connection.
     fn close<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a;
 }
