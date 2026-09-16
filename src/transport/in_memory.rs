@@ -27,19 +27,24 @@ use super::{Endpoint, ResolvedEndpoint, Transport, TransportError, TransportResu
 
 pub struct InMemoryEndpoint {
     channel: Arc<SubscriptionSlot>,
+    cached_version: u64,
 }
 
 impl InMemoryEndpoint {
     pub(crate) fn new(channel: Arc<SubscriptionSlot>) -> Self {
-        Self { channel }
+        let (_, cached_version) = channel.load();
+        Self { 
+            channel, 
+            cached_version,  
+        }
     }
 }
 
 impl Endpoint for InMemoryEndpoint {
-    fn send<'a>(
-        &'a self,
+    fn send(
+        &self,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
+    ) -> impl Future<Output = TransportResult<()>> + Send {
         Box::pin(async move {
             let (sender, _) = self.channel.load();
             match sender {
@@ -55,14 +60,18 @@ impl Endpoint for InMemoryEndpoint {
         })
     }
     
-    fn is_alive(&self) -> bool {
-        // An mpsc::Sender is considered alive as long as at least one active Receiver exists.
-        !self.channel.is_closed()
-    }
+    fn is_valid(&self) -> bool {
+        let (sender, current_version) = self.channel.load();
 
-    fn version(&self) -> u64 {
-        0
-    }    
+        // Проверяем физическое состояние
+        match sender {
+            None => return false,
+            Some(s) if s.is_closed() => return false,
+            _ => {}
+        }
+
+        current_version == self.cached_version
+    }
 }
 
 /// Transport for in-process delivery.
@@ -85,7 +94,7 @@ impl InMemoryTransport {
     }
 }
 
-impl Transport for InMemoryTransport {
+impl Transport<InMemoryEndpoint> for InMemoryTransport {
     /// Resolve address for the recipient at the specified address.
     ///
     /// # Arguments
@@ -97,7 +106,7 @@ impl Transport for InMemoryTransport {
     fn resolve<'a>(
         &'a self,
         address: &'a str,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<ResolvedEndpoint>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = TransportResult<ResolvedEndpoint<InMemoryEndpoint>>> + Send + 'a>> {
         Box::pin(async move {
             match self.registry.lookup(address) {
                 Some(channel) => {
@@ -158,7 +167,7 @@ impl Transport for InMemoryTransport {
     /// the recipient is not found or the channel is closed.
     fn send_to<'a>(
         &'a self,
-        endpoint: &'a ResolvedEndpoint,
+        endpoint: &'a ResolvedEndpoint<InMemoryEndpoint>,
         message: Message,
     ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
         Box::pin(async move {
@@ -202,7 +211,7 @@ impl Transport for InMemoryTransport {
     /// The response message upon successful execution, or a timeout/connection closed error.
     fn request_to<'a>(
         &'a self,
-        _endpoint: &'a ResolvedEndpoint,
+        _endpoint: &'a ResolvedEndpoint<InMemoryEndpoint>,
         _message: Message,
     ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
         Box::pin(async move {

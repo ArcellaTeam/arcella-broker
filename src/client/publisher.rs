@@ -11,15 +11,23 @@ use std::sync::Arc;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 
 use crate::protocol::Message;
-use crate::transport::{ResolvedEndpoint, Transport, TransportError, TransportResult};
+use crate::transport::{Endpoint, ResolvedEndpoint, Transport, TransportError, TransportResult};
 
-pub struct Publisher<T: Transport> {
+pub struct Publisher<T, E>
+where
+    T: Transport<E>,
+    E: Endpoint,
+{
     address: String,
     transport: Arc<T>,
-    cached_endpoint: RwLock<Option<ResolvedEndpoint>>,
+    cached_endpoint: RwLock<Option<ResolvedEndpoint<E>>>,
 }
 
-impl<T: Transport> Publisher<T> {
+impl<T, E> Publisher<T, E>
+where
+    T: Transport<E>,
+    E: Endpoint,
+{
     pub(crate) fn new(address: String, transport: Arc<T>) -> Self {
         Self {
             address,
@@ -28,12 +36,13 @@ impl<T: Transport> Publisher<T> {
         }
     }
 
-    async fn get_or_resolve_endpoint(&self) -> TransportResult<ResolvedEndpoint> {
+    async fn get_or_resolve_endpoint(&self) -> TransportResult<ResolvedEndpoint<E>> {
         // 1. Fast endpoint check
         {
             let guard = self.cached_endpoint.read();
             if let Some(ep) = guard.as_ref() {
-                if ep.is_alive() {
+                // Check alive and version of endpoint
+                if ep.is_valid() {
                     return Ok(ep.clone());
                 }
             }
@@ -45,7 +54,7 @@ impl<T: Transport> Publisher<T> {
         let guard = self.cached_endpoint.upgradable_read();
 
         if let Some(ep) = guard.as_ref() {
-            if ep.is_alive() {
+            if ep.is_valid() {
                 return Ok(ep.clone());
             }
         }
@@ -53,7 +62,7 @@ impl<T: Transport> Publisher<T> {
         // 3. Resolve address from transport
         let mut write_guard = RwLockUpgradableReadGuard::upgrade(guard);
         if let Some(ep) = write_guard.as_ref() {
-            if ep.is_alive() {
+            if ep.is_valid() {
                 return Ok(ep.clone());
             }
         }
