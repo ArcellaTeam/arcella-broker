@@ -16,25 +16,35 @@
 
 use std::{
     sync::Arc,
+    sync::atomic::Ordering,
     future::Future,
 };
 
 use crate::protocol::Message;
 use crate::registry::{LocalRegistry, SubscriptionSlot};
 
-use super::{Endpoint, ResolvedEndpoint, Transport, TransportError, TransportResult};
+use super::{
+    channel::MessageSender,
+    Endpoint, 
+    ResolvedEndpoint, 
+    Transport, 
+    TransportError, 
+    TransportResult,
+};
 
 pub struct InMemoryEndpoint {
-    channel: Arc<SubscriptionSlot>,
+    slot: Arc<SubscriptionSlot>,
+    sender: MessageSender,
     cached_version: u64,
 }
 
 impl InMemoryEndpoint {
-    pub(crate) fn new(channel: Arc<SubscriptionSlot>) -> Self {
-        let (_, cached_version) = channel.load();
+    pub(crate) fn new(slot: Arc<SubscriptionSlot>) -> Self {
+        let (sender, version) = slot.load();
         Self { 
-            channel, 
-            cached_version,  
+            slot,
+            sender: sender.expect("Slot must have a valid sender upon resolve"), 
+            cached_version: version, 
         }
     }
 }
@@ -45,31 +55,16 @@ impl Endpoint for InMemoryEndpoint {
         message: Message,
     ) -> impl Future<Output = TransportResult<()>> + Send {
         async move {
-            let (sender, _) = self.channel.load();
-            match sender {
-                Some(sender) => {
-                    sender.send(message).await.map_err(|_| {
-                        TransportError::ConnectionClosed
-                    })
-                }
-                None => {
-                    Err(TransportError::ConnectionClosed)
-                }
-            }
+            // Use cached sender without clone
+            self.sender.send(message).await.map_err(|_| TransportError::ConnectionClosed)
         }
     }
     
     fn is_valid(&self) -> bool {
-        let (sender, current_version) = self.channel.load();
+        let current_version = self.slot.version.load(Ordering::Acquire);
 
-        // Проверяем физическое состояние
-        match sender {
-            None => return false,
-            Some(s) if s.is_closed() => return false,
-            _ => {}
-        }
-
-        current_version == self.cached_version
+        // Check actual status
+        current_version == self.cached_version && !self.sender.is_closed()
     }
 }
 

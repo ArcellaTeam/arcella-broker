@@ -50,7 +50,7 @@ pub struct SubscriptionSlot {
     /// - register (initial or re-registration)
     /// - unregister
     /// - replacement of the sender
-    version: AtomicU64,
+    pub version: AtomicU64,
 }
 
 impl SubscriptionSlot {
