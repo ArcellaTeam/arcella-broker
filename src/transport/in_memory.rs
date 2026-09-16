@@ -17,7 +17,6 @@
 use std::{
     sync::Arc,
     future::Future,
-    pin::Pin,
 };
 
 use crate::protocol::Message;
@@ -45,7 +44,7 @@ impl Endpoint for InMemoryEndpoint {
         &self,
         message: Message,
     ) -> impl Future<Output = TransportResult<()>> + Send {
-        Box::pin(async move {
+        async move {
             let (sender, _) = self.channel.load();
             match sender {
                 Some(sender) => {
@@ -57,7 +56,7 @@ impl Endpoint for InMemoryEndpoint {
                     Err(TransportError::ConnectionClosed)
                 }
             }
-        })
+        }
     }
     
     fn is_valid(&self) -> bool {
@@ -106,8 +105,8 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
     fn resolve<'a>(
         &'a self,
         address: &'a str,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<ResolvedEndpoint<InMemoryEndpoint>>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = TransportResult<ResolvedEndpoint<InMemoryEndpoint>>> + Send + 'a {
+        async move {
             match self.registry.lookup(address) {
                 Some(channel) => {
                     // Create a type-erased endpoint
@@ -115,7 +114,7 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
                 }
                 None => Err(TransportError::RecipientNotFound(address.to_string())),
             }
-        })
+        }
     }
     
     /// Asynchronously sends a message to the specified address.
@@ -131,8 +130,8 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
         &'a self,
         address: &'a str,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
+        async move {
             match self.registry.lookup(address) {
                 Some(channel) => {
 					// IMPORTANT: Using .await on mpsc::Sender provides natural backpressure.
@@ -153,7 +152,7 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
                 }
                 None => Err(TransportError::RecipientNotFound(address.to_string())),
             }
-        })
+        }
     }
 
     /// Send a message to resolved endpoint
@@ -169,11 +168,11 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
         &'a self,
         endpoint: &'a ResolvedEndpoint<InMemoryEndpoint>,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
+        async move {
             // Delegate the sending to the endpoint itself
             endpoint.send(message).await
-        })
+        }
     }    
 
     /// Sends a request and waits for a response with a timeout.
@@ -190,13 +189,13 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
         &'a self,
         _address: &'a str,
         _message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a {
+        async move {
             Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "Use BrokerClient::request for InOut mode to ensure proper reply_to injection and per-client dispatching",
             )))
-        })
+        }
     }
 
     /// Sends a request to resolved endpoint and waits for a response with a timeout.
@@ -213,13 +212,13 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
         &'a self,
         _endpoint: &'a ResolvedEndpoint<InMemoryEndpoint>,
         _message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a {
+        async move {
             Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "Use BrokerClient::request for InOut mode",
             )))
-        })
+        }
     }   
 
     /// Method for receiving messages (stub for this implementation).
@@ -230,12 +229,12 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
     /// by the component directly via `MessageReceiver` obtained during registration.
     fn receive<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a {
+        async move {
             // TODO: Implement if a unified receive interface is needed 
             // for all transport types. For now, return a connection closed error.
             Err(TransportError::ConnectionClosed)
-        })
+        }
     }
 
     /// Closes the transport.
@@ -244,7 +243,7 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
     /// as the lifetime of channels is managed by memory management rules and the registry's `Drop`.
     fn close<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
+        async move { Ok(()) }
     }
 }

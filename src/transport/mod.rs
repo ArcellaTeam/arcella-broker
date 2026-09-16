@@ -9,7 +9,6 @@
 
 use std::{
     future::Future,
-    pin::Pin,
     sync::Arc,
 };
 
@@ -106,7 +105,7 @@ pub trait Transport<E: Endpoint>: Send + Sync {
     fn resolve<'a>(
         &'a self,
         address: &'a str,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<ResolvedEndpoint<E>>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<ResolvedEndpoint<E>>> + Send + 'a;
 
     /// Send a message to a recipient at the specified address.
     ///
@@ -121,7 +120,7 @@ pub trait Transport<E: Endpoint>: Send + Sync {
         &'a self,
         address: &'a str,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a;
 
     /// Send a message to resolved endpoint
     ///
@@ -136,7 +135,7 @@ pub trait Transport<E: Endpoint>: Send + Sync {
         &'a self,
         endpoint: &'a ResolvedEndpoint<E>,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a;
 
     /// Send a request and wait for a response (InOut mode) to a recipient at the specified address.
     ///
@@ -152,7 +151,7 @@ pub trait Transport<E: Endpoint>: Send + Sync {
         &'a self,
         address: &'a str,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a;
 
     /// Send a request and wait for a response (InOut mode) to resolved endpoint.
     ///
@@ -167,15 +166,15 @@ pub trait Transport<E: Endpoint>: Send + Sync {
         &'a self,
         endpoint: &'a ResolvedEndpoint<E>,
         message: Message,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a;
 
     /// Receive the next incoming message (used on the server side).
     fn receive<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<Message>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a;
 
     /// Close the transport connection.
     fn close<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 'a>>;
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a;
 }
