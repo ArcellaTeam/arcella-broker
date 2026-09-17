@@ -54,7 +54,7 @@ async fn test_high_throughput_in_memory_routing() {
     let recv_client = broker.client(client_config.clone(), "load:test".to_string()).unwrap();
 
     let subscriber_config = SubscriberConfig::default()
-        .with_channel_capacity(4096)
+        .with_channel_capacity(100)
         .expect("Channel capacity 4096 should be valid");
 
     let mut receiver_addresses = Vec::with_capacity(NUM_RECEIVERS);
