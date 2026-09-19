@@ -22,16 +22,16 @@ use arcella_broker::{
 // ============================================================================
 // Test Configuration
 // ============================================================================
-const NUM_RECEIVERS: usize = 10;
-const NUM_SENDERS: usize = 10;
-const MESSAGES_PER_SENDER: usize = 10_000_000;
+const NUM_RECEIVERS: usize = 100;
+const NUM_SENDERS: usize = 100;
+const MESSAGES_PER_SENDER: usize = 1_000_000;
 const TOTAL_MESSAGES: usize = NUM_SENDERS * MESSAGES_PER_SENDER;
 
 fn init_tracing() {
     // Attempt to read the logging level from RUST_LOG,
     // if not set, default to "info"
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new("warn"));
 
     fmt()
         .with_env_filter(env_filter)
@@ -82,32 +82,34 @@ async fn test_high_throughput_in_memory_routing() {
         message_templates.push(msg);
     }
 
-    let mut receiver_handles = JoinSet::new();
+    let mut receiver_task_handles = JoinSet::new();
+    let mut subscriber_handles = Vec::new();
 
     for i in 0..NUM_RECEIVERS {
 
         let addr = receiver_addresses[i].clone(); 
 
-        let mut subscriber = recv_client.subscribe(addr, subscriber_config.clone())
+        let (mut subscriber, handle) = recv_client.subscribe(addr.clone(), subscriber_config.clone())
             .expect("Failed to subscribe");
+        subscriber_handles.push(handle);
 
         // Spawn a dedicated task for each receiver to consume messages
-        receiver_handles.spawn(async move {
-            tracing::debug!("start task: {}", subscriber.address());
-           
+        receiver_task_handles.spawn(async move {
+            tracing::trace!("Test receiver: start task on {}", addr.clone());
+
             let mut count = 0;
             // The loop will terminate when the channel is closed (all senders dropped)
             while let Some(_msg) = subscriber.recv().await {
                 count += 1;
             }
-            tracing::debug!("stop task: {}", subscriber.address());
+            tracing::trace!("Test receiver: stop task on {}", addr.clone());
             count
         });
     }
 
     // 5. Main Load Test: Spawn Sender tasks and measure dispatch time
     let start_time = Instant::now();
-    let mut sender_handles = JoinSet::new();
+    let mut sender_task_handles = JoinSet::new();
     
     for sender_id in 0..NUM_SENDERS {
         let target_idx = (sender_id + 50) % NUM_RECEIVERS;
@@ -117,9 +119,10 @@ async fn test_high_throughput_in_memory_routing() {
         let client_config = client_config.clone();
         let base_msg = message_templates[target_idx].clone();        
 
-        sender_handles.spawn(async move {
+        sender_task_handles.spawn(async move {
             let sender_addr = format!("arcella:load:test:{}", sender_id);
-            let client = broker.client(client_config.clone(), sender_addr).unwrap();
+            tracing::trace!("Test sender: start task on {}", sender_addr);
+            let client = broker.client(client_config.clone(), sender_addr.clone()).unwrap();
 
             // Publisher создается ОДИН раз на задачу, что активирует и тестирует его внутренний кэш
             let publisher = client.publisher(addr_str.clone());
@@ -134,25 +137,26 @@ async fn test_high_throughput_in_memory_routing() {
                 
                 publisher.send(msg).await.expect("Send should succeed");
             }
+            tracing::trace!("Test sender: stop task on {}", sender_addr);
         });
     }
 
     // 6. Wait for all senders to finish dispatching
-    while let Some(res) = sender_handles.join_next().await {
+    tracing::trace!("Wait for sender's tasks");
+    while let Some(res) = sender_task_handles.join_next().await {
         res.expect("Sender task panicked");
     }
     let dispatch_duration = start_time.elapsed();
 
     // 7. Unbind receivers to close their channels and signal them to terminate
-    for i in 0..NUM_RECEIVERS {
-        let addr = format!("arcella:{}:perf:recv", i);
-        recv_client.unbind(&addr).expect("Unbind should succeed");
-    }
+    tracing::trace!("Unbind receiver");
+    drop(subscriber_handles);
     drop(recv_client);
 
     // 8. Wait for all receivers to finish processing and sum up received messages
+    tracing::trace!("Wait for receiver's tasks");
     let mut total_received = 0;
-    while let Some(res) = receiver_handles.join_next().await {
+    while let Some(res) = receiver_task_handles.join_next().await {
         total_received += res.expect("Receiver task panicked");
     }
     let total_duration = start_time.elapsed();

@@ -34,78 +34,32 @@ use arc_swap::ArcSwap;
 use iradix::sync::Radix;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
     Mutex,
 };
-use thiserror::Error;
 
-use crate::transport::channel::MessageSender;
+mod error;
+mod routing;
+mod slot;
 
-pub struct SubscriptionSlot {
-    /// Current sender. `None` means the subscription has been removed.
-    /// We use `ArcSwap` for lock-free updates.
-    sender: ArcSwap<Option<MessageSender>>,
-    
-    /// Subscription version. Increments on ANY change:
-    /// - register (initial or re-registration)
-    /// - unregister
-    /// - replacement of the sender
-    pub version: AtomicU64,
-}
+use crate::transport::MessageSender;
 
-impl SubscriptionSlot {
-    pub fn new(sender: MessageSender) -> Arc<Self> {
-        Arc::new(Self {
-            sender: ArcSwap::from(Arc::new(Some(sender))),
-            version: AtomicU64::new(1),
-        })
-    }
-    
-    /// Update the sender and version increment.
-    pub fn update(&self, new_sender: MessageSender) {
-        self.sender.store(Arc::new(Some(new_sender)));
-        self.version.fetch_add(1, Ordering::Release);
-    }
-    
-    /// Marks the slot as deleted and version increment.
-    pub fn mark_removed(&self) {
-        self.sender.store(Arc::new(None));
-        self.version.fetch_add(1, Ordering::Release);
-    }
-    
-    /// Lock-free retrieval of the current state
-    pub fn load(&self) -> (Option<MessageSender>, u64) {
-        let guard = self.sender.load();        
-        let version = self.version.load(Ordering::Acquire);
-        (guard.as_ref().as_ref().cloned(), version)
-    }
-    
-    /// Checks if the underlying channel is closed or the slot is marked as removed
-    pub fn is_closed(&self) -> bool {
-        let guard = self.sender.load();
-        match guard.as_ref().as_ref() {
-            Some(sender) => sender.is_closed(),
-            None => true, // Slot was deleted explicitly with mark_removed
-        }
-    }
-}
-
-impl Drop for SubscriptionSlot {
-    fn drop(&mut self) {
-        tracing::debug!("drop");
-    }
-}
+pub use error::RegistryError;
+pub use slot::SubscriptionSlot;
+pub use routing::RouteTarget;
 
 /// Internal state of the registry, protected by a `RwLock`.
 /// Separates exact matches and wildcards for optimized lookup and conflict detection.
 #[derive(Clone)]
 struct RegistryInner {
-    /// Exact address -> channel. Key is `u8` for zero-allocation `&[u8]` queries.
-    exact_tree: Radix<u8, Arc<SubscriptionSlot>>,
+    /// Exact address -> routing target (Single slot or Group). 
+    /// Key is `u8` for zero-allocation `&[u8]` queries.
+    exact_tree: Radix<u8, Arc<RouteTarget>>,
+    
     /// Prefix wildcards (ending in `:**`). O(L) lookup via `get_ancestor`.
-    prefix_wildcard_tree: Radix<u8, Arc<SubscriptionSlot>>,
+    prefix_wildcard_tree: Radix<u8, Arc<RouteTarget>>,
+    
     /// Single-segment wildcards (containing `*` but not ending in `**`).
-    single_wildcards: Vec<(Vec<u8>, Arc<SubscriptionSlot>)>,
+    single_wildcards: Vec<(Vec<u8>, Arc<RouteTarget>)>,
 }
 
 /// Registry of local recipients (within a single process).
@@ -119,34 +73,6 @@ pub struct LocalRegistry {
     /// Mutex to serialize all mutations, preventing TOCTOU races during conflict checks
     /// without ever blocking concurrent readers.
     register_mutex: Mutex<()>,
-}
-
-/// Errors that can occur during registry operations.
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum RegistryError {
-    /// Returned when attempting to register an address or pattern that is already registered.
-    #[error("Address or pattern '{0}' is already occupied")]
-    AddressAlreadyOccupied(String),
-    
-    /// Returned when a new wildcard pattern overlaps with an existing exact address.
-    #[error("Wildcard subscription '{0}' conflicts with existing exact address '{1}'")]
-    WildcardConflict(String, String),
-    
-    /// Returned when an exact address is registered that falls under an existing wildcard pattern.
-    #[error("Exact address '{0}' conflicts with existing wildcard subscription '{1}'")]
-    ConflictsWithWildcard(String, String),
-
-    /// Returned when a wildcard pattern violates syntax rules.
-    /// 
-    /// Common causes:
-    /// - Empty pattern or empty segments (e.g., `a::b`).
-    /// - `**` is not the last segment (e.g., `a:**:b`).
-    /// - Malformed segments containing `*` alongside other characters (e.g., `a*`, `*b`).
-    #[error("Invalid wildcard format: {0}")]
-    InvalidWildcardFormat(String),
-
-    #[error("Waiter already exists")]
-    WaiterAlreadyExists,
 }
 
 impl LocalRegistry {
@@ -311,7 +237,7 @@ impl LocalRegistry {
     }
 
     fn check_prefix_wildcard_conflicts(
-        prefix_wildcard_tree: &Radix<u8, Arc<SubscriptionSlot>>,
+        prefix_wildcard_tree: &Radix<u8, Arc<RouteTarget>>,
         pat_bytes: &[u8],
     ) -> Result<Option<String>, RegistryError> {
         if prefix_wildcard_tree.is_empty() {
@@ -356,26 +282,38 @@ impl LocalRegistry {
         Ok(None)
     }        
 
-    /// Registers a recipient at the specified address.
+    /// Registers a recipient at the specified address with the given routing policy.
     ///
-    /// Automatically routes to `register_exact` or `register_wildcard` based on 
-    /// the presence of the `*` character.
-    pub fn register(&self, address: String, channel: MessageSender) -> Result<(), RegistryError> {
+    /// # Arguments
+    /// * `address` - logical address or wildcard pattern.
+    /// * `channel` - the sender end of the message channel.
+    /// * `policy` - routing policy (`None` = Exclusive, `Some(LoadBalanced|Broadcast)`).
+    ///
+    /// # Errors
+    /// - `AddressAlreadyOccupied` if an Exclusive subscription already exists.
+    /// - `PolicyMismatch` if a group exists with a different policy.
+    pub fn register(
+        &self,
+        address: String, 
+        channel: MessageSender,
+    ) -> Result<Arc<SubscriptionSlot>, RegistryError> {
         let _guard = self.register_mutex.lock().unwrap();
         let current = self.inner.load();
         let mut new_inner = (**current).clone();
         
-        tracing::debug!("register: {}", address);
+        tracing::debug!("LocalRegistry register: {}", address);
+
+        let slot = SubscriptionSlot::new(channel);
 
         if Self::is_wildcard(&address) {
-            self.register_wildcard(&mut new_inner, address, channel)?;
+            self.register_wildcard(&mut new_inner, address, slot.clone())?;
         } else {
-            self.register_exact(&mut new_inner, address, channel)?;
+            self.register_exact(&mut new_inner, address, slot.clone())?;
         }
 
         self.inner.store(Arc::new(new_inner));
 
-        Ok(())
+        Ok(slot)
     }
 
     /// Registers an exact, non-wildcard address.
@@ -383,7 +321,7 @@ impl LocalRegistry {
         &self,
         inner: &mut RegistryInner,
         address: String,
-        channel: MessageSender,
+        slot: Arc<SubscriptionSlot>,
     ) -> Result<(), RegistryError> {
         let addr_bytes = address.as_bytes();
 
@@ -407,9 +345,9 @@ impl LocalRegistry {
         } 
 
         // 4. Insert (O(L) copy-on-write)
-        let slot = SubscriptionSlot::new(channel);
+        let target = Arc::new(RouteTarget::Single(slot));
         let mut txn = inner.exact_tree.txn();
-        txn.insert(addr_bytes, slot);
+        txn.insert(addr_bytes, target);
         inner.exact_tree = txn.commit();                       
 
         Ok(())
@@ -420,7 +358,7 @@ impl LocalRegistry {
         &self,
         inner: &mut RegistryInner,
         pattern: String,
-        channel: MessageSender,
+        slot: Arc<SubscriptionSlot>,
     ) -> Result<(), RegistryError> {
         Self::validate_wildcard_pattern(&pattern)?;
         let pat_bytes = pattern.as_bytes();
@@ -462,54 +400,77 @@ impl LocalRegistry {
         }
 
         // 6. Insert
-        let slot = SubscriptionSlot::new(channel);
+        let target = Arc::new(RouteTarget::Single(slot));
         if is_prefix_wildcard {
             let mut txn = inner.prefix_wildcard_tree.txn();
-            txn.insert(pat_bytes, slot);
+            txn.insert(pat_bytes, target);
             inner.prefix_wildcard_tree = txn.commit();
         } else {
-            inner.single_wildcards.push((pat_bytes.to_vec(), slot));
+            inner.single_wildcards.push((pat_bytes.to_vec(), target));
         }
 
         Ok(())
     }
 
-    /// Unregisters a recipient by address or pattern.
+    /// Unregisters a specific subscription slot from the given address.
     ///
-    /// Note: This is a silent no-op if the address/pattern is not found, 
-    /// which is standard for cleanup operations.
-    pub fn unregister(&self, address: &str) -> Result<(), RegistryError>{
+    /// For **Exclusive** (Single) targets: removes the entire route from the tree.
+    /// For **Group** targets (LoadBalanced/Broadcast): removes only the specified 
+    /// slot from the group. The route is removed from the tree only when the 
+    /// group becomes empty.
+    ///
+    /// The slot is identified by `Arc::ptr_eq`, ensuring that only the exact 
+    /// subscription is removed, even if multiple slots share the same address.
+    ///
+    /// Note: This is a silent no-op if the address or slot is not found.
+    pub fn unregister(
+        &self,
+        address: &str,
+        slot: &Arc<SubscriptionSlot>
+    ) -> Result<(), RegistryError>{
         let _guard = self.register_mutex.lock().unwrap();
         let current = self.inner.load();
         let mut new_inner = (**current).clone();
         let addr_bytes = address.as_bytes();
 
-        tracing::debug!("unregister: {}", address);
+        tracing::debug!("LocalRegistry unregister: {}", address);
+
+        let mut needs_update = false;
 
         if Self::is_wildcard(address) {
             if address.ends_with("**") {
-                if let Some(slot) = new_inner.prefix_wildcard_tree.get(addr_bytes) {
-                    slot.mark_removed(); // Notify existing endpoints FIRST
-                    let mut txn = new_inner.prefix_wildcard_tree.txn();
-                    txn.remove(addr_bytes); // THEN remove from tree to prevent false wildcard conflicts
-                    new_inner.prefix_wildcard_tree = txn.commit();
+                if let Some(target) = new_inner.prefix_wildcard_tree.get(addr_bytes) {
+                    if target.remove_slot(slot) {
+                        let mut txn = new_inner.prefix_wildcard_tree.txn();
+                        txn.remove(addr_bytes); // THEN remove from tree to prevent false wildcard conflicts
+                        new_inner.prefix_wildcard_tree = txn.commit();
+                        needs_update = true;
+                    }
                 }
             } else {
                 if let Some(idx) = new_inner.single_wildcards.iter().position(|(p, _)| p.as_slice() == addr_bytes) {
-                    let (_pattern, slot) = new_inner.single_wildcards.remove(idx);
-                    slot.mark_removed();
+                    let target = new_inner.single_wildcards[idx].1.clone();
+                    if target.remove_slot(slot) {
+                        new_inner.single_wildcards.remove(idx);
+                        needs_update = true;
+                    }
                 }
             }
         } else {
-            if let Some(slot) = new_inner.exact_tree.get(addr_bytes) {
-                slot.mark_removed(); // Notify existing endpoints FIRST
-                let mut txn = new_inner.exact_tree.txn();
-                txn.remove(addr_bytes); // THEN remove from tree
-                new_inner.exact_tree = txn.commit();
+            if let Some(target) = new_inner.exact_tree.get(addr_bytes) {
+                if target.remove_slot(slot) {
+                    let mut txn = new_inner.exact_tree.txn();
+                    txn.remove(addr_bytes); // THEN remove from tree
+                    new_inner.exact_tree = txn.commit();
+                    needs_update = true;
+                }
             }
         }
 
-        self.inner.store(Arc::new(new_inner));
+        if needs_update {
+            self.inner.store(Arc::new(new_inner));
+        }
+
         Ok(())
     }
 
@@ -517,7 +478,7 @@ impl LocalRegistry {
     ///
     /// Returns `Some(channel)` if a recipient exists in this process.
     /// Priority is given to exact matches, followed by wildcard matches.
-    pub fn lookup(&self, address: &str) -> Option<Arc<SubscriptionSlot>> {
+    pub fn lookup(&self, address: &str) -> Option<Arc<RouteTarget>> {
         let inner = self.inner.load();
         let addr_bytes = address.as_bytes();    
 

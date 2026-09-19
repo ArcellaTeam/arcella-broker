@@ -87,7 +87,7 @@ impl MessageSender {
     /// Internal use: Called by the create_channel factory function
     /// or by the registry when registering a new subscription.
     pub(crate) fn new(inner: mpsc::Sender<Message>) -> Self {
-        tracing::debug!("new");
+        tracing::debug!("MessageSender new");
         Self { inner }
     }
 
@@ -101,7 +101,7 @@ impl MessageSender {
     /// Returns BrokerError::ChannelClosed if the receiver (MessageReceiver)
     /// has been dropped and the message cannot be delivered.
     pub async fn send(&self, message: Message) -> Result<(), BrokerError> {
-        tracing::trace!("send");
+        tracing::trace!("MessageSender send");
         self.inner
             .send(message)
             .await
@@ -120,7 +120,7 @@ impl MessageSender {
     /// - BrokerError::ChannelFull: The queue is full. The message is returned to the calling code.
     /// - BrokerError::ChannelClosed: The receiver has been destroyed.
     pub fn try_send(&self, message: Message) -> Result<(), BrokerError> {
-        tracing::trace!("try_send");
+        tracing::trace!("MessageSender try_send");
         self.inner
             .try_send(message)
             .map_err(|e| match e {
@@ -154,7 +154,7 @@ impl Drop for MessageSender {
     fn drop(&mut self) {
     // If the reference count drops to 0, the channel is automatically closed for the receiver.
     // Logging helps track the lifecycle of subscriptions.
-        tracing::debug!("drop");
+        tracing::debug!("MessageSender drop");
     }
 }
 
@@ -173,7 +173,7 @@ pub struct MessageReceiver {
 impl MessageReceiver {
     /// Creates a new instance of the recipient.
     pub(crate) fn new(inner: mpsc::Receiver<Message>) -> Self {
-        tracing::debug!("new");
+        tracing::debug!("MessageReceiver new");
         Self { inner }
     }
 
@@ -184,7 +184,7 @@ impl MessageReceiver {
     /// Returns None if all senders have been dropped and the channel is closed.
     /// This is a signal for the broker's processing loop to terminate work with this subscriber.
     pub async fn recv(&mut self) -> Option<Message> {
-        tracing::trace!("recv");
+        tracing::trace!("MessageReceiver recv");
         self.inner.recv().await
     }
 
@@ -193,7 +193,7 @@ impl MessageReceiver {
     /// Useful for implementing polling or hybrid processing loops,
     /// where the broker needs to check for messages without blocking the execution thread.
     pub fn try_recv(&mut self) -> Result<Message, TryRecvError> {
-        tracing::trace!("try_recv");
+        tracing::trace!("MessageReceiver try_recv");
         self.inner.try_recv().map_err(Into::into)
     }
 
@@ -217,7 +217,7 @@ impl Drop for MessageReceiver {
     fn drop(&mut self) {
     // When the tokio receiver is dropped, the channel is closed automatically.
     // Logging helps track the lifecycle of subscriptions.
-        tracing::debug!("drop");
+        tracing::debug!("MessageReceiver drop");
     }
 }
 
@@ -256,7 +256,7 @@ impl ChannelLoad {
 ///
 /// # Example
 /// ```rust
-/// use arcella_broker::transport::channel::create_channel;
+/// use arcella_broker::transport::create_channel;
 /// 
 /// // Creating a channel with a capacity of 1024 messages 
 /// let (sender, mut receiver) = create_channel(1024); 
