@@ -36,15 +36,13 @@
 
 use std::{
     sync::Arc,
-    sync::atomic::Ordering,
     future::Future,
 };
 
 use crate::protocol::Message;
-use crate::registry::{LocalRegistry, SubscriptionSlot};
+use crate::registry::{LocalRegistry, RouteTarget};
 
 use super::{
-    channel::MessageSender,
     Endpoint, 
     ResolvedEndpoint, 
     Transport, 
@@ -57,7 +55,7 @@ use super::{
 /// # Hot Path optimization
 /// Instead of accessing the LocalRegistry on every message send
 /// (which would require a Radix tree lookup or scanning wildcard rules),
-/// InMemoryEndpoint stores a direct reference to a SubscriptionSlot and its current version.
+/// InMemoryEndpoint stores a direct reference to a `RouteTarget`
 ///
 /// Before sending, the is_valid() method performs an ultra-fast check:
 /// 1. Whether the slot's current version matches the cached one (guaranteeing that the subscriber
@@ -67,10 +65,8 @@ use super::{
 /// If both conditions hold, the send happens without any locks
 /// or registry lookups.
 pub struct InMemoryEndpoint {
-    // A direct reference to the subscription slot in the registry for verifying version freshness.
-    slot: Arc<SubscriptionSlot>,
-    /// A cached sender extracted from the slot at the time the endpoint was created.
-    sender: MessageSender,
+    // A direct reference to the routing target in the registry for verifying version freshness.
+    target: Arc<RouteTarget>,
     /// The slot version at the time of caching. Used to detect changes (TOCTOU).
     cached_version: u64,
 }
@@ -82,12 +78,10 @@ impl InMemoryEndpoint {
     /// The expect call here is safe because this method is called exclusively
     /// from InMemoryTransport::resolve, which returns the slot only if
     /// it exists and contains a valid MessageSender.
-    pub(crate) fn new(slot: Arc<SubscriptionSlot>) -> Self {
-        let (sender, version) = slot.load();
-        Self { 
-            slot,
-            sender: sender.expect("Slot must have a valid sender upon resolve"), 
-            cached_version: version, 
+    pub(crate) fn new(target: Arc<RouteTarget>) -> Self {
+        Self {
+            cached_version: target.version(),
+            target,
         }
     }
 }
@@ -95,17 +89,18 @@ impl InMemoryEndpoint {
 impl Endpoint for InMemoryEndpoint {
     /// Sends a message using the cached channel.
     ///
-    /// This method does not perform a repeated registry lookup. If the channel was closed
-    /// after caching, the method returns TransportError::ConnectionClosed,
-    /// which forces the caller (e.g., Publisher) to invalidate the cache
-    /// and perform address re-resolution (resolve).
+    /// This method does not perform a repeated registry lookup. 
+    /// For Single targets: if the channel was closed, returns ConnectionClosed.
+    /// For Group targets: delegates to the group's send logic, which handles 
+    /// individual channel failures internally (e.g., skipping dead members in Broadcast).
     fn send(
         &self,
         message: Message,
     ) -> impl Future<Output = TransportResult<()>> + Send {
         async move {
             // Use cached sender without clone
-            self.sender.send(message).await.map_err(|_| TransportError::ConnectionClosed)
+            //self.sender.send(message).await.map_err(|_| TransportError::ConnectionClosed)
+            self.target.send(message).await
         }
     }
     
@@ -117,10 +112,8 @@ impl Endpoint for InMemoryEndpoint {
     /// after a component restart), and the old channel is no longer relevant.
     /// 2. Checks the physical state of the channel via is_closed().
     fn is_valid(&self) -> bool {
-        let current_version = self.slot.version.load(Ordering::Acquire);
-
         // Check actual status
-        current_version == self.cached_version && !self.sender.is_closed()
+        self.target.version() == self.cached_version && !self.target.is_closed()
     }
 }
 
@@ -187,22 +180,11 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
     ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
         async move {
             match self.registry.lookup(address) {
-                Some(channel) => {
+                Some(target) => {
                     // IMPORTANT: Using .await on mpsc::Sender provides natural backpressure.
                     // If the receiver's queue is full, the sender will be blocked, preventing
                     // unbounded memory growth (OOM) with slow consumers or DoS attacks.
-                    let (sender, _) = channel.load();
-                    match sender {
-                        Some(sender) => {
-                            sender.send(message).await.map_err(|_| {
-                                TransportError::ConnectionClosed
-                            })
-                        }
-                        None => {
-                            Err(TransportError::ConnectionClosed)
-                        }
-                    }?;
-                    Ok(())
+                    target.send(message).await
                 }
                 None => Err(TransportError::RecipientNotFound(address.to_string())),
             }
@@ -240,7 +222,7 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
     /// BrokerClient::request. This is necessary for safety guarantees:
     /// 1. Forced and safe injection of the correct reply_to address.
     /// 2. Registration of response waiting in ReplyDispatcher, tied to the lifecycle
-    /// of a specific client (RAII cleanup when a Wasm component crashes).
+    /// of a specific client (RAII cleanup).
     /// The raw transport does not have the client's context and must not manage this process.
     ///
     /// Uses `ReplyDispatcher` to register waiting for a response by `message_id`.

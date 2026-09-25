@@ -43,11 +43,13 @@ use std::{
     sync::Arc,
 };
 
-pub mod channel;
+mod channel;
 pub mod in_memory;
 
 use crate::protocol::{Message, ProtocolError};
 use crate::registry::RegistryError;
+
+pub use channel::*;
 
 /// Errors that occur at the broker's transport level during message delivery.
 ///

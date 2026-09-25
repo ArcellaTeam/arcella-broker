@@ -20,8 +20,7 @@
 //! zero-cost routing between asynchronous tasks.
 //!
 //! Key guarantees that this module provides to the broker:
-//! 1. **Strict lifecycle management (RAII)**: When the client is destroyed
-//! (for example, upon a task panic or graceful shutdown of a Wasm instance), its
+//! 1. **Strict lifecycle management (RAII)**: When the client is destroyed, its
 //! address is automatically and synchronously removed from the `LocalRegistry`, preventing
 //! the appearance of "zombie" routes and memory leaks.
 //! 2. **Safety of the Request/Response (InOut) pattern**: The `request` method
@@ -36,15 +35,21 @@ use std::sync::Arc;
 
 mod publisher;
 mod reply_dispatcher;
-pub mod subscriber;
+mod subscriber;
 
 use crate::{
     broker::Broker,
     config::{ClientConfig, SubscriberConfig},
     protocol::Message,
-    registry::RegistryError,
+    registry::{
+        RegistryError, 
+        RegisterResult,
+        RoutingPolicy,
+        RouteTarget,
+        SubscriptionSlot,
+    },
     transport::{
-        channel::MessageSender,
+        create_channel,
         in_memory::{
             InMemoryTransport, 
             InMemoryEndpoint,
@@ -55,11 +60,11 @@ use crate::{
     }
 };
 
-use subscriber::Subscriber;
+pub use subscriber::{Subscriber, SubscriptionHandle};
 use publisher::Publisher;
 use reply_dispatcher::ReplyDispatcher;
 
-// The primary client interface for interacting with the Arcella message broker.
+/// The primary client interface for interacting with the Arcella message broker.
 ///
 /// An instance of `BrokerClient` represents the logical identity of a component
 /// in the routing system. It owns the channel for receiving replies (via
@@ -82,6 +87,8 @@ pub struct BrokerClient {
     /// (for example, "arcella:core:http-handler").
     client_address: String,
 
+    _reply_handle: SubscriptionHandle,
+
     /// The dispatcher that manages pending replies to requests (InOut).
     /// Guarantees the absence of memory leaks upon abnormal termination of the component.
     reply_dispatcher: ReplyDispatcher,
@@ -101,10 +108,23 @@ impl BrokerClient {
     /// Returns `RegistryError` if the `client_address` is already occupied
     /// by another active component (guaranteeing binding exclusivity).
     pub(crate) fn new(broker: Arc<Broker>, config: ClientConfig, client_address: String) -> Result<Self, RegistryError> {
+        let (sender, receiver) = create_channel(config.reply_channel_capacity);
+        
+        let reply_slot = SubscriptionSlot::new(sender);
+        let target = RouteTarget::new_exclusive(reply_slot.clone());
+
+        broker.registry.register(client_address.clone(), target)?;
+
         // The reply channel registration must happen first, so that
         // the component is ready to accept a reply immediately after sending a request.
-        let reply_subscriber = Subscriber::bind(client_address.clone(), broker.registry.clone(), config.reply_channel_capacity)?;
+        let reply_subscriber = Subscriber::new_push(receiver, client_address.clone());
         let reply_dispatcher = ReplyDispatcher::new(reply_subscriber);
+
+        let reply_handle = SubscriptionHandle::new_exclusive(
+            client_address.clone(),
+            reply_slot,
+            broker.registry.clone(),
+        );
 
         let transport = InMemoryTransport::new(broker.registry.clone());
         let local = Arc::new(transport);
@@ -113,6 +133,7 @@ impl BrokerClient {
             broker, 
             local,
             client_address,
+            _reply_handle: reply_handle,
             reply_dispatcher,
         })
     }
@@ -124,37 +145,87 @@ impl BrokerClient {
 
     /// Creates a subscription to messages at the specified logical address.
     ///
-    /// Creates a new `Subscriber` that registers its channel in the LocalRegistry.
-    /// Supports both exact addresses and wildcard patterns (depending on
-    /// the registry's validation rules). The channel capacity controls backpressure.
+    /// Returns a tuple of:
+    /// - `Subscriber`: the data receiver (move into a background task).
+    /// - `SubscriptionHandle`: the RAII guard (keep in the parent scope).
+    ///   Dropping the handle unregisters the subscription.
+    ///
+    /// # Routing Policy
+    /// The subscription type is determined by `SubscriberConfig::routing_policy`:
+    /// - `Exclusive` (default): Exclusive binding. Fails if address is occupied.
+    /// - `LoadBalanced`: Adds to a Round-Robin group. Fails if address is registered as Exclusive or Broadcast
+    /// - `Broadcast`: Adds to a Fan-out group. Fails if address is registered as Exclusive or LoadBalanced.
     pub fn subscribe(
         &self,
         address: String,
         config: SubscriberConfig,
-    ) -> Result<Subscriber, RegistryError> {
-        Subscriber::bind(address, self.broker.registry.clone(), config.channel_capacity)
-    }
-    
-    /// Low-level registration of a custom sender at an address.
-    ///
-    /// # Note
-    /// This method is intended for advanced scenarios where a component wants
-    /// to provide the broker with an already-created `MessageSender` (for example, for
-    /// integration with third-party queues). In standard scenarios, you should
-    /// use `subscribe`, which encapsulates this logic.
-    pub fn bind(&self, address: String, sender: MessageSender) -> Result<(), RegistryError> {
-        self.broker.registry.register(address, sender)
-    }
-    
-    /// Unregisters the receiver at the specified address.
-    ///
-    /// This results in the receiver's channel being closed. Any pending `recv()` calls
-    /// on the receiver's side will immediately return `None`, and senders will receive
-    /// a `ChannelClosed` error on their next send attempt.
-    pub fn unbind(&self, address: &str) -> Result<(), RegistryError> {
-        self.broker.registry.unregister(address)
-    }
+    ) -> Result<(Subscriber, SubscriptionHandle), RegistryError> {
+        match config.routing_policy {
+            RoutingPolicy::Exclusive => {        
+                let (sender, receiver) = create_channel(config.channel_capacity);
 
+                let slot = SubscriptionSlot::new(sender);
+                let target = RouteTarget::new_exclusive(slot.clone());
+
+                self.broker.registry.register(address.clone(), target)?;
+
+                let subscriber = Subscriber::new_push(receiver, address.clone());
+                let handle = SubscriptionHandle::new_exclusive(
+                    address,
+                    slot,
+                    self.broker.registry.clone(),
+                );
+
+                Ok((subscriber, handle))
+            }
+            RoutingPolicy::LoadBalanced => {
+                let registry = self.broker.registry.clone();
+                let address_for_factory = address.clone();
+                let channel_capacity = config.channel_capacity;
+                let req_capacity = 1000;
+
+                // ATOMIC operation: check and register under a single mutex.
+                // The factory is called ONLY if the address is free, eliminating races and task leaks.
+                let result = registry.get_existing_or_register(
+                    address.clone(),
+                    || {
+                        let (sender, receiver) = create_channel(channel_capacity);
+                        let slot = SubscriptionSlot::new(sender);
+                        Ok(RouteTarget::new_load_balanced(
+                            slot,
+                            receiver,
+                            req_capacity,
+                            Arc::downgrade(&registry),
+                            address_for_factory.clone(),
+                        ))
+                    },
+                )?;
+
+                // Extract the RouteTarget (whether new or already existing)
+                let target = match result {
+                    RegisterResult::Registered(t) => t,
+                    RegisterResult::AlreadyExists(t) => t,
+                };
+
+                let group = target.load_balanced_group()
+                    .ok_or_else(|| crate::registry::RegistryError::PolicyMismatch(address.clone()))?
+                    .clone();
+                let req_sender = group.subscribe();
+
+                // Create a unified Subscriber type (in Pull mode).
+                // For the calling code, the API is no different from Exclusive!
+                let subscriber = Subscriber::new_pull(req_sender, address.clone());
+                
+                // Create a passive handle. It will not call unregister on drop,
+                // since the group's lifecycle is managed by the background task via the RequestSender refcount.
+                let handle = SubscriptionHandle::new_load_balanced(address, group);
+
+                Ok((subscriber, handle))
+            }
+        }
+
+    }
+    
     /// Creates a high-performance `Publisher` for the specified address.
     ///
     /// # Optimization (Hot Path)
@@ -214,31 +285,6 @@ impl BrokerClient {
 
 }
 
-/// Automatic cleanup of the client's resources upon the termination of its lifecycle.
-///
-/// # Critical importance for Arcella's stability
-/// This method implements a strict cleanup order to prevent state races
-/// (TOCTOU) during rapid recreation of components:
-/// 1. **Synchronous unregistration**: The `client_address` is removed from the
-///    `LocalRegistry` before the asynchronous `ReplyDispatcher` begins to be destroyed.
-/// 2. This guarantees that any new component attempting to occupy the same
-///    address will not encounter an `AddressAlreadyOccupied` conflict due to
-///    a delay in asynchronous cleanup.
-/// 3. The error is ignored (with logging) if the address has already been removed (for example,
-///    upon forced termination of the entire broker process).
-impl Drop for BrokerClient {
-    fn drop(&mut self) {
-        // Synchronously clean up the client address from the registry BEFORE
-        // the ReplyDispatcher begins its asynchronous task cleanup.
-        // This prevents a race condition when quickly recreating a client with the same address.
-        if let Err(e) = self.broker.registry.unregister(&self.client_address) {
-            // Ignore the error if the address was already removed (e.g., during a panic),
-            // but log it for debugging purposes.
-            tracing::debug!(address = %self.client_address, error = %e, "Client address already unregistered or cleanup race");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -255,7 +301,11 @@ mod tests {
         // 2. Prepare the receiver (Actor pattern)
         let target_address = "arcella:core:test:receiver".to_string();
         let subscriber_config = SubscriberConfig::default();
-        let mut subscriber = client.subscribe(target_address.clone(), subscriber_config).expect("Subscription should succeed");
+        let (mut subscriber, _handle) = client
+            .subscribe(
+                target_address.clone(),
+                subscriber_config
+            ).expect("Subscription should succeed");
 
         // 3. Create a test message
         let original_message = test_utils::dummy_in_only_message(Bytes::from("test:ping"),
@@ -307,8 +357,15 @@ mod tests {
         let subscriber_config = SubscriberConfig::default();
 
         let mut subscribers = Vec::new();
+        let mut handles = Vec::new();
         for addr in &addresses {
-            subscribers.push(client.subscribe(addr.to_string(), subscriber_config.clone()).expect("Subscription should succeed"));
+            let (subscriber, handle)  = client
+                .subscribe(
+                    addr.to_string(),
+                    subscriber_config.clone()
+                ).expect("Subscription should succeed");
+            subscribers.push(subscriber);
+            handles.push(handle);
         }
 
         // 3. Send mixed messages to different addresses
@@ -367,6 +424,8 @@ mod tests {
         assert!(subscribers[0].try_recv().is_err(), "users channel should be empty");
         assert!(subscribers[1].try_recv().is_err(), "api channel should be empty");
         assert!(subscribers[2].try_recv().is_err(), "processor channel should be empty");
+
+        drop(handles);
     }
 
     #[tokio::test]
@@ -387,14 +446,19 @@ mod tests {
         let subscriber_config = SubscriberConfig::default();
 
         // Registration
-        let mut subscriber = client.subscribe("arcella:test".to_string(), subscriber_config).expect("Subscription should succeed");
+        let (mut subscriber, handle) = client
+            .subscribe(
+                "arcella:test".to_string(),
+                subscriber_config,
+            )
+            .expect("Subscription should succeed");
 
         // Now sending should succeed
         assert!(client.send("arcella:test", msg).await.is_ok());
         assert!(subscriber.recv().await.is_some());
 
         // Unregistration
-        assert!(client.unbind("arcella:test").is_ok());
+        drop(handle);
 
         // Should return an error again
         let msg2 = test_utils::dummy_in_only_message(Bytes::from_static(b"test2"),
@@ -407,31 +471,42 @@ mod tests {
 async fn test_subscription_cleanup_and_re_registration() {
         // 1. Initialize client
         let client = test_utils::test_client("test".to_string()).unwrap();
-																								  
-        
-													   
 																		  
         let addr = "arcella:test:duplicate";
 
         let subscriber_config = SubscriberConfig::default();
 
         // 1. First subscription
-        let sub1 = client.subscribe(addr.to_string(), subscriber_config.clone()).expect("First subscription should succeed");
+        let (_sub1, hdl1) = client
+            .subscribe(
+                addr.to_string(),
+                subscriber_config.clone(),
+            )
+            .expect("First subscription should succeed");
         
         // 2. Second subscription to the same address 
-        let sub2_result = client.subscribe(addr.to_string(), subscriber_config.clone());
+        let sub2_result = client
+            .subscribe(
+                addr.to_string(),
+                subscriber_config.clone(),
+            );
         assert!(
             matches!(sub2_result, Err(RegistryError::AddressAlreadyOccupied(_))),
             "Second subscription to the same address must be rejected with AddressAlreadyOccupied"
         );
 
         // 3. sub1 goes out of scope
-        drop(sub1);
+        drop(hdl1);
         // Drop triggers: self.registry.unregister(&self.address);
         // Registry is now empty! tx2 (owned by sub2) is removed from the registry.
 
 													 
-        let mut sub3 = client.subscribe(addr.to_string(), subscriber_config).expect("Subscription after drop should succeed");
+        let (mut sub3, _hdl3) = client
+            .subscribe(
+                addr.to_string(),
+                subscriber_config.clone(),
+            )
+            .expect("Subscription after drop should succeed");
 
         // 4. Attempt to send a message
         let msg = test_utils::dummy_in_only_message(

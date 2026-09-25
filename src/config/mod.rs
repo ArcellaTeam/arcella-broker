@@ -10,6 +10,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::registry::RoutingPolicy;
+
 pub const DEFAULT_REPLY_CHANNEL_CAPACITY: usize = 1024;
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 pub const MAX_CHANNEL_CAPACITY: usize = 65_536;
@@ -104,13 +106,15 @@ pub struct SubscriberConfig {
     /// Maximum number of messages the subscriber channel can buffer.
     /// Upon overflow, the sender will be blocked (backpressure) or receive an error.
     pub channel_capacity: usize,
+    pub routing_policy: RoutingPolicy,
 }
 
 impl Default for SubscriberConfig {
     /// Creates a new subscriber configuration with default values.
     fn default() -> Self {
         Self {
-            channel_capacity: DEFAULT_CHANNEL_CAPACITY
+            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            routing_policy: RoutingPolicy::Exclusive,
         }
     }
 }

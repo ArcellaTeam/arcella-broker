@@ -52,7 +52,7 @@ pub fn dummy_in_out_message(msg_type: Bytes, address: Bytes, reply_to: Bytes, pa
         64,
         msg_type,
         address,
-        reply_to, // <-- Для InOut здесь должен быть валидный адрес
+        reply_to, // <-- For InOut, there must be a valid address here
         payload,
     ).unwrap()
 }

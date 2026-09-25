@@ -107,6 +107,7 @@ where
             if let Some(ep) = guard.as_ref() {
                 // Check alive and version of endpoint
                 if ep.is_valid() {
+                    tracing::trace!("Publisher fast resolve endpoint");
                     return Ok(ep.clone());
                 }
             }
@@ -119,6 +120,7 @@ where
         let guard = self.cached_endpoint.upgradable_read();
         if let Some(ep) = guard.as_ref() {
             if ep.is_valid() {
+                tracing::trace!("Publisher endpoint already updated along with resolve");
                 return Ok(ep.clone());
             }
         }
@@ -128,10 +130,12 @@ where
         // Re-check after acquiring the exclusive lock (classic double-check)
         if let Some(ep) = write_guard.as_ref() {
             if ep.is_valid() {
+                tracing::trace!("Publisher endpoint already updated befor write lock");
                 return Ok(ep.clone());
             }
         }
 
+        tracing::trace!("Publisher has been updated");
         *write_guard = Some(resolved_ep.clone());
         Ok(resolved_ep)
     }
@@ -141,8 +145,8 @@ where
     ///
     /// # Failure handling and self-healing
     /// If the transport returns `TransportError::ConnectionClosed`, this means
-    /// the target component (e.g., a Wasm instance in `arcella-worker`) has terminated
-    /// or its channel has been broken. In this case, `Publisher` performs an **explicit
+    /// the target component has terminated or its channel has been broken. 
+    /// In this case, `Publisher` performs an **explicit
     /// cache invalidation** (`*self.cached_endpoint.write() = None`).
     ///
     /// This is critically important: on the next send attempt (or upon automatic
