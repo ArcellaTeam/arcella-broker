@@ -222,7 +222,7 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
     /// BrokerClient::request. This is necessary for safety guarantees:
     /// 1. Forced and safe injection of the correct reply_to address.
     /// 2. Registration of response waiting in ReplyDispatcher, tied to the lifecycle
-    /// of a specific client (RAII cleanup when a Wasm component crashes).
+    /// of a specific client (RAII cleanup).
     /// The raw transport does not have the client's context and must not manage this process.
     ///
     /// Uses `ReplyDispatcher` to register waiting for a response by `message_id`.

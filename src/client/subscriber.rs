@@ -40,38 +40,66 @@
 
 use std::sync::Arc;
 
-use crate::protocol::Message;
-use crate::registry::{LocalRegistry, RegistryError, SubscriptionSlot};
-use crate::transport::{create_channel, MessageReceiver, TryRecvError};
+use crate::{
+    protocol::Message,
+    registry::{
+        LocalRegistry, 
+        LoadBalancedGroup,
+        SubscriptionSlot
+    },
+    transport::{
+        MessageReceiver, 
+        RequestSender,
+        TryRecvError
+    },
+};
+
+enum CleanupStrategy {
+    /// Exclusive: unregister from the registry
+    Exclusive {
+        slot: Arc<SubscriptionSlot>,
+        registry: Arc<LocalRegistry>,
+    },
+    /// LoadBalanced: remove_consumer from the group
+    LoadBalanced {
+        group: Arc<LoadBalancedGroup>,
+    },
+}
 
 pub struct SubscriptionHandle {
-    /// Логический адрес подписки (для логирования)
+    /// Logical subscription address (for logging)
     address: String,
- 
-    /// Ссылка на слот в реестре
-    slot: Arc<SubscriptionSlot>,
- 
-    /// Ссылка на реестр для отмены регистрации
-    registry: Arc<LocalRegistry>,
+
+    cleanup: CleanupStrategy,
 }
 
 impl SubscriptionHandle {
-    pub(crate) fn new(
+    /// Creates a guard for an Exclusive subscription (active cleanup on drop)
+    pub(crate) fn new_exclusive(
         address: String,
         slot: Arc<SubscriptionSlot>,
         registry: Arc<LocalRegistry>,
     ) -> Self {
-        Self { address, slot, registry }
+        Self { 
+            address, 
+            cleanup: CleanupStrategy::Exclusive { slot, registry },
+        }
+    }
+    
+    /// Creates a guard for a LoadBalanced subscription (passive, cleanup via refcount)
+    pub(crate) fn new_load_balanced(
+        address: String,
+        group: Arc<LoadBalancedGroup>,
+    ) -> Self {
+        Self { 
+            address, 
+            cleanup: CleanupStrategy::LoadBalanced { group },
+        }
     }
 
     pub fn address(&self) -> &str {
         &self.address
     }
-
-    pub fn unsubscribe(self) {
-        // Drop будет вызван автоматически
-        drop(self);
-    }            
 }
 
 /// # Architectural guarantee (RAII)
@@ -85,16 +113,30 @@ impl SubscriptionHandle {
 impl Drop for SubscriptionHandle {
     fn drop(&mut self) {
         tracing::debug!("SubscriptionHandle drop: {}", self.address);
-        if let Err(e) = self.registry.unregister(&self.address, &self.slot) {
-            tracing::warn!(
-                address = %self.address, 
-                error = %e, 
-                "Failed to unregister subscription on drop"
-            );
+
+        match &self.cleanup {
+            CleanupStrategy::Exclusive { slot, registry } => {
+                if let Err(e) = registry.unregister(&self.address, slot) {
+                    tracing::warn!(
+                        address = %self.address, 
+                        error = %e, 
+                        "Failed to unregister subscription on drop"
+                    );
+                }
+            }
+            CleanupStrategy::LoadBalanced { group } => {
+                group.remove_consumer();
+            }
         }
     }
 }
 
+enum SubscriberMode {
+    /// Push mode: messages arrive in MessageReceiver (Exclusive, Broadcast)
+    Push(MessageReceiver),
+    /// Pull mode: messages are requested via RequestSender (LoadBalanced)
+    Pull(Arc<RequestSender>),
+}
 
 /// An active subscription to messages at a specific logical address.
 ///
@@ -112,31 +154,34 @@ impl Drop for SubscriptionHandle {
 /// `BrokerClient::subscribe()`.
 pub struct Subscriber {
     /// The receiving end of the asynchronous channel, protected against overflow.																  
-    rx: MessageReceiver,
+    mode: SubscriberMode,
 
     /// The logical address the subscription is registered for (for logging and debugging).
     address: String,
-
-    // /// A reference to the registry for automatic unregistration upon destruction (`Drop`).
-    //registry: Arc<LocalRegistry>,
-
-    //slot: Arc<SubscriptionSlot>,
 }
 
 impl Subscriber {
-    /// Internal constructor.
-    ///
-    /// Used by the `bind` factory method after successfully registering
-    /// the sender in the registry.
-    pub(crate) fn new(
+    /// Creates a Push subscriber (for Exclusive and Broadcast)
+    pub(crate) fn new_push(
         rx: MessageReceiver,
         address: String,
-        //registry: Arc<LocalRegistry>,
-        //slot: Arc<SubscriptionSlot>,
     ) -> Self {
-        //Self { rx, address, registry, slot}
-        Self { rx, address }
-    }
+        Self {
+            mode: SubscriberMode::Push(rx),
+            address,
+        }
+    } 
+
+    /// Creates a Pull subscriber (for LoadBalanced)
+    pub(crate) fn new_pull(
+        req_sender: Arc<RequestSender>,
+        address: String,
+    ) -> Self {
+        Self {
+            mode: SubscriberMode::Pull(req_sender),
+            address,
+        }
+    }       
 
     /// Asynchronously waits for the next message.
     ///
@@ -146,7 +191,15 @@ impl Subscriber {
     /// since `LocalRegistry` holds at least one strong reference
     /// to the `MessageSender`, but the method is implemented for completeness of the `tokio::mpsc` API.
     pub async fn recv(&mut self) -> Option<Message> {
-        self.rx.recv().await
+        match &mut self.mode {
+            SubscriberMode::Push(rx) => rx.recv().await,
+            SubscriberMode::Pull(req_sender) => {
+                match req_sender.request().await {
+                    Ok(reply_rx) => reply_rx.await.ok(),
+                    Err(_) => None,
+                }
+            }
+        }
     }
 
     /// A non-blocking attempt to retrieve a message from the queue.
@@ -159,7 +212,10 @@ impl Subscriber {
     /// loops or when implementing your own non-blocking event handlers.
     #[must_use = "The result must be handled, otherwise the message will be dropped"]
     pub fn try_recv(&mut self) -> Result<Message, TryRecvError> {
-        self.rx.try_recv()
+        match &mut self.mode {
+            SubscriberMode::Push(rx) => rx.try_recv(),
+            SubscriberMode::Pull(_) => Err(TryRecvError::Empty),
+        }
     }  
 
     /// Returns the logical address this subscription is registered for.

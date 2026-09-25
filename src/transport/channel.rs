@@ -39,16 +39,47 @@
 //! The recv_timeout method allows the broker or client to interrupt waiting for a response
 //! if the remote component terminated with an error (trap) or stopped responding.
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use thiserror::Error;
 
 use crate::protocol::Message;
-use crate::error::BrokerError;
+
+#[derive(Debug, Error)]
+#[error("Channel is closed")]
+pub struct SendError<T>(pub T);
+
+impl<T> From<mpsc::error::SendError<T>> for SendError<T> {
+    fn from(err: mpsc::error::SendError<T>) -> Self {
+        SendError(err.0)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum TrySendError<T> {
+    #[error("Channel is full")]
+    Full(T),    
+
+    /// All senders (MessageSender) have been destroyed.
+    /// The channel is closed, and no new messages will arrive.
+    /// The broker must initiate resource cleanup for this address.
+    #[error("Channel is disconnected")]
+    Disconnected(T),
+}
+
+impl<T> From<mpsc::error::TrySendError<T>> for TrySendError<T> {
+    fn from(err: mpsc::error::TrySendError<T>) -> Self {
+        match err {
+            mpsc::error::TrySendError::Full(msg) => TrySendError::Full(msg),
+            mpsc::error::TrySendError::Closed(msg) => TrySendError::Disconnected(msg),
+        }
+    }
+}
 
 /// Errors that occur when attempting a non-blocking receive of a message from a channel.
 ///
 /// Used by the broker in scenarios where waiting is unacceptable,
 /// for example, when polling a channel in an event processing loop with strict timing constraints.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum TryRecvError {
     /// The channel queue is empty. There are no messages to process at the moment.
     #[error("Channel is empty")]
@@ -70,161 +101,29 @@ impl From<mpsc::error::TryRecvError> for TryRecvError {
     }
 }
 
-/// Type-safe message sender.
-///
-/// It is a lightweight, cloneable wrapper over tokio::sync::mpsc::Sender.
-/// Cloning the sender does not create new queues;
-/// all clones share the same receiver queue, which allows
-/// multiple broker tasks to send messages to a single subscriber in parallel.
-#[derive(Clone)]
-pub struct MessageSender {
-    inner: mpsc::Sender<Message>,
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RecvTimeoutError {
+    #[error("Channel is disconnected")]
+    Disconnected,
+
+    #[error("Receive operation timed out")]
+    Timeout,
 }
 
-impl MessageSender {
-    /// Creates a new instance of the sender.
-    ///
-    /// Internal use: Called by the create_channel factory function
-    /// or by the registry when registering a new subscription.
-    pub(crate) fn new(inner: mpsc::Sender<Message>) -> Self {
-        tracing::debug!("MessageSender new");
-        Self { inner }
-    }
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TryRequestError {
+    /// The request queue is full. The consumer should retry later
+    /// or use the async `request()` method which provides natural backpressure.
+    #[error("Request channel is full")]
+    Full,
 
-    /// Asynchronous send with natural backpressure.
-    ///
-    /// If the receiver's queue is full, the current task will be suspended (yield)
-    /// until space becomes available in the queue. This is the primary mechanism protecting the broker
-    /// from memory overflow when there is an imbalance between producer and consumer speeds.
-    ///
-    /// # Errors
-    /// Returns BrokerError::ChannelClosed if the receiver (MessageReceiver)
-    /// has been dropped and the message cannot be delivered.
-    pub async fn send(&self, message: Message) -> Result<(), BrokerError> {
-        tracing::trace!("MessageSender send");
-        self.inner
-            .send(message)
-            .await
-            .map_err(|e| match e {
-                mpsc::error::SendError(msg) => BrokerError::ChannelClosed(msg),
-            })
-    }
-
-    /// Non-blocking send attempt.
-    ///
-    /// Used by the broker in scenarios where blocking the sender is unacceptable
-    /// (for example, when handling critical system events or when attempting
-    /// to send a response to an already closed reply_to channel).
-    ///
-    /// # Errors
-    /// - BrokerError::ChannelFull: The queue is full. The message is returned to the calling code.
-    /// - BrokerError::ChannelClosed: The receiver has been destroyed.
-    pub fn try_send(&self, message: Message) -> Result<(), BrokerError> {
-        tracing::trace!("MessageSender try_send");
-        self.inner
-            .try_send(message)
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(msg) => BrokerError::ChannelFull(msg),
-                mpsc::error::TrySendError::Closed(msg) => BrokerError::ChannelClosed(msg),
-            })
-    }
-
-    /// Checks whether the receiver is alive.
-    ///
-    /// Returns `true` if all `MessageReceiver` instances associated with this
-    /// channel have been dropped. The broker uses this method to
-    /// validate cached endpoints before attempting to send.
-    pub fn is_closed(&self) -> bool {
-        self.inner.is_closed()
-    }
-
-    /// Current channel utilization (for metrics/telemetry).
-    ///
-    /// Allows the broker to monitor queue depth and detect slow consumers
-    /// before they cause complete blocking of senders.
-    pub fn load(&self) -> ChannelLoad {
-        ChannelLoad {
-            capacity: self.inner.capacity(),
-            max_capacity: self.inner.max_capacity(),
-        }
-    }
-}
-
-impl Drop for MessageSender {
-    fn drop(&mut self) {
-    // If the reference count drops to 0, the channel is automatically closed for the receiver.
-    // Logging helps track the lifecycle of subscriptions.
-        tracing::debug!("MessageSender drop");
-    }
-}
-
-/// Type-safe message receiver.
-///
-/// Owns the message queue. In the broker architecture, each MessageReceiver
-/// is strictly bound to a single address (or pattern) and is usually encapsulated
-/// inside a Subscriber or ReplyDispatcher structure.
-///
-/// Dropping this object automatically closes the channel for all
-/// active MessageSenders, signaling them with a ChannelClosed error.
-pub struct MessageReceiver {
-    inner: mpsc::Receiver<Message>,
-}
-
-impl MessageReceiver {
-    /// Creates a new instance of the recipient.
-    pub(crate) fn new(inner: mpsc::Receiver<Message>) -> Self {
-        tracing::debug!("MessageReceiver new");
-        Self { inner }
-    }
-
-    /// Asynchronously receives the next message.
-    ///
-    /// # Return value
-    /// Returns Some(Message) on successful receipt.
-    /// Returns None if all senders have been dropped and the channel is closed.
-    /// This is a signal for the broker's processing loop to terminate work with this subscriber.
-    pub async fn recv(&mut self) -> Option<Message> {
-        tracing::trace!("MessageReceiver recv");
-        self.inner.recv().await
-    }
-
-    /// Non-blocking receive attempt.
-    ///
-    /// Useful for implementing polling or hybrid processing loops,
-    /// where the broker needs to check for messages without blocking the execution thread.
-    pub fn try_recv(&mut self) -> Result<Message, TryRecvError> {
-        tracing::trace!("MessageReceiver try_recv");
-        self.inner.try_recv().map_err(Into::into)
-    }
-
-    /// Receive with a timeout (critical for Wasm environments).
-    ///
-    /// This method guarantees that the broker will not hold resources indefinitely
-    /// (for example, the WaiterGuard in ReplyDispatcher), but will correctly interrupt the wait
-    /// and return control.
-    pub async fn recv_timeout(
-        &mut self,
-        timeout: std::time::Duration,
-    ) -> Option<Message> {
-        match tokio::time::timeout(timeout, self.inner.recv()).await {
-            Ok(msg) => msg,
-            Err(_) => None,
-        }
-    }
-}
-
-impl Drop for MessageReceiver {
-    fn drop(&mut self) {
-    // When the tokio receiver is dropped, the channel is closed automatically.
-    // Logging helps track the lifecycle of subscriptions.
-        tracing::debug!("MessageReceiver drop");
-    }
+    /// All receivers have been dropped. The target component has terminated
+    /// and cannot accept new requests.
+    #[error("Request channel is disconnected")]
+    Disconnected,
 }
 
 /// Channel utilization information (for metrics).
-///
-/// Used by broker management systems to make decisions about
-/// scaling, throttling, or forcibly disconnecting slow clients.
 pub struct ChannelLoad {
     /// The current number of free slots in the channel's queue.
     pub capacity: usize,
@@ -248,6 +147,207 @@ impl ChannelLoad {
     }
 }
 
+/// Generic asynchronous channel sender.
+///
+/// It is a lightweight, cloneable wrapper over `tokio::sync::mpsc::Sender`.
+/// Cloning the sender does not create new queues; all clones share the same
+/// receiver queue, enabling parallel sends to a single logical recipient.
+#[derive(Clone)]
+pub struct Sender<T> {
+    inner: mpsc::Sender<T>,
+}
+
+impl<T: Send> Sender<T> {
+    pub(crate) fn new(inner: mpsc::Sender<T>) -> Self {
+        tracing::trace!("Sender new");
+        Self { inner }
+    }
+
+    /// Asynchronous send with natural backpressure.
+    ///
+    /// If the receiver's queue is full, the current task will yield
+    /// until space becomes available, preventing unbounded memory growth (OOM).
+    pub async fn send(&self, msg: T) -> Result<(), SendError<T>> {
+        tracing::trace!("Sender send");
+        self.inner.send(msg).await.map_err(Into::into)
+    }
+
+    /// Non-blocking send attempt.
+    ///
+    /// Returns the message back in the error variant if the queue is full or closed,
+    /// allowing the caller to handle or retry the operation.
+    #[must_use = "The result must be processed, otherwise the message/request will be lost"]
+    pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
+        tracing::trace!("Sender try_send");
+        self.inner.try_send(msg).map_err(Into::into)
+    }
+
+    /// Checks whether the receiver is alive.
+    ///
+    /// Returns `true` if all `Receiver` instances associated with this
+    /// channel have been dropped.
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    /// Current channel utilization (for metrics/telemetry).
+    pub fn load(&self) -> ChannelLoad {
+        ChannelLoad {
+            capacity: self.inner.capacity(),
+            max_capacity: self.inner.max_capacity(),
+        }
+    }
+}
+
+/// Generic asynchronous channel receiver.
+///
+/// Owns the message queue. Dropping this object automatically closes 
+/// the channel for all active `Sender`s.
+pub struct Receiver<T> {
+    inner: mpsc::Receiver<T>,
+}
+
+impl<T: Send> Receiver<T> {
+    pub(crate) fn new(inner: mpsc::Receiver<T>) -> Self {
+        tracing::trace!("Receiver new");
+        Self { inner }
+    }
+
+    /// Asynchronously receives the next message.
+    ///
+    /// Returns `None` if all senders have been dropped and the channel is closed.
+    pub async fn recv(&mut self) -> Option<T> {
+        tracing::trace!("Receiver recv");
+        self.inner.recv().await
+    }
+
+    /// Non-blocking receive attempt.
+    #[must_use = "The result must be handled, otherwise the data will be dropped"]
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        tracing::trace!("Receiver try_recv");
+        self.inner.try_recv().map_err(Into::into)
+    }
+
+    /// Receive with a timeout.
+    ///
+    /// Guarantees that the broker will not hold resources indefinitely,
+    /// correctly interrupting the wait and returning control.
+    pub async fn recv_timeout(&mut self, timeout: std::time::Duration) -> Result<T, RecvTimeoutError> {
+        match tokio::time::timeout(timeout, self.inner.recv()).await {
+            Ok(Some(msg)) => Ok(msg),
+            Ok(None) => Err(RecvTimeoutError::Disconnected),
+            Err(_) => Err(RecvTimeoutError::Timeout),
+        }
+    }
+}
+
+// ============================================================================
+// Domain-Specific Type Aliases & Extensions
+// ============================================================================
+
+/// Sender for standard broker messages.
+pub type MessageSender = Sender<Message>;
+/// Receiver for standard broker messages.
+pub type MessageReceiver = Receiver<Message>;
+
+/// Token used by a consumer to receive a reply from a producer.
+pub type RequestToken = oneshot::Sender<Message>;
+
+/// Sender for requesting messages from a shared LoadBalanced queue.
+/// (Sends ReplyTokens to the producer).
+pub type RequestSender = Sender<RequestToken>;
+/// Receiver for managing incoming pull-requests from consumers.
+pub type RequestReceiver = Receiver<RequestToken>;
+
+impl RequestSender {
+    /// Asynchronously requests the next message from the shared LoadBalanced queue.
+    /// 
+    /// This method implements the **"Pull" pattern**: it creates a `oneshot` channel,
+    /// sends the `oneshot::Sender` (as a `RequestToken`) to the producer,
+    /// and returns the `oneshot::Receiver` to the caller.
+    /// 
+    /// This is the primary mechanism for consumers in a LoadBalanced group to
+    /// signal readiness and receive messages with natural backpressure, ensuring
+    /// that the producer never sends a message to a dead or busy consumer.
+    ///
+    /// # Returns
+    /// - `Ok(oneshot::Receiver<Message>)` — the request was successfully queued.
+    ///   The caller **MUST** await this receiver to get the response.
+    /// - `Err(SendError<RequestToken>)` — the target component has terminated (channel is closed).
+    ///   The `RequestToken` is returned inside the error, allowing for clean resource drop.
+    #[must_use = "The returned receiver must be awaited to receive the message. \
+                  Dropping it silently cancels the request and may cause the producer to hang \
+                  while trying to send to a dropped receiver."]
+    pub async fn request(&self) -> Result<oneshot::Receiver<Message>, SendError<RequestToken>> {
+        tracing::trace!("RequestSender request");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        
+        // If the channel is closed, `send` will immediately return Err(SendError(reply_tx)).
+        // This is safer than a pre-check (is_closed) as it avoids TOCTOU race conditions
+        // and correctly provides the allocated token back to the caller for cleanup.
+        self.send(reply_tx).await?;
+        
+        Ok(reply_rx)
+    }
+
+    /// Non-blocking request attempt.
+    ///
+    /// Attempts to register a pull-request in the shared LoadBalanced queue
+    /// without blocking the current task. This is useful in scenarios where
+    /// the caller cannot afford to yield (e.g., in tight polling loops or
+    /// when implementing custom scheduling logic).
+    ///
+    /// # Returns
+    /// - `Ok(oneshot::Receiver<Message>)` — the request was successfully queued.
+    ///   The caller MUST await this receiver to get the response, otherwise the
+    ///   response will be lost when the receiver is dropped.
+    /// - `Err(TryRequestError::Full)` — the queue is full. The caller should
+    ///   either retry later or switch to the async `request()` method.
+    /// - `Err(TryRequestError::Disconnected)` — the target component has terminated.
+    ///   No further requests will be accepted.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// match request_sender.try_request() {
+    ///     Ok(receiver) => {
+    ///         // Successfully queued, now wait for response
+    ///         let response = receiver.await?;
+    ///         // Handle response
+    ///     }
+    ///     Err(TryRequestError::Full) => {
+    ///         // Queue is full, retry or use async request()
+    ///         tracing::warn!("Request queue full, backing off");
+    ///     }
+    ///     Err(TryRequestError::Disconnected) => {
+    ///         // Target component is dead, clean up resources
+    ///         return Err(TransportError::ConnectionClosed);
+    ///     }
+    /// }
+    /// ```
+    #[must_use = "The returned receiver must be awaited to receive the message. Dropping it silently cancels the request."]
+    pub fn try_request(&self) -> Result<oneshot::Receiver<Message>, TryRequestError> {
+        // Fast-path: avoid allocating a oneshot channel if the dispatcher is already dead.
+        // This is a common scenario in Wasm environments when a component traps.
+        if self.is_closed() {
+            return Err(TryRequestError::Disconnected);
+        }
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        
+        match self.try_send(reply_tx) {
+            Ok(()) => Ok(reply_rx),
+            // If Full or Disconnected, the reply_tx is consumed by TrySendError 
+            // and immediately dropped here, preventing memory leaks.
+            Err(TrySendError::Full(_)) => Err(TryRequestError::Full), 
+            Err(TrySendError::Disconnected(_)) => Err(TryRequestError::Disconnected),
+        }
+    }
+}
+
+// ============================================================================
+// Factories
+// ============================================================================
+
 /// Creates a new linked sender-receiver pair with the given capacity.
 ///
 /// The capacity (capacity) is strictly controlled by the broker configuration
@@ -265,6 +365,12 @@ impl ChannelLoad {
 /// assert!(!sender.is_closed()); 
 /// ```
 pub fn create_channel(capacity: usize) -> (MessageSender, MessageReceiver) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Message>(capacity);
+    let (tx, rx) = mpsc::channel::<Message>(capacity);
     (MessageSender::new(tx), MessageReceiver::new(rx))
+}
+
+/// Creates a new linked sender-receiver pair for request routing with the given capacity.
+pub fn create_request_channel(capacity: usize) -> (RequestSender, RequestReceiver) {
+    let (tx, rx) = mpsc::channel::<RequestToken>(capacity);
+    (RequestSender::new(tx), RequestReceiver::new(rx))
 }

@@ -8,15 +8,17 @@
 // except according to those terms.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use arcella_broker::{
     broker::Broker,
     config::{ClientConfig, SubscriberConfig},
     protocol::{Message, TransferMode},
+    registry::RoutingPolicy,
 };
 
 // ============================================================================
@@ -31,7 +33,7 @@ fn init_tracing() {
     // Attempt to read the logging level from RUST_LOG,
     // if not set, default to "info"
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+        .unwrap_or_else(|_| EnvFilter::new("error"));
 
     fmt()
         .with_env_filter(env_filter)
@@ -53,9 +55,11 @@ async fn test_high_throughput_in_memory_routing() {
     let client_config = ClientConfig::default();
     let recv_client = broker.client(client_config.clone(), "load:test".to_string()).unwrap();
 
-    let subscriber_config = SubscriberConfig::default()
-        .with_channel_capacity(100)
+    let mut subscriber_config = SubscriberConfig::default()
+        .with_channel_capacity(4096)
         .expect("Channel capacity 4096 should be valid");
+    //subscriber_config.routing_policy = RoutingPolicy::Exclusive;
+    subscriber_config.routing_policy = RoutingPolicy::LoadBalanced;
 
     let mut receiver_addresses = Vec::with_capacity(NUM_RECEIVERS);
     let mut message_templates = Vec::with_capacity(NUM_RECEIVERS);    
@@ -89,7 +93,11 @@ async fn test_high_throughput_in_memory_routing() {
 
         let addr = receiver_addresses[i].clone(); 
 
-        let (mut subscriber, handle) = recv_client.subscribe(addr.clone(), subscriber_config.clone())
+        let (mut subscriber, handle) = recv_client
+            .subscribe(
+                addr.clone(),
+                subscriber_config.clone(),
+            )
             .expect("Failed to subscribe");
         subscriber_handles.push(handle);
 
@@ -124,7 +132,7 @@ async fn test_high_throughput_in_memory_routing() {
             tracing::trace!("Test sender: start task on {}", sender_addr);
             let client = broker.client(client_config.clone(), sender_addr.clone()).unwrap();
 
-            // Publisher создается ОДИН раз на задачу, что активирует и тестирует его внутренний кэш
+            // The Publisher is created ONCE per task, which activates and tests its internal cache
             let publisher = client.publisher(addr_str.clone());
                 
             for seq in 0..MESSAGES_PER_SENDER {
@@ -147,6 +155,8 @@ async fn test_high_throughput_in_memory_routing() {
         res.expect("Sender task panicked");
     }
     let dispatch_duration = start_time.elapsed();
+
+    sleep(Duration::from_millis(5)).await;
 
     // 7. Unbind receivers to close their channels and signal them to terminate
     tracing::trace!("Unbind receiver");

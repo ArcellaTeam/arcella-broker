@@ -38,14 +38,14 @@ use std::sync::{
 };
 
 mod error;
+mod load_balanced_group;
 mod routing;
 mod slot;
 
-use crate::transport::MessageSender;
-
 pub use error::RegistryError;
 pub use slot::SubscriptionSlot;
-pub use routing::RouteTarget;
+pub use routing::{RoutingPolicy, RouteTarget};
+pub use load_balanced_group::LoadBalancedGroup;
 
 /// Internal state of the registry, protected by a `RwLock`.
 /// Separates exact matches and wildcards for optimized lookup and conflict detection.
@@ -62,6 +62,18 @@ struct RegistryInner {
     single_wildcards: Vec<(Vec<u8>, Arc<RouteTarget>)>,
 }
 
+/// The result of checking an address before registration.
+/// Used for atomic detection of duplicates and routing conflicts.
+enum LookupResult {
+    /// An exact duplicate was found (the address is already registered).
+    Duplicate(Arc<RouteTarget>),
+    /// A conflict with an existing route was found.
+    /// Contains the address of the existing route that conflicts.
+    Conflict(String),
+    /// Nothing was found, the address is free for registration.
+    NotFound,
+}
+
 /// Registry of local recipients (within a single process).
 ///
 /// Supports two subscription types:
@@ -73,6 +85,14 @@ pub struct LocalRegistry {
     /// Mutex to serialize all mutations, preventing TOCTOU races during conflict checks
     /// without ever blocking concurrent readers.
     register_mutex: Mutex<()>,
+}
+
+/// The result of the atomic "get existing or register new" operation.
+pub enum RegisterResult {
+    /// The address was free, and the new RouteTarget was successfully registered.
+    Registered(Arc<RouteTarget>),
+    /// The address was already occupied. Returns the existing RouteTarget to join the group.
+    AlreadyExists(Arc<RouteTarget>),
 }
 
 impl LocalRegistry {
@@ -143,7 +163,7 @@ impl LocalRegistry {
             }
 
             if segment == "**" {
-				// Mark if we found "**"
+                // Mark if we found "**"
                 found_starstar = true;
             } else if segment == "*" {
                 // Valid single-segment wildcard, continue checking
@@ -196,38 +216,6 @@ impl LocalRegistry {
         }
     }         
 
-    /// Checks whether a concrete address matches a wildcard pattern.
-    ///
-    /// # Examples
-    /// ```text
-    /// matches("arcella:*:users",    "arcella:core:users")   - true
-    /// matches("arcella:*:*",        "arcella:core:users")   - true
-    /// matches("*:core:users",       "arcella:core:users")   - true
-    /// matches("arcella:core:**",    "arcella:core:users")   - true
-    /// matches("arcella:core:**",    "arcella:core")         - true  (zero extra segments)
-    /// matches("arcella:core:**",    "arcella")              - false (too short)
-    /// matches("arcella:core:*",     "arcella:core:users")   - true
-    /// matches("arcella:core:*",     "arcella:core:a:b")     - false (length mismatch)
-    /// matches("arcella:web:*",      "arcella:core:users")   - false
-    /// ```
-    fn matches(pattern: &[u8], address: &[u8]) -> Result<bool, RegistryError> {
-        let p1 = String::from_utf8_lossy(pattern);
-        let p2 = String::from_utf8_lossy(address);
-        Self::validate_wildcard_pattern(&p1)?;
-
-        Ok(Self::compare_segments_bytes(pattern, address, false))
-    } 
-
-    /// Checks whether two wildcard patterns can ever match the same concrete address.
-    /// Used during registration to enforce the exclusive binding model.
-    fn patterns_conflict_bytes(pattern1: &[u8], pattern2: &[u8]) -> Result<bool, RegistryError> {
-        let p1 = String::from_utf8_lossy(pattern1);
-        let p2 = String::from_utf8_lossy(pattern2);
-        Self::validate_wildcard_pattern(&p1)?;
-        Self::validate_wildcard_pattern(&p2)?;
-        Ok(Self::compare_segments_bytes(pattern1, pattern2, true))
-    }
-
     fn static_prefix_bytes(pattern: &[u8]) -> &[u8] {
         if let Some(idx) = pattern.iter().position(|&b| b == b'*') {
             &pattern[..idx]
@@ -239,9 +227,9 @@ impl LocalRegistry {
     fn check_prefix_wildcard_conflicts(
         prefix_wildcard_tree: &Radix<u8, Arc<RouteTarget>>,
         pat_bytes: &[u8],
-    ) -> Result<Option<String>, RegistryError> {
+    ) -> Option<String> {
         if prefix_wildcard_tree.is_empty() {
-            return Ok(None);
+            return None;
         }
 
         let mut candidate = Vec::with_capacity(pat_bytes.len() + 3);
@@ -260,7 +248,7 @@ impl LocalRegistry {
 
             // Targeted O(L) check
             if prefix_wildcard_tree.get(&check_bytes).is_some() {
-                return Ok(Some(String::from_utf8_lossy(&check_bytes).into_owned()));
+                return Some(String::from_utf8_lossy(&check_bytes).into_owned());
             }
         }
 
@@ -275,141 +263,222 @@ impl LocalRegistry {
             
             // Semantic conflict check
             if Self::compare_segments_bytes(pat_bytes, &k, true) {
-                return Ok(Some(String::from_utf8_lossy(&k).into_owned()));
+                return Some(String::from_utf8_lossy(&k).into_owned());
             }
         }       
         
-        Ok(None)
+        None
     }        
 
-    /// Registers a recipient at the specified address with the given routing policy.
-    ///
-    /// # Arguments
-    /// * `address` - logical address or wildcard pattern.
-    /// * `channel` - the sender end of the message channel.
-    /// * `policy` - routing policy (`None` = Exclusive, `Some(LoadBalanced|Broadcast)`).
-    ///
-    /// # Errors
-    /// - `AddressAlreadyOccupied` if an Exclusive subscription already exists.
-    /// - `PolicyMismatch` if a group exists with a different policy.
-    pub fn register(
-        &self,
-        address: String, 
-        channel: MessageSender,
-    ) -> Result<Arc<SubscriptionSlot>, RegistryError> {
-        let _guard = self.register_mutex.lock().unwrap();
-        let current = self.inner.load();
-        let mut new_inner = (**current).clone();
-        
-        tracing::debug!("LocalRegistry register: {}", address);
-
-        let slot = SubscriptionSlot::new(channel);
-
-        if Self::is_wildcard(&address) {
-            self.register_wildcard(&mut new_inner, address, slot.clone())?;
-        } else {
-            self.register_exact(&mut new_inner, address, slot.clone())?;
-        }
-
-        self.inner.store(Arc::new(new_inner));
-
-        Ok(slot)
-    }
-
-    /// Registers an exact, non-wildcard address.
-    fn register_exact(
-        &self,
-        inner: &mut RegistryInner,
-        address: String,
-        slot: Arc<SubscriptionSlot>,
-    ) -> Result<(), RegistryError> {
+    /// Searches for an existing route for an exact address.
+    /// Checks for duplicates and conflicts with wildcard patterns.
+    fn get_exact(&self, inner: &RegistryInner, address: &str) -> LookupResult {
         let addr_bytes = address.as_bytes();
-
+        
         // 1. Exact duplicate check (O(L))
-        if inner.exact_tree.get(addr_bytes).is_some() {
-            return Err(RegistryError::AddressAlreadyOccupied(address));
+        if let Some(target) = inner.exact_tree.get(addr_bytes) {
+            return LookupResult::Duplicate(target.clone());
         }
-
+        
         // 2. Check conflicts with prefix wildcards (O(L) via walk_path)
-        if let Some((k, _slot)) = inner.prefix_wildcard_tree.walk_path(addr_bytes).next() {
-            let wc = String::from_utf8_lossy(&k).into_owned();
-            return Err(RegistryError::ConflictsWithWildcard(address, wc));
+        if let Some((k, _)) = inner.prefix_wildcard_tree.walk_path(addr_bytes).next() {
+            return LookupResult::Conflict(String::from_utf8_lossy(&k).into_owned());
         }
-
+        
         // 3. Check conflicts with single wildcards (O(N))
-        for (pattern, _slot) in &inner.single_wildcards {
+        for (pattern, _) in &inner.single_wildcards {
             if Self::compare_segments_bytes(pattern, addr_bytes, false) {
-                let wc = String::from_utf8_lossy(pattern).into_owned();
-                return Err(RegistryError::ConflictsWithWildcard(address, wc));
+                return LookupResult::Conflict(String::from_utf8_lossy(pattern).into_owned());
             }
-        } 
-
-        // 4. Insert (O(L) copy-on-write)
-        let target = Arc::new(RouteTarget::Single(slot));
-        let mut txn = inner.exact_tree.txn();
-        txn.insert(addr_bytes, target);
-        inner.exact_tree = txn.commit();                       
-
-        Ok(())
+        }
+        
+        LookupResult::NotFound
     }
-    
-    /// Registers a wildcard pattern.
-    fn register_wildcard(
-        &self,
-        inner: &mut RegistryInner,
-        pattern: String,
-        slot: Arc<SubscriptionSlot>,
-    ) -> Result<(), RegistryError> {
-        Self::validate_wildcard_pattern(&pattern)?;
+
+    /// Searches for an existing route for a wildcard pattern.
+    /// Checks for duplicates and conflicts with exact addresses and other wildcards.
+    fn get_wildcard(&self, inner: &RegistryInner, pattern: &str) -> LookupResult {
         let pat_bytes = pattern.as_bytes();
         let is_prefix_wildcard = pattern.ends_with("**");
-
+        
         // 1. Exact duplication (Fast path O(L))
         if is_prefix_wildcard {
-            if inner.prefix_wildcard_tree.get(pat_bytes).is_some() {
-                return Err(RegistryError::AddressAlreadyOccupied(pattern));
+            if let Some(target) = inner.prefix_wildcard_tree.get(pat_bytes) {
+                return LookupResult::Duplicate(target.clone());
             }
         } else {
-            if inner.single_wildcards.iter().any(|(p, _)| p == pat_bytes) {
-                return Err(RegistryError::AddressAlreadyOccupied(pattern));
+            if let Some((_, target)) = inner.single_wildcards.iter().find(|(p, _)| p.as_slice() == pat_bytes) {
+                return LookupResult::Duplicate(target.clone());
             }
-        };
-
-        // 2. Semantic conflict with existing PREFIX wildcards ().
-        // This check is universal and works both for new "" and for new "*" patterns.
-        if let Some(existing) = Self::check_prefix_wildcard_conflicts(&inner.prefix_wildcard_tree, pat_bytes)? {
-            return Err(RegistryError::WildcardConflict(pattern, existing));
-        }        
-
+        }
+        
+        // 2. Semantic conflict with existing PREFIX wildcards.
+        // This check is universal and works both for new "**" and for new "*" patterns.
+        if let Some(existing) = Self::check_prefix_wildcard_conflicts(&inner.prefix_wildcard_tree, pat_bytes) {
+            return LookupResult::Conflict(existing);
+        }
+        
         // 3. Semantic conflict with existing SINGLE wildcards (*).
         // Iterate over the entire list, since they do not form a prefix hierarchy.
         for (existing_pat, _) in &inner.single_wildcards {
-            if Self::patterns_conflict_bytes(existing_pat, pat_bytes)? {
-                return Err(RegistryError::WildcardConflict(pattern, String::from_utf8_lossy(existing_pat).into_owned()));
+            if Self::compare_segments_bytes(existing_pat, pat_bytes, true) {
+                return LookupResult::Conflict(String::from_utf8_lossy(existing_pat).into_owned());
             }
         }
 
         // 4. Check conflicts with exact addresses (Optimized: only scan relevant prefix)
         let static_pref = Self::static_prefix_bytes(pat_bytes);
         let exact_iter = inner.exact_tree.walk_prefix(static_pref);
-
-        for (k, _slot) in exact_iter {
+        for (k, _) in exact_iter {
             if Self::compare_segments_bytes(pat_bytes, &k, false) {
-                return Err(RegistryError::WildcardConflict(pattern, String::from_utf8_lossy(&k).into_owned()));
+                return LookupResult::Conflict(String::from_utf8_lossy(&k).into_owned());
             }
         }
+        
+        LookupResult::NotFound
+    }
 
-        // 6. Insert
-        let target = Arc::new(RouteTarget::Single(slot));
-        if is_prefix_wildcard {
-            let mut txn = inner.prefix_wildcard_tree.txn();
-            txn.insert(pat_bytes, target);
-            inner.prefix_wildcard_tree = txn.commit();
+    /// Registers a recipient at the specified address with the given routing policy.
+    ///
+    /// # Arguments
+    /// * `address` - logical address or wildcard pattern.
+    /// * `target` - the routing target to register.
+    ///
+    /// # Errors
+    /// - `AddressAlreadyOccupied` if an Exclusive subscription already exists.
+    pub fn register(
+        &self,
+        address: String, 
+        target: Arc<RouteTarget>,
+    ) -> Result<(), RegistryError> {
+        let _guard = self.register_mutex.lock().unwrap();
+        let current = self.inner.load();
+        
+        tracing::debug!("LocalRegistry register: {}", address);
+
+        let is_wildcard = Self::is_wildcard(&address);
+
+        let lookup_result = if is_wildcard {
+            Self::validate_wildcard_pattern(&address)?;
+            self.get_wildcard(&current, &address)
         } else {
-            inner.single_wildcards.push((pat_bytes.to_vec(), target));
+            self.get_exact(&current, &address) 
+        };
+
+        match (lookup_result, is_wildcard) {
+            (LookupResult::Duplicate(_), _) => {
+                return Err(RegistryError::AddressAlreadyOccupied(address));
+            }
+            (LookupResult::Conflict(wc), true) => {
+                return Err(RegistryError::WildcardConflict(address, wc));    
+            }
+            (LookupResult::Conflict(wc), false) => {
+                return Err(RegistryError::ConflictsWithWildcard(address, wc));    
+            }
+            (LookupResult::NotFound, _) => {}
         }
 
+        let mut new_inner = (**current).clone();
+        let addr_bytes = address.as_bytes();
+
+        if !is_wildcard {
+            // Insert (O(L) copy-on-write)
+            let mut txn = new_inner.exact_tree.txn();
+            txn.insert(addr_bytes, target);
+            new_inner.exact_tree = txn.commit(); 
+        } else if address.ends_with("**") {
+            let mut txn = new_inner.prefix_wildcard_tree.txn();
+            txn.insert(addr_bytes, target);
+            new_inner.prefix_wildcard_tree = txn.commit();
+        } else {
+            new_inner.single_wildcards.push((addr_bytes.to_vec(), target));
+        }
+        self.inner.store(Arc::new(new_inner));
+
         Ok(())
+    }
+
+    /// Atomically checks if an address exists and registers a new RouteTarget
+    /// if the address is free. Both operations are performed under a single `register_mutex`,
+    /// which eliminates TOCTOU races.
+    ///
+    /// # Arguments
+    /// * `address` - logical address or wildcard pattern.
+    /// * `factory` - closure that creates the `RouteTarget`. It is called **strictly under the mutex** 
+    ///   and **only** if the address is free and all conflict checks have passed. 
+    ///   This guarantees that expensive resources (e.g., `tokio::spawn` in `LoadBalancedGroup`) 
+    ///   are not created in vain during a thread race.
+    ///
+    /// # Errors
+    /// - `AddressAlreadyOccupied` / `WildcardConflict` / `ConflictsWithWildcard` - if the address is occupied or conflicts.
+    /// - Any error returned by the `factory` closure.
+    pub fn get_existing_or_register<F>(
+        &self,
+        address: String,
+        factory: F,
+    ) -> Result<RegisterResult, RegistryError>
+    where
+        F: FnOnce() -> Result<Arc<RouteTarget>, RegistryError>,
+    {
+        // 1. Lock the mutex for the atomicity of the entire "check + action" operation
+        let _guard = self.register_mutex.lock().unwrap();
+        let current = self.inner.load();
+        
+        let is_wildcard = Self::is_wildcard(&address);
+
+        // 2. Perform the check (duplicates and conflicts) on the current snapshot
+        let lookup_result = if is_wildcard {
+            // Note: validate_wildcard_pattern is called here to ensure validation happens before get_wildcard
+
+            Self::validate_wildcard_pattern(&address)?; 
+            self.get_wildcard(&current, &address)
+        } else {
+            self.get_exact(&current, &address)
+        };
+
+        // 3. Process the check result
+        match lookup_result {
+            LookupResult::Duplicate(target) => {
+                // Address is already occupied, return the existing target (e.g., to join a LoadBalanced group)
+                Ok(RegisterResult::AlreadyExists(target))
+            }
+            LookupResult::Conflict(existing) => {
+                // Found a semantic conflict with an existing route
+                if is_wildcard {
+                    Err(RegistryError::WildcardConflict(address, existing))
+                } else {
+                    Err(RegistryError::ConflictsWithWildcard(address, existing))
+                }
+            }
+            LookupResult::NotFound => {
+                // 4. Address is free! Call the factory UNDER the mutex.
+                // This is critical: if we called factory() before acquiring the mutex,
+                // another thread could have occupied the address, and we would have created a tokio::spawn task in vain.
+                let target = factory()?;
+
+                // 5. Prepare the new state for ArcSwap (Copy-on-Write)
+                let mut new_inner = (**current).clone();
+                let addr_bytes = address.as_bytes();
+
+                // 6. Insert into the corresponding data structure
+                if !is_wildcard {
+                    let mut txn = new_inner.exact_tree.txn();
+                    txn.insert(addr_bytes, target.clone());
+                    new_inner.exact_tree = txn.commit();
+                } else if address.ends_with("**") {
+                    let mut txn = new_inner.prefix_wildcard_tree.txn();
+                    txn.insert(addr_bytes, target.clone());
+                    new_inner.prefix_wildcard_tree = txn.commit();
+                } else {
+                    new_inner.single_wildcards.push((addr_bytes.to_vec(), target.clone()));
+                }
+
+                // 7. Atomically publish the new state for all readers
+                self.inner.store(Arc::new(new_inner));
+
+                Ok(RegisterResult::Registered(target))
+            }
+        }
     }
 
     /// Unregisters a specific subscription slot from the given address.
@@ -515,15 +584,51 @@ impl LocalRegistry {
     pub fn has_route(&self, address: &str) -> bool {
         self.lookup(address).is_some()
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::{create_channel, MessageSender};
+
+    fn create_dummy_sender() -> MessageSender {
+        let (tx, _rx) = create_channel(10);
+        tx
+    }
 
     mod matches {
         use super::*;
+
+        /// Checks whether a concrete address matches a wildcard pattern.
+        ///
+        /// # Examples
+        /// ```text
+        /// matches("arcella:*:users",    "arcella:core:users")   - true
+        /// matches("arcella:*:*",        "arcella:core:users")   - true
+        /// matches("*:core:users",       "arcella:core:users")   - true
+        /// matches("arcella:core:**",    "arcella:core:users")   - true
+        /// matches("arcella:core:**",    "arcella:core")         - true  (zero extra segments)
+        /// matches("arcella:core:**",    "arcella")              - false (too short)
+        /// matches("arcella:core:*",     "arcella:core:users")   - true
+        /// matches("arcella:core:*",     "arcella:core:a:b")     - false (length mismatch)
+        /// matches("arcella:web:*",      "arcella:core:users")   - false
+        /// ```
+        fn matches(pattern: &[u8], address: &[u8]) -> Result<bool, RegistryError> {
+            let p1 = String::from_utf8_lossy(pattern);
+            LocalRegistry::validate_wildcard_pattern(&p1)?;
+
+            Ok(LocalRegistry::compare_segments_bytes(pattern, address, false))
+        } 
+
+        /// Checks whether two wildcard patterns can ever match the same concrete address.
+        /// Used during registration to enforce the exclusive binding model.
+        fn patterns_conflict_bytes(pattern1: &[u8], pattern2: &[u8]) -> Result<bool, RegistryError> {
+            let p1 = String::from_utf8_lossy(pattern1);
+            let p2 = String::from_utf8_lossy(pattern2);
+            LocalRegistry::validate_wildcard_pattern(&p1)?;
+            LocalRegistry::validate_wildcard_pattern(&p2)?;
+            Ok(LocalRegistry::compare_segments_bytes(pattern1, pattern2, true))
+        }
 
         // ============================================================
         // 1. Exact matches
@@ -531,11 +636,11 @@ mod tests {
 
         #[test]
         fn exact_match() {
-            assert!(LocalRegistry::matches(b"arcella", b"arcella").unwrap());
-            assert!(LocalRegistry::matches(b"arcella:core:users", b"arcella:core:users").unwrap());
+            assert!(matches(b"arcella", b"arcella").unwrap());
+            assert!(matches(b"arcella:core:users", b"arcella:core:users").unwrap());
 
-            assert!(!LocalRegistry::matches(b"arcella:core:users", b"arcella:core:admin").unwrap());
-            assert!(!LocalRegistry::matches(b"Arcella", b"arcella").unwrap()); // Case-sensitive
+            assert!(!matches(b"arcella:core:users", b"arcella:core:admin").unwrap());
+            assert!(!matches(b"Arcella", b"arcella").unwrap()); // Case-sensitive
         }
 
         // ============================================================
@@ -544,8 +649,8 @@ mod tests {
 
         #[test]
         fn length_mismatch() {
-            assert!(!LocalRegistry::matches(b"a:b:c", b"a:b").unwrap());
-            assert!(!LocalRegistry::matches(b"a:b", b"a:b:c").unwrap());
+            assert!(!matches(b"a:b:c", b"a:b").unwrap());
+            assert!(!matches(b"a:b", b"a:b:c").unwrap());
         }
 
         // ============================================================
@@ -554,13 +659,13 @@ mod tests {
 
             #[test]
         fn empty_strings() {
-            assert!(LocalRegistry::matches(b"", b"").is_err());
-            assert!(LocalRegistry::matches(b"a::b", b"a:b").is_err());
-            assert!(LocalRegistry::matches(b"", b"a:b").is_err());
+            assert!(matches(b"", b"").is_err());
+            assert!(matches(b"a::b", b"a:b").is_err());
+            assert!(matches(b"", b"a:b").is_err());
 
-            assert!(!LocalRegistry::matches(b"a:b", b"").unwrap());
-            assert!(!LocalRegistry::matches(b"a", b"").unwrap());
-            assert!(!LocalRegistry::matches(b"a:b", b"a::b").unwrap());
+            assert!(!matches(b"a:b", b"").unwrap());
+            assert!(!matches(b"a", b"").unwrap());
+            assert!(!matches(b"a:b", b"a::b").unwrap());
         }
 
         // ============================================================
@@ -569,17 +674,17 @@ mod tests {
 
         #[test]
         fn single_segment_wildcard() {
-            assert!(LocalRegistry::matches(b"a:*:c", b"a:b:c").unwrap());
-            assert!(LocalRegistry::matches(b"a:b:*", b"a:b:c").unwrap());
+            assert!(matches(b"a:*:c", b"a:b:c").unwrap());
+            assert!(matches(b"a:b:*", b"a:b:c").unwrap());
             
             // Forbidden patterns must return an error
-            assert!(LocalRegistry::matches(b"*", b"a").is_err());
-            assert!(LocalRegistry::matches(b"*:b:c", b"a:b:c").is_err());
-            assert!(LocalRegistry::matches(b"*:*:*", b"a:b:c").is_err());
+            assert!(matches(b"*", b"a").is_err());
+            assert!(matches(b"*:b:c", b"a:b:c").is_err());
+            assert!(matches(b"*:*:*", b"a:b:c").is_err());
 
-            assert!(!LocalRegistry::matches(b"a:*:d", b"a:b:c").unwrap());
-            assert!(!LocalRegistry::matches(b"a:*:d", b"a:b:c:d").unwrap());
-            assert!(!LocalRegistry::matches(b"a:*:d", b"a:d").unwrap());
+            assert!(!matches(b"a:*:d", b"a:b:c").unwrap());
+            assert!(!matches(b"a:*:d", b"a:b:c:d").unwrap());
+            assert!(!matches(b"a:*:d", b"a:d").unwrap());
         }
 
         // ============================================================
@@ -588,18 +693,18 @@ mod tests {
 
         #[test]
         fn multi_segment_wildcard() {
-            assert!(LocalRegistry::matches(b"a:**",   b"a").unwrap());
-            assert!(LocalRegistry::matches(b"a:b:**", b"a:b").unwrap());
-            assert!(LocalRegistry::matches(b"a:b:**", b"a:b:c").unwrap());
-            assert!(LocalRegistry::matches(b"a:b:**", b"a:b:c:d:e").unwrap());
-            assert!(LocalRegistry::matches(b"a:**",   b"a:b:c:d:e").unwrap());
+            assert!(matches(b"a:**",   b"a").unwrap());
+            assert!(matches(b"a:b:**", b"a:b").unwrap());
+            assert!(matches(b"a:b:**", b"a:b:c").unwrap());
+            assert!(matches(b"a:b:**", b"a:b:c:d:e").unwrap());
+            assert!(matches(b"a:**",   b"a:b:c:d:e").unwrap());
 
             // Forbidden patterns must return an error
-            assert!(LocalRegistry::matches(b"**",     b"a").is_err());
-            assert!(LocalRegistry::matches(b"**",     b"a:b:c:d").is_err());
+            assert!(matches(b"**",     b"a").is_err());
+            assert!(matches(b"**",     b"a:b:c:d").is_err());
 
-            assert!(!LocalRegistry::matches(b"a:b:**", b"a").unwrap());
-            assert!(!LocalRegistry::matches(b"a:b:**", b"x:b:c").unwrap());
+            assert!(!matches(b"a:b:**", b"a").unwrap());
+            assert!(!matches(b"a:b:**", b"x:b:c").unwrap());
         }
 
         // ============================================================
@@ -608,14 +713,14 @@ mod tests {
 
         #[test]
         fn star_and_starstar_combined() {
-            assert!(LocalRegistry::matches(b"a:*:c:**", b"a:b:c:d:e").unwrap());
-            //assert!(LocalRegistry::matches(b"a:*:**", b"x:y:z").unwrap());
+            assert!(matches(b"a:*:c:**", b"a:b:c:d:e").unwrap());
+            //assert!(matches(b"a:*:**", b"x:y:z").unwrap());
 
             // Forbidden patterns must return an error
-            assert!(LocalRegistry::matches(b"*:b:**", b"a:b:c:d:e").is_err());
-            assert!(LocalRegistry::matches(b"*:**", b"x:y:z").is_err());
+            assert!(matches(b"*:b:**", b"a:b:c:d:e").is_err());
+            assert!(matches(b"*:**", b"x:y:z").is_err());
 
-            assert!(LocalRegistry::patterns_conflict_bytes(b"a:b:c:*", b"a:**").unwrap());
+            assert!(patterns_conflict_bytes(b"a:b:c:*", b"a:**").unwrap());
         }
 
         // ============================================================
@@ -623,11 +728,206 @@ mod tests {
         // ============================================================
         #[test]
         fn invalid_patterns() {
-            assert!(LocalRegistry::matches(b"a:**:b", b"a:b").is_err());
-            assert!(LocalRegistry::matches(b"a:*:b:", b"a:b").is_err());
-            assert!(LocalRegistry::matches(b"**:a:**", b"a:b").is_err());
-            assert!(LocalRegistry::matches(b"a:**:**", b"a:b").is_err());
+            assert!(matches(b"a:**:b", b"a:b").is_err());
+            assert!(matches(b"a:*:b:", b"a:b").is_err());
+            assert!(matches(b"**:a:**", b"a:b").is_err());
+            assert!(matches(b"a:**:**", b"a:b").is_err());
         }
-    }    
+    }
 
+    mod register {
+        use super::*;
+
+        #[test]
+        fn test_register_lookup_and_unregister() {
+            let registry = LocalRegistry::new();
+            let address = "arcella:core:users".to_string();
+            let sender = create_dummy_sender();
+
+            // 1. Registration
+            let slot = SubscriptionSlot::new(sender);
+            let target = RouteTarget::new_exclusive(slot.clone());
+            
+            assert!(registry.register(address.clone(), target).is_ok());
+            
+            // 2. Successful lookup
+            assert!(registry.lookup(&address).is_some());
+            assert!(registry.has_route(&address));
+            assert!(registry.has_local(&address));
+
+            // 3. Removal
+            // Note: in the current implementation, unregister requires a slot,
+            // but for simplicity of the test we can check that unregister by address works
+            // if we pass any slot (since remove_slot will return false for someone else's slot,
+            // but in the current implementation unregister removes the entire address if the slot matches.
+            // For the test we need to get the real slot).
+            
+            // Get the slot via lookup for a correct unregister
+            assert!(registry.unregister(&address, &slot).is_ok());
+
+            // 4. Verification after removal
+            assert!(registry.lookup(&address).is_none());
+            assert!(!registry.has_route(&address));
+        }
+
+        #[test]
+        fn test_conflict_exact_vs_wildcard() {
+            let registry = LocalRegistry::new();
+            let exact_addr = "arcella:core:users".to_string();
+            let wildcard_addr = "arcella:core:*".to_string();
+
+            // Register the exact address
+            let slot = SubscriptionSlot::new(create_dummy_sender());
+            let target = RouteTarget::new_exclusive(slot.clone());
+            registry.register(exact_addr.clone(), target).unwrap();
+
+            // Attempting to register an overlapping wildcard must fail
+            let slot = SubscriptionSlot::new(create_dummy_sender());
+            let target = RouteTarget::new_exclusive(slot.clone());
+            let err = registry.register(wildcard_addr.clone(), target).unwrap_err();
+            assert!(matches!(err, RegistryError::WildcardConflict(_, _)));
+
+            // And vice versa: first wildcard, then exact address
+            let registry2 = LocalRegistry::new();
+            let slot = SubscriptionSlot::new(create_dummy_sender());
+            let target = RouteTarget::new_exclusive(slot.clone());
+            registry2.register(wildcard_addr.clone(), target).unwrap();
+            
+            let slot = SubscriptionSlot::new(create_dummy_sender());
+            let target = RouteTarget::new_exclusive(slot.clone());
+            let err2 = registry2.register(exact_addr.clone(), target).unwrap_err();
+            assert!(matches!(err2, RegistryError::ConflictsWithWildcard(_, _)));
+        }
+
+        #[test]
+        fn test_lookup_priority_exact_over_wildcard() {
+            let registry = LocalRegistry::new();
+            let exact_addr = "arcella:core:users".to_string();
+            let wildcard_addr = "arcella:core:*".to_string();
+
+            let slot = SubscriptionSlot::new(create_dummy_sender());
+            let target1 = RouteTarget::new_exclusive(slot.clone());
+            
+            let slot = SubscriptionSlot::new(create_dummy_sender());
+            let target2 = RouteTarget::new_exclusive(slot.clone());
+
+            // 1. Register the wildcard first
+            registry.register(wildcard_addr.clone(), target1.clone()).unwrap();
+
+            // 2. Attempting to register an exact address that falls under the wildcard MUST fail
+            let err = registry.register(exact_addr.clone(), target2.clone()).unwrap_err();
+            assert!(
+                matches!(err, RegistryError::ConflictsWithWildcard(_, _)),
+                "Expected ConflictsWithWildcard error, got: {:?}",
+                err
+            );
+
+            // 3. The reverse situation: register the exact address first
+            let registry2 = LocalRegistry::new();
+            registry2.register(exact_addr.clone(), target2.clone()).unwrap();
+
+            // 4. Attempting to register a wildcard that covers the exact address MUST fail
+            let err2 = registry2.register(wildcard_addr.clone(), target1).unwrap_err();
+            assert!(
+                matches!(err2, RegistryError::WildcardConflict(_, _)),
+                "Expected WildcardConflict error, got: {:?}",
+                err2
+            );
+        }
+
+        #[test]
+        fn test_get_existing_or_register_atomic() {
+            let registry = LocalRegistry::new();
+            let address = "arcella:lb:group".to_string();
+            let mut factory_call_count = 0;
+
+            // 1. First call: the address is free, the factory must be invoked
+            let result1 = registry.get_existing_or_register(address.clone(), || {
+                factory_call_count += 1;
+                Ok(RouteTarget::new_exclusive(SubscriptionSlot::new(create_dummy_sender())))
+            }).unwrap();
+
+            assert!(matches!(result1, RegisterResult::Registered(_)));
+            assert_eq!(factory_call_count, 1);
+
+            // 2. Second call: the address is taken, the factory must NOT be invoked, Existing is returned
+            let result2 = registry.get_existing_or_register(address.clone(), || {
+                factory_call_count += 1; // This must not execute
+                Ok(RouteTarget::new_exclusive(SubscriptionSlot::new(create_dummy_sender())))
+            }).unwrap();
+
+            assert!(matches!(result2, RegisterResult::AlreadyExists(_)));
+            assert_eq!(factory_call_count, 1); // The count did not change!
+        }
+
+        #[test]
+        fn test_unregister_with_wrong_slot_is_noop() {
+            let registry = LocalRegistry::new();
+            let address = "arcella:test".to_string();
+            
+            let slot1 = SubscriptionSlot::new(create_dummy_sender());
+            let target1 = RouteTarget::new_exclusive(slot1.clone());
+            
+            let slot2 = SubscriptionSlot::new(create_dummy_sender());
+
+            registry.register(address.clone(), target1.clone()).unwrap();
+
+            // Attempting to remove the address by passing the WRONG slot
+            let result = registry.unregister(&address, &slot2);
+            assert!(result.is_ok()); // There must be no error (silent no-op)
+
+            // The address must still be in the registry, since the slot did not match
+            assert!(registry.lookup(&address).is_some());
+            assert!(Arc::ptr_eq(&registry.lookup(&address).unwrap(), &target1));
+        } 
+    }
+
+    mod multithread {
+        use super::*;
+
+        #[test]
+        fn test_get_existing_or_register_concurrent_race() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::thread;
+
+            let registry = Arc::new(LocalRegistry::new());
+            let address = "arcella:lb:race_test".to_string();
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let mut handles = vec![];
+
+            // Spawn 100 threads that simultaneously try to register the same address
+            for _ in 0..100 {
+                let registry_clone = registry.clone();
+                let addr = address.clone();
+                let calls = factory_calls.clone();
+                
+                handles.push(thread::spawn(move || {
+                    registry_clone.get_existing_or_register(addr, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(RouteTarget::new_exclusive(SubscriptionSlot::new(create_dummy_sender())))
+                    })
+                }));
+            }
+
+            // Collect results from all threads
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            // 1. The factory must be called EXACTLY once
+            assert_eq!(
+                factory_calls.load(Ordering::SeqCst), 
+                1, 
+                "Factory must be called exactly once under concurrent access"
+            );
+
+            // 2. Additional safety check: verify the distribution of results
+            let registered_count = results.iter().filter(|r| matches!(r, Ok(RegisterResult::Registered(_)))).count();
+            let already_exists_count = results.iter().filter(|r| matches!(r, Ok(RegisterResult::AlreadyExists(_)))).count();
+
+            assert_eq!(registered_count, 1, "Exactly one thread should succeed in registering");
+            assert_eq!(already_exists_count, 99, "The remaining 99 threads should receive AlreadyExists");
+            
+            // 3. Ensure no errors occurred
+            assert!(results.iter().all(|r| r.is_ok()), "All threads should complete without RegistryError");
+        }        
+    }
 }

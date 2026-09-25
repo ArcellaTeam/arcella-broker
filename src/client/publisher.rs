@@ -145,8 +145,8 @@ where
     ///
     /// # Failure handling and self-healing
     /// If the transport returns `TransportError::ConnectionClosed`, this means
-    /// the target component (e.g., a Wasm instance in `arcella-worker`) has terminated
-    /// or its channel has been broken. In this case, `Publisher` performs an **explicit
+    /// the target component has terminated or its channel has been broken. 
+    /// In this case, `Publisher` performs an **explicit
     /// cache invalidation** (`*self.cached_endpoint.write() = None`).
     ///
     /// This is critically important: on the next send attempt (or upon automatic

@@ -23,6 +23,9 @@ pub enum BrokerError {
     #[error("Channel is full")]
     ChannelFull(Message),
 
+    #[error("Request channel is closed")]
+    RequestClosed,
+
     #[error("Arcella broker registry error: {0}")]
     RegistryError (#[from] RegistryError),
 

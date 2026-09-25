@@ -7,35 +7,64 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    Weak,
 };
-use parking_lot::{RwLock, RwLockReadGuard};
 
-use crate::protocol::Message;
-use crate::transport::{
-    TransportError, 
+use crate::{
+    protocol::Message,
+    registry::LocalRegistry,
+    transport::{
+        MessageReceiver,
+        TransportError, 
+    },
 };
+
+use super::load_balanced_group::LoadBalancedGroup;
 
 use super::SubscriptionSlot;
 
-/// Политика доставки сообщений
+/// Message Delivery Policy
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoutingPolicy {
-    Exclusive,      // Только один подписчик
-    //LoadBalanced,   // Round-Robin между подписчиками
-    //Broadcast,      // Fan-out всем подписчикам
+    Exclusive,      // Only one subscriber
+    LoadBalanced,   // Round-Robin between subscribers
+    //Broadcast,      // Fan-out to all subscribers
 }
 
-/// Цель маршрутизации (zero-cost для одиночных подписок)
+/// Routing target (zero-cost for single subscriptions)
 pub enum RouteTarget {
     Single(Arc<SubscriptionSlot>),
-    //LoadBalanced(Arc<LoadBalancedGroup>),
+    LoadBalanced(Arc<LoadBalancedGroup>),
     //Broadcast(Arc<BroadcastGroup>),
 }
 
 impl RouteTarget {
-    /// Отправка сообщения. Делегирует либо напрямую в канал, либо в группу.
+    /// Creates a routing target for an Exclusive subscription.
+    pub fn new_exclusive(slot: Arc<SubscriptionSlot>) -> Arc<Self> {
+        Arc::new(Self::Single(slot))
+    }
+
+    /// Creates a routing target for a LoadBalanced group.
+    pub fn new_load_balanced(
+        slot: Arc<SubscriptionSlot>,
+        main_receiver: MessageReceiver,
+        req_channel_capacity: usize,
+        registry: Weak<LocalRegistry>,
+        address: String,
+    ) -> Arc<Self> {
+        Arc::new(Self::LoadBalanced(LoadBalancedGroup::new(
+            slot,
+            main_receiver,
+            req_channel_capacity,
+            registry,
+            address,
+        )))
+    }
+
+    /// Sends a message. Delegates either directly to the channel or to the group.
     pub async fn send(&self, message: Message) -> Result<(), TransportError> {
         match self {
             Self::Single(slot) => {
@@ -46,7 +75,14 @@ impl RouteTarget {
                     Err(TransportError::ConnectionClosed)
                 }
             }
-            //Self::LoadBalanced(group) => group.send(message).await,
+            Self::LoadBalanced(group) => {
+                let  guard = group.slot.sender.load();
+                if let Some(sender) = guard.as_ref() {
+                    sender.send(message).await.map_err(|_| TransportError::ConnectionClosed)
+                } else {
+                    Err(TransportError::ConnectionClosed)
+                }
+            }
             //Self::Broadcast(group) => group.send(message).await,
         }
     }
@@ -56,88 +92,57 @@ impl RouteTarget {
         match self {
             Self::Single(existing_slot) => {
                 if Arc::ptr_eq(existing_slot, slot) {
-                    existing_slot.mark_removed(); // Мгновенная инвалидация кэша!
-                    true // Нужно удалить из дерева
+                    existing_slot.mark_removed(); // Instant cache invalidation!
+                    true // Needs to be removed from the tree
                 } else {
                     false
                 }
             }
-            /*Self::LoadBalanced(group) | Self::Broadcast(group) => {
-                group.remove_member(slot);
-                group.is_empty() // Нужно удалить из дерева, если участников не осталось
-            }*/
+            //Self::LoadBalanced(group) | Self::Broadcast(group) => {
+            Self::LoadBalanced(group) => {
+                if Arc::ptr_eq(&group.slot, slot) {
+                    group.shutdown();
+                    true // Needs to be removed from the tree
+                } else {
+                    false
+                }
+            }
         }
-    }    
+    }
 
-    /// Уникальная версия для защиты кэша (TOCTOU).
+    /// Returns a RequestSender if this is a LoadBalanced group.
+    /// Used by the client to join an existing group.
+    pub fn request_sender(&self) -> Option<Arc<crate::transport::RequestSender>> {
+        match self {
+            Self::LoadBalanced(group) => Some(group.subscribe()),
+            _ => None,
+        }
+    }
+
+    /// Return a LoadBalancedGroup if this is a LoadBalanced group.
+    /// Used by the client to get subscriber group
+    pub fn load_balanced_group(&self) -> Option<&Arc<LoadBalancedGroup>> {
+        match self {
+            Self::LoadBalanced(group) => Some(group),
+            _ => None,
+        }
+    }            
+
+    /// Unique version for cache protection (TOCTOU).
     pub fn version(&self) -> u64 {
         match self {
             Self::Single(slot) => slot.version.load(std::sync::atomic::Ordering::Acquire),
-            //Self::LoadBalanced(group) => group.version(),
+            Self::LoadBalanced(group) => group.version(),
             //Self::Broadcast(group) => group.version(),
         }
     }
 
-    /// Проверка "живости" для инвалидации кэша.
+    /// Liveness check for cache invalidation.
     pub fn is_closed(&self) -> bool {
         match self {
             Self::Single(slot) => slot.is_closed(),
-            //Self::LoadBalanced(group) => group.is_empty(),
+            Self::LoadBalanced(group) => group.is_empty(),
             //Self::Broadcast(group) => group.is_empty(),
         }
-    }
-}
-
-/// Базовая структура для управления группой подписчиков.
-/// Инкапсулирует общую логику: добавление/удаление участников, версионирование.
-pub struct SubscriptionGroupBase {
-    /// Список активных слотов (физических каналов).
-    pub(crate) members: RwLock<Vec<Arc<SubscriptionSlot>>>,
-    
-    /// Версия группы. Инкрементируется при добавлении/удалении участников.
-    /// Необходима для инвалидации кэша в InMemoryEndpoint (защита от TOCTOU).
-    version: AtomicU64,  // Для инвалидации кэша TOCTOU
-}
-
-impl SubscriptionGroupBase {
-    pub fn new(first_slot: Arc<SubscriptionSlot>) -> Self {
-        Self {
-            members: RwLock::new(vec![first_slot]),
-            version: AtomicU64::new(1),
-        }
-    }
-
-    /// Добавляет нового подписчика в группу.
-    /// Это "холодный" путь, поэтому синхронная блокировка parking_lot допустима и предпочтительна.
-    pub fn add_member(&self, slot: Arc<SubscriptionSlot>) {
-        let mut members = self.members.write();
-        members.push(slot);
-        self.version.fetch_add(1, Ordering::Release);
-    }
-
-    /// Удаляет подписчика из группы.
-    pub fn remove_member(&self, slot_ptr: *const SubscriptionSlot) {
-        let mut members = self.members.write();
-        members.retain(|s| Arc::as_ptr(s) != slot_ptr);
-        self.version.fetch_add(1, Ordering::Release);
-    }
-
-    /// Возвращает текущую версию группы для проверки валидности кэша.
-    pub fn version(&self) -> u64 {
-        self.version.load(Ordering::Acquire)
-    }
-
-    /// Проверяет, пуста ли группа (все ли подписчики отключились).
-    pub fn is_empty(&self) -> bool {
-        self.members.read().is_empty()
-    }
-
-    /// Безопасный способ выполнения операции над списком участников.
-    pub fn with_members<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&Vec<Arc<SubscriptionSlot>>) -> R,
-    {
-        let members = self.members.read();
-        f(&members)
     }
 }

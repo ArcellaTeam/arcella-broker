@@ -35,4 +35,10 @@ pub enum RegistryError {
 
     #[error("Waiter already exists")]
     WaiterAlreadyExists,
+
+    /// Attempt to join an address with an incompatible policy.
+    /// For example, the address is already taken by an Exclusive subscription, but the client requests LoadBalanced.
+    #[error("Routing policy mismatch for address: {0}")]
+    PolicyMismatch(String),
+
 }
