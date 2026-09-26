@@ -13,17 +13,16 @@ use std::sync::{
     Weak,
 };
 
-use crate::{
-    protocol::Message,
-    registry::LocalRegistry,
-    transport::{
-        MessageReceiver,
-        TransportError, 
-    },
+use crate::protocol::Message;
+
+use super::LocalRegistry;
+use super::super::transport::{
+    MessageReceiver,
+    RequestSender,
+    TransportError, 
 };
 
 use super::load_balanced_group::LoadBalancedGroup;
-
 use super::SubscriptionSlot;
 
 /// Message Delivery Policy
@@ -112,7 +111,7 @@ impl RouteTarget {
 
     /// Returns a RequestSender if this is a LoadBalanced group.
     /// Used by the client to join an existing group.
-    pub fn request_sender(&self) -> Option<Arc<crate::transport::RequestSender>> {
+    pub fn request_sender(&self) -> Option<Arc<RequestSender>> {
         match self {
             Self::LoadBalanced(group) => Some(group.subscribe()),
             _ => None,

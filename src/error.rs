@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::{
     protocol::{ProtocolError, Message},
-    registry::RegistryError,
+    broker_core::registry::RegistryError,
 };
 
 #[derive(Debug, Error, PartialEq, Eq)]
