@@ -18,7 +18,7 @@ use arcella_broker::{
     broker::Broker,
     config::{ClientConfig, SubscriberConfig},
     protocol::{Message, TransferMode},
-    registry::RoutingPolicy,
+    broker_core::registry::RoutingPolicy,
 };
 
 // ============================================================================
@@ -58,8 +58,8 @@ async fn test_high_throughput_in_memory_routing() {
     let mut subscriber_config = SubscriberConfig::default()
         .with_channel_capacity(4096)
         .expect("Channel capacity 4096 should be valid");
-    //subscriber_config.routing_policy = RoutingPolicy::Exclusive;
-    subscriber_config.routing_policy = RoutingPolicy::LoadBalanced;
+    subscriber_config.routing_policy = RoutingPolicy::Exclusive;
+    //subscriber_config.routing_policy = RoutingPolicy::LoadBalanced;
 
     let mut receiver_addresses = Vec::with_capacity(NUM_RECEIVERS);
     let mut message_templates = Vec::with_capacity(NUM_RECEIVERS);    

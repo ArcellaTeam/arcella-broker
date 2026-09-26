@@ -41,23 +41,25 @@ use crate::{
     broker::Broker,
     config::{ClientConfig, SubscriberConfig},
     protocol::Message,
-    registry::{
-        RegistryError, 
-        RegisterResult,
-        RoutingPolicy,
-        RouteTarget,
-        SubscriptionSlot,
-    },
-    transport::{
-        create_channel,
-        in_memory::{
-            InMemoryTransport, 
-            InMemoryEndpoint,
+    broker_core::{
+        registry::{
+            RegistryError, 
+            RegisterResult,
+            RoutingPolicy,
+            RouteTarget,
+            SubscriptionSlot,
         },
-        Transport,
-        TransportError, 
-        TransportResult,
-    }
+        transport::{
+            create_channel,
+            in_memory::{
+                InMemoryTransport, 
+                InMemoryEndpoint,
+            },
+            Transport,
+            TransportError, 
+            TransportResult,
+        },
+    },
 };
 
 pub use subscriber::{Subscriber, SubscriptionHandle};
@@ -208,7 +210,7 @@ impl BrokerClient {
                 };
 
                 let group = target.load_balanced_group()
-                    .ok_or_else(|| crate::registry::RegistryError::PolicyMismatch(address.clone()))?
+                    .ok_or_else(|| RegistryError::PolicyMismatch(address.clone()))?
                     .clone();
                 let req_sender = group.subscribe();
 
@@ -290,7 +292,6 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::transport::{TransportError};
     use crate::test_utils;
 
     #[tokio::test]

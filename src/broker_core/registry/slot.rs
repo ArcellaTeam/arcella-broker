@@ -13,7 +13,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use crate::transport::MessageSender;
+use super::super::transport::MessageSender;
 
 pub struct SubscriptionSlot {
     /// Current sender. `None` means the subscription has been removed.

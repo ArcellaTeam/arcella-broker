@@ -1,4 +1,4 @@
-// arcella-broker/src/registry/mod.rs
+// arcella-broker/src/broker_core/registry/mod.rs
 //
 // Copyright (c) 2026 Arcella Team
 //
@@ -589,7 +589,7 @@ impl LocalRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{create_channel, MessageSender};
+    use super::super::transport::{create_channel, MessageSender};
 
     fn create_dummy_sender() -> MessageSender {
         let (tx, _rx) = create_channel(10);

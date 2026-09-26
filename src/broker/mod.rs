@@ -37,7 +37,7 @@ use std::sync::Arc;
 use crate::client::BrokerClient;
 use crate::config::{BrokerConfig, ClientConfig};
 use crate::error::BrokerError;
-use crate::registry::LocalRegistry;
+use crate::broker_core::registry::LocalRegistry;
 
 /// The central core of the Arcella message broker.
 ///

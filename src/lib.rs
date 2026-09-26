@@ -37,11 +37,7 @@ pub mod error;
 /// Message protocol definitions, including headers, transfer modes, and validation.
 pub mod protocol;
 
-/// Local recipient registry for routing messages to local recipients.
-pub mod registry;
-
-/// Abstract transport layer for message routing and delivery.
-pub mod transport;
+pub mod broker_core;
 
 /// Client frontend for interacting with the Arcella message broker.
 #[cfg(feature = "client")]

@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::registry::RoutingPolicy;
+use crate::broker_core::registry::RoutingPolicy;
 
 pub const DEFAULT_REPLY_CHANNEL_CAPACITY: usize = 1024;
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;

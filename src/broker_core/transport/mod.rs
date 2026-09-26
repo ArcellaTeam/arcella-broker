@@ -47,7 +47,7 @@ mod channel;
 pub mod in_memory;
 
 use crate::protocol::{Message, ProtocolError};
-use crate::registry::RegistryError;
+use super::registry::RegistryError;
 
 pub use channel::*;
 

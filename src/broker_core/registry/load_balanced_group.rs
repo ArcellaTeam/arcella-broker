@@ -14,7 +14,7 @@ use std::sync::{
 };
 use parking_lot::RwLock;
 
-use crate::{
+use crate::broker_core::{
     registry::LocalRegistry,
     transport::{
         create_request_channel,

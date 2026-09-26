@@ -40,7 +40,7 @@ use std::{
 };
 
 use crate::protocol::Message;
-use crate::registry::{LocalRegistry, RouteTarget};
+use super::super::registry::{LocalRegistry, RouteTarget};
 
 use super::{
     Endpoint, 

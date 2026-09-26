@@ -42,15 +42,17 @@ use std::sync::Arc;
 
 use crate::{
     protocol::Message,
-    registry::{
-        LocalRegistry, 
-        LoadBalancedGroup,
-        SubscriptionSlot
-    },
-    transport::{
-        MessageReceiver, 
-        RequestSender,
-        TryRecvError
+    broker_core::{
+        registry::{
+            LocalRegistry, 
+            LoadBalancedGroup,
+            SubscriptionSlot
+        },
+        transport::{
+            MessageReceiver, 
+            RequestSender,
+            TryRecvError
+        },
     },
 };
 

@@ -36,7 +36,13 @@ use std::sync::Arc;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 
 use crate::protocol::Message;
-use crate::transport::{Endpoint, ResolvedEndpoint, Transport, TransportError, TransportResult};
+use crate::broker_core::transport::{
+    Endpoint,
+    ResolvedEndpoint,
+    Transport,
+    TransportError,
+    TransportResult
+};
 
 /// A universal message publisher for a given logical address.
 ///
