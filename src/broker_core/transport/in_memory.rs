@@ -1,4 +1,4 @@
-// arcella-broker/src/transport/in_memory.rs
+// arcella-broker/src/broker_core/transport/in_memory.rs
 //
 // Copyright (c) 2026 Arcella Team
 //

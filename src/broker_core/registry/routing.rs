@@ -1,4 +1,4 @@
-// arcella-broker/src/registry/routing.rs
+// arcella-broker/src/broker_core/registry/routing.rs
 //
 // Copyright (c) 2026 Arcella Team
 //

@@ -1,4 +1,4 @@
-// arcella-broker/src/transport/mod.rs
+// arcella-broker/src/broker_core/transport/mod.rs
 //
 // Copyright (c) 2026 Arcella Team
 //
@@ -44,12 +44,16 @@ use std::{
 };
 
 mod channel;
-pub mod in_memory;
+mod in_memory;
 
 use crate::protocol::{Message, ProtocolError};
 use super::registry::RegistryError;
 
 pub use channel::*;
+pub use in_memory::{
+    InMemoryEndpoint, 
+    InMemoryTransport,
+};
 
 /// Errors that occur at the broker's transport level during message delivery.
 ///

@@ -1,4 +1,4 @@
-// arcella-broker/src/registry/load_balanced_group.rs
+// arcella-broker/src/broker_core/registry/load_balanced_group.rs
 //
 // Copyright (c) 2026 Arcella Team
 //
