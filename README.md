@@ -1,33 +1,33 @@
-# `arcella-broker`
+`arcella-broker`
+Crates.io Documentation License: Apache-2.0/MIT
 
 [![Crates.io](https://img.shields.io/crates/v/arcella-broker.svg)](https://crates.io/crates/arcella-broker)
-[![Documentation](https://docs.rs/arcella-broker/badge.svg)](https://docs.rs/arcella-broker)
-[![License: Apache-2.0/MIT](https://img.shields.io/badge/license-Apache%202.0%20%7C%20MIT-blue)](https://github.com/ArcellaTeam/arcella-broker)
+[![Documentation](https://img.shields.io/docs.rs/arcella-broker)](https://docs.rs/arcella-broker)
+[![License: Apache-2.0/MIT](https://img.shields.io/badge/license-Apache%202.0%20%7C%20MIT-blue)](https://github.com/ArcellaTeam/mini-rs)
 
-A high-performance, hierarchical message micro-broker for the **Arcella** platform (a modular WebAssembly application platform).
+A high-performance, hierarchical message micro-broker for the Arcella platform (a modular WebAssembly application platform).
 
 This library provides ultra-fast, secure, and deterministic message routing between platform components, leveraging the Tokio asynchronous runtime.
 
 ## Key Features
-
-- **Hierarchical Addressing:** Strict routing via addresses formatted as `level1:level2:level3`, with support for wildcard patterns (`*` for a single segment, `**` for multiple trailing segments).
-- **High Performance:** Zero-copy binary protocol parsing using the `bytes` crate, minimal allocations, and `parking_lot` for highly concurrent registry access.
-- **Priority Routing:** 256 levels of message priority (0 = critical, 255 = background) embedded directly into the 64-byte fixed header without performance overhead.
-- **Two Delivery Modes:**  
+- **Hierarchical Addressing**: Strict routing via addresses formatted as `level1:level2:level3`, with support for wildcard patterns (`*` for a single segment, `** `for multiple trailing segments).
+- **High Performance**: Zero-copy binary protocol parsing using the `bytes` crate, minimal allocations, and highly concurrent registry access.
+- **Priority Routing**: 256 levels of message priority (0 = critical, 255 = background) embedded directly into the 64-byte fixed header without performance overhead.
+- **Two Delivery Modes**:
   - `InOnly` (Fire-and-forget): Asynchronous sending without waiting for a response.
   - `InOut` (Request/Response): Sending with response awaiting and correlation via `message_id`.
-- **RAII Lifecycle Management:** Automatic unsubscription and resource cleanup upon `Subscriber` destruction (protects against "zombie" subscriptions when Wasm instances crash or drop).
-- **Zero Introspection:** The broker does not analyze, deserialize, or modify 
-the message payload, ensuring data confidentiality and maximum throughput.
+- **RAII Lifecycle Management**: Automatic unsubscription and resource cleanup upon `SubscriptionHandle` destruction (protects against "zombie" subscriptions when Wasm instances crash or drop).
+- **Zero Introspection**: The broker does not analyze, deserialize, or modify the message payload, ensuring data confidentiality and maximum throughput.
 
 ## Architecture and Security Model
 
-`arcella-broker` is designed to operate within a **trusted OS environment**.  
-> **Important:** WebAssembly modules **do not interact** with the broker directly. Interaction is performed exclusively through a connector library or trusted async components (`trusted = true`), which inject valid `session_token` and `message_id` values, preventing identity spoofing.
+`arcella-broker` is designed to operate within a trusted OS environment.
+
+**Important**: WebAssembly modules do not interact with the broker directly. Interaction is performed exclusively through a connector library or trusted async components (`trusted = true`), which inject valid `session_token` and `message_id` values, preventing identity spoofing.
 
 ## Installation
 
-Add the dependency to your `Cargo.toml`:
+Add the dependency to your Cargo.toml:
 
 ```toml
 [dependencies]
@@ -35,56 +35,59 @@ arcella-broker = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 bytes = "1"
 ```
-
 ## Quick Start
-
 Example of creating a client, subscribing to an address, and sending a message in-process (using the In-Memory transport):
 
 ```rust
 use std::sync::Arc;
 use bytes::Bytes;
 use arcella_broker::{
+    broker::Broker,
     client::BrokerClient,
+    config::{ClientConfig, SubscriberConfig},
     protocol::{Message, TransferMode},
-    registry::LocalRegistry,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize registry and client
-    let registry = Arc::new(LocalRegistry::new(1024));
-    let client = BrokerClient::new(registry);
+    // 1. Initialize broker and client (simplified for example)
+    let broker = Arc::new(Broker::new()); 
+    let config = ClientConfig::default();
+    let client = BrokerClient::new(broker, config, "arcella:core:sender".to_string())?;
 
     let target_address = "arcella:core:events:user_login".to_string();
 
-    // 2. Subscribe to an address (automatically registers the channel and unsubscribes on drop)
-    let mut subscriber = client.subscribe(target_address.clone())?;
+    // 2. Subscribe to an address (returns Subscriber + RAII SubscriptionHandle)
+    let sub_config = SubscriberConfig::default();
+    let (mut subscriber, _handle) = client.subscribe(target_address.clone(), sub_config)?;
 
     // 3. Form the message (in a real application, IDs and tokens are securely generated by the connector)
     let message = Message::new(
         TransferMode::InOnly,
-        [0u8; 32], // session_token
-        [1u8; 16], // message_id (GUID)
-        [0u8; 4],  // sub_message_id
-        64,        // ttl
-        Bytes::from("event:user.login"),
-        Bytes::from(target_address.clone()),
-        Bytes::from(r#"{"user_id": 42}"#),
+        [0u8; 32],                        // session_token
+        [1u8; 16],                        // message_id (GUID)
+        [0u8; 4],                         // sub_message_id
+        128,                              // priority (0 = critical, 255 = background)
+        64,                               // ttl
+        Bytes::from("event:user.login"),  // msg_type
+        Bytes::from(target_address.clone()), // address (Single Source of Truth for routing)
+        Bytes::new(),                     // reply_to (must be empty for InOnly)
+        Bytes::from(r#"{"user_id": 42}"#), // payload
     )?;
 
-    // 4. Send the message
-    client.send(&target_address, message.clone()).await?;
+    // 4. Send the message (Address is extracted directly from message.address)
+    client.send(message.clone()).await?;
     println!("Message sent successfully!");
 
     // 5. Receive the message on the subscriber side
     if let Some(received_msg) = subscriber.recv().await {
         println!(
             "Received message type: {:?}", 
-            std::str::from_utf8(&received_msg.msg_type)
+            std::str::from_utf8(&received_msg.msg_type).unwrap()
         );
     }
 
-    // 6. subscriber goes out of scope -> the channel is automatically closed and removed from the registry
+    // 6. `_handle` goes out of scope -> the channel is automatically closed and removed from the registry
     
     Ok(())
 }
@@ -93,31 +96,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Protocol Format
 
 The broker uses a strict binary protocol (Little-Endian):
-1. **Fixed Header (64 bytes):** version, mode flags, tokens, identifiers, and field lengths.
-- version (u16)
-- flags (u8): Transfer mode (InOnly/InOut) + reserved bits.
-- priority (u8): Message priority (0 = critical, 255 = background).
-- session_token (32 bytes)
-- message_id (16 bytes)
-- sub_message_id (4 bytes)
-- ttl (u8)
-- msg_type_len (u8)
-- address_len (u16)
-- payload_len (u32)
-2. **Variable Header:** message type (UTF-8, up to 255 bytes) and recipient address (UTF-8, up to 1024 bytes).
-3. **Payload:** binary data completely transparent to the broker (up to 1 MB).
 
-**Address Validation Rules:**
+### Fixed Header (64 bytes)
+Contains version, mode flags, tokens, identifiers, and field lengths:
+- `version` (u16): Protocol version.
+- `flags` (u8): Transfer mode (`InOnly`/`InOut`) + reserved bits.
+- `priority` (u8): Message priority (0 = critical, 255 = background).
+- `session_token` (32 bytes): Authentication/authorization token.
+- `message_id` (16 bytes): Unique message identifier (GUID).
+- `sub_message_id` (4 bytes): Unique submessage identifier.
+- `ttl` (u8): Routing counter (Time To Live).
+- `msg_type_len` (u8): Length of the message type string.
+- `address_len` (u16): Length of the recipient address string.
+- `payload_len` (u32): Length of the binary payload.
+
+### Variable Header
+- `message type`: UTF-8 string (up to 255 bytes).
+- `recipient address`: UTF-8 string (up to 1024 bytes).
+- `reply_to address`: UTF-8 string (up to 1024 bytes, **present only in `InOut` mode**, prefixed by a `u16` length).
+
+### Payload
+Binary data completely transparent to the broker (up to 1 MB).
+
+### Address Validation Rules
 - Allowed characters: `a-zA-Z0-9`, `-`, `_`, `:`.
 - Empty levels (`::`) or addresses starting/ending with `:` are strictly forbidden.
 
 ## Implementation Details
 
-- **Exclusive Binding:** The registry prevents conflicting subscriptions. For example, you cannot subscribe to an exact address if an overlapping wildcard pattern already exists, and vice versa.
-- **Reply Dispatcher:** A built-in request-response correlation mechanism for `InOut` mode. It utilizes a background task and `oneshot` channels with automatic cleanup via `WaiterGuard` (providing robust protection against memory leaks).
+- **Exclusive Binding**: The registry prevents conflicting subscriptions. For example, you cannot subscribe to an exact address if an overlapping wildcard pattern already exists, and vice versa.
+- **Reply Dispatcher**: A built-in request-response correlation mechanism for `InOut` mode. It utilizes a background task and `oneshot` channels with automatic cleanup via `WaiterGuard` (providing robust protection against memory leaks).
+- **Single Source of Truth (SSOT)**: The routing destination is determined *exclusively* by the `address` field inside the `Message` struct, eliminating parameter duplication and preventing routing desynchronization.
 
 ## License
-
 This project is distributed under a dual-license:
-- [Apache License, Version 2.0](LICENSE-APACHE)
-- [MIT License](LICENSE-MIT)
+- Apache License, Version 2.0
+- MIT License
