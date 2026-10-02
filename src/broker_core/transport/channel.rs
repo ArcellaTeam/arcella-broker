@@ -1,4 +1,4 @@
-// arcella-broker/src/transport/channel.rs
+// arcella-broker/src/broker_core/transport/channel.rs
 //
 // Copyright (c) 2026 Arcella Team
 //

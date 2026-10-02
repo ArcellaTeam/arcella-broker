@@ -1,4 +1,4 @@
-// arcella-broker/src/transport/in_memory.rs
+// arcella-broker/src/broker_core/transport/in_memory.rs
 //
 // Copyright (c) 2026 Arcella Team
 //
@@ -93,13 +93,13 @@ impl Endpoint for InMemoryEndpoint {
     /// For Single targets: if the channel was closed, returns ConnectionClosed.
     /// For Group targets: delegates to the group's send logic, which handles 
     /// individual channel failures internally (e.g., skipping dead members in Broadcast).
+    #[inline]
     fn send(
         &self,
         message: Message,
     ) -> impl Future<Output = TransportResult<()>> + Send {
         async move {
             // Use cached sender without clone
-            //self.sender.send(message).await.map_err(|_| TransportError::ConnectionClosed)
             self.target.send(message).await
         }
     }
@@ -111,6 +111,7 @@ impl Endpoint for InMemoryEndpoint {
     /// If the version has changed, it means the subscriber was re-registered (e.g.,
     /// after a component restart), and the old channel is no longer relevant.
     /// 2. Checks the physical state of the channel via is_closed().
+    #[inline]
     fn is_valid(&self) -> bool {
         // Check actual status
         self.target.version() == self.cached_version && !self.target.is_closed()
@@ -160,37 +161,7 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
             }
         }
     }
-    
-    /// Asynchronously sends a message to the specified address.
-    ///
-    /// Used for one-off sends when creating and caching a Publisher
-    /// is impractical. Performs an on-the-fly registry lookup.    ///
-    ///
-    /// # Arguments
-    /// * `address` - the string address of the recipient.
-    /// * `message` - the message to be sent.
-    ///
-    /// # Returns
-    /// `Ok(())` if the message is successfully queued in the channel, or an error if
-    /// the recipient is not found or the channel is closed.
-    fn send<'a>(
-        &'a self,
-        address: &'a str,
-        message: Message,
-    ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
-        async move {
-            match self.registry.lookup(address) {
-                Some(target) => {
-                    // IMPORTANT: Using .await on mpsc::Sender provides natural backpressure.
-                    // If the receiver's queue is full, the sender will be blocked, preventing
-                    // unbounded memory growth (OOM) with slow consumers or DoS attacks.
-                    target.send(message).await
-                }
-                None => Err(TransportError::RecipientNotFound(address.to_string())),
-            }
-        }
-    }
-
+ 
     /// Send a message to resolved endpoint
     ///
     /// This is the "fast path". Delegates the send directly to the
@@ -203,6 +174,7 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
     /// # Returns
     /// `Ok(())` if the message is successfully queued in the channel, or an error if
     /// the recipient is not found or the channel is closed.
+    #[inline]
     fn send_to<'a>(
         &'a self,
         endpoint: &'a ResolvedEndpoint<InMemoryEndpoint>,
@@ -214,38 +186,6 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
         }
     }    
 
-    /// Sends a request and waits for a response with a timeout.
-    ///
-    /// # Architectural constraint
-    /// This method intentionally returns an Unsupported error.
-    /// In the Arcella architecture, handling the InOut pattern is strictly centralized in
-    /// BrokerClient::request. This is necessary for safety guarantees:
-    /// 1. Forced and safe injection of the correct reply_to address.
-    /// 2. Registration of response waiting in ReplyDispatcher, tied to the lifecycle
-    /// of a specific client (RAII cleanup).
-    /// The raw transport does not have the client's context and must not manage this process.
-    ///
-    /// Uses `ReplyDispatcher` to register waiting for a response by `message_id`.
-    ///
-    /// # Arguments
-    /// * `address` - the string address of the recipient.
-    /// * `message` - the request message to be sent.
-    ///
-    /// # Returns
-    /// The response message upon successful execution, or a timeout/connection closed error.
-    fn request<'a>(
-        &'a self,
-        _address: &'a str,
-        _message: Message,
-    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a {
-        async move {
-            Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Use BrokerClient::request for InOut mode to ensure proper reply_to injection and per-client dispatching",
-            )))
-        }
-    }
-
     /// Sends a request to resolved endpoint and waits for a response with a timeout.
     ///
     /// See the documentation for request. The same architectural constraint applies.
@@ -253,7 +193,7 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
     /// Uses `ReplyDispatcher` to register waiting for a response by `message_id`.
     ///
     /// # Arguments
-    /// * `address` - the string address of the recipient.
+    /// * `endpoint` - the endpoint for resolved address of the recipient.
     /// * `message` - the request message to be sent.
     ///
     /// # Returns
@@ -264,10 +204,7 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
         _message: Message,
     ) -> impl Future<Output = TransportResult<Message>> + Send + 'a {
         async move {
-            Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Use BrokerClient::request for InOut mode",
-            )))
+            Err(TransportError::Unsupported)
         }
     }   
 

@@ -345,7 +345,8 @@ pub fn validate_address(address: &str) -> Result<(), ProtocolError> {
 /// 1. Fixed header (64 bytes)
 /// 2. Message type (UTF-8 string, < 255 bytes)
 /// 3. Recipient address (UTF-8 string, < 1024 bytes)
-/// 4. Payload (bincode, transparent to the broker)
+/// 4. Reply to address (UTF-8 string, < 1024 bytes)
+/// 5. Payload (bincode, transparent to the broker)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub header: FixedHeader,

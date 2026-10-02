@@ -1,4 +1,4 @@
-// arcella-broker/src/registry/slot.rs
+// arcella-broker/src/broker_core/registry/slot.rs
 //
 // Copyright (c) 2026 Arcella Team
 //
