@@ -245,15 +245,19 @@ impl BrokerClient {
 
     /// Asynchronously sends a message without waiting for a reply (InOnly pattern).
     ///
-    /// This is the "cold path". The address is resolved in the registry on every
-    /// call. Use this method for rare or one-off messages.
-    /// For frequent sending to the same address, it is preferable to use
-    /// `self.publisher(address).send()`.
-    pub async fn send(&self, address: &str, message: Message) -> TransportResult<()> {
-        self.local.send(address, message).await
+    /// This is the "cold path". The destination address is extracted directly 
+    /// from `message.address`, eliminating parameter duplication and ensuring 
+    /// Single Source of Truth (SSOT) for routing.
+    /// 
+    /// Use this method for rare or one-off messages. For frequent sending to
+    ///  the same address, it is preferable to use `self.publisher(address).send()`.
+    pub async fn send(&self, message: Message) -> TransportResult<()> {
+        self.local.send(message).await
     }
 
     /// Sends a request and waits for a reply (InOut / Request-Response pattern).
+    ///
+    /// The destination address is extracted directly from `message.address`.
     ///
     /// # Broker safety guarantees
     /// 1. **Forced injection of `reply_to`**: The method ignores any value of
@@ -266,8 +270,14 @@ impl BrokerClient {
     ///    blocking the resource forever.
     /// 3. **RAII cleanup**: The `WaiterGuard` created internally guarantees removal
     ///    of the pending wait from the `ReplyDispatcher` even in the event of a panic in the calling code.
-    pub async fn request(&self, address: &str, mut message: Message) -> TransportResult<Message> {
+    pub async fn request(&self, mut message: Message) -> TransportResult<Message> {
         let message_id = message.header.message_id;
+
+        // Ensure InOut mode (Request/Response).
+        // If the calling code accidentally created a message with the InOnly flag,
+        // we forcefully correct this to ensure proper response handling by the receiver.
+        message.header.flags = (message.header.flags & !crate::protocol::TRANSFER_MODE_MASK) 
+            | crate::protocol::TransferMode::InOut.to_flags();
 
         // Force override of `reply_to` to ensure security and correct response routing.
         // Ignore any value that the calling code might have passed.
@@ -279,7 +289,7 @@ impl BrokerClient {
             .map_err(TransportError::Registry)?; 
 
         // Sending the request
-        self.local.send(address, message).await?;
+        self.local.send(message).await?;
 
         // Waiting for the reply with a timeout
         match tokio::time::timeout(self.broker.config.request_timeout(), receiver).await {
@@ -313,12 +323,14 @@ mod tests {
             ).expect("Subscription should succeed");
 
         // 3. Create a test message
-        let original_message = test_utils::dummy_in_only_message(Bytes::from("test:ping"),
+        let original_message = test_utils::dummy_in_only_message(
+            Bytes::from("test:ping"),
             Bytes::from(target_address.clone()),
-            Bytes::from("hello from sender"));
+            Bytes::from("hello from sender")
+        );
 
         // 4. Action: Send the message
-        let send_result = client.send(&target_address, original_message.clone()).await;
+        let send_result = client.send(original_message.clone()).await;
         assert!(send_result.is_ok(), "Send operation should succeed");
 
         // 5. Verification: Receiving the message on the receiver side
@@ -336,12 +348,14 @@ mod tests {
         // 1. Initialize client
         let client = test_utils::test_client("test".to_string()).unwrap();
 
-        let msg = test_utils::dummy_in_only_message(Bytes::from("test:ping"),
+        let msg = test_utils::dummy_in_only_message(
+            Bytes::from("test:ping"),
             Bytes::from("arcella:unknown:address"),
-            Bytes::from(""));
+            Bytes::from("")
+        );
 
         // Attempt to send to an unregistered address
-        let result = client.send("arcella:unknown:address", msg).await;
+        let result = client.send(msg).await;
 
         // Expect a `RecipientNotFound` error
         assert!(matches!(result, Err(TransportError::RecipientNotFound(_))));
@@ -389,7 +403,7 @@ mod tests {
                 Bytes::from(*addr),
                 payload.clone());
 
-            let result = client.send(addr, msg).await;
+            let result = client.send(msg).await;
             assert!(result.is_ok(), "Send to {} should succeed", addr);
         }
 
@@ -442,11 +456,13 @@ mod tests {
         let payload = Bytes::from_static(b"");
 
         // Sending before registration should return an error
-        let msg = test_utils::dummy_in_only_message(Bytes::from_static(b"test"),
+        let msg = test_utils::dummy_in_only_message(
+            Bytes::from_static(b"test"),
             address.clone(),
-            payload.clone());
+            payload.clone()
+        );
         
-        assert!(client.send("arcella:test", msg.clone()).await.is_err());
+        assert!(client.send(msg.clone()).await.is_err());
 
         let subscriber_config = SubscriberConfig::default();
 
@@ -459,7 +475,7 @@ mod tests {
             .expect("Subscription should succeed");
 
         // Now sending should succeed
-        assert!(client.send("arcella:test", msg).await.is_ok());
+        assert!(client.send(msg).await.is_ok());
         assert!(subscriber.recv().await.is_some());
 
         // Unregistration
@@ -469,7 +485,7 @@ mod tests {
         let msg2 = test_utils::dummy_in_only_message(Bytes::from_static(b"test2"),
             address.clone(),
             payload.clone());
-        assert!(client.send("arcella:test", msg2).await.is_err());
+        assert!(client.send(msg2).await.is_err());
     }    
 
     #[tokio::test]
@@ -521,7 +537,7 @@ async fn test_subscription_cleanup_and_re_registration() {
         );
         
         // Send should succeed, as sub3 is alive and ready to receive.
-        let result = client.send(addr, msg).await;
+        let result = client.send(msg).await;
         
         assert!(!result.is_err());
         assert!(!sub3.try_recv().is_err(), "sub3 received the message");

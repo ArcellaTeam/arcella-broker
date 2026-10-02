@@ -98,6 +98,9 @@ pub enum TransportError {
     /// (e.g., invalid UTF-8 in the address, exceeding the payload limit).
     #[error("Protocol error: {0}")]
     Protocol(#[from] ProtocolError),
+
+    #[error("Operation is unsupported")]
+    Unsupported,
     
     /// A low-level I/O error.
     ///
@@ -203,11 +206,12 @@ pub trait Transport<E: Endpoint>: Send + Sync {
 
     /// Send a message to a recipient at the specified address.
     ///
+    /// The recipient address is automatically extracted from `message.address`,
+    /// eliminating parameter duplication and the risk of desynchronization.
     /// Used for one-off sends when creating a `Publisher` and caching
     /// the endpoint is impractical. Performs the full cycle: registry lookup -> send.
     ///
     /// # Arguments
-    /// * `address` - the string address of the recipient.
     /// * `message` - the message to be sent.
     ///
     /// # Returns
@@ -215,9 +219,16 @@ pub trait Transport<E: Endpoint>: Send + Sync {
     /// the recipient is not found or the channel is closed.
     fn send<'a>(
         &'a self,
-        address: &'a str,
         message: Message,
-    ) -> impl Future<Output = TransportResult<()>> + Send + 'a;
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
+        async move {
+            let address_str = std::str::from_utf8(&message.address)
+                .map_err(|_| TransportError::Protocol(ProtocolError::InvalidAddressUtf8))?;
+            
+            let endpoint = self.resolve(address_str).await?;
+            self.send_to(&endpoint, message).await
+        }
+    }
 
     /// Send a message to resolved endpoint
     ///
@@ -239,6 +250,9 @@ pub trait Transport<E: Endpoint>: Send + Sync {
 
     /// Send a request and wait for a response (InOut mode) to a recipient at the specified address.
     ///
+    ///
+    /// The recipient address is automatically extracted from `message.address`,
+    /// eliminating parameter duplication and the risk of desynchronization.
     /// Uses `ReplyDispatcher` to register waiting for a response by `message_id`.
     ///
     /// # Architectural note
@@ -250,16 +264,22 @@ pub trait Transport<E: Endpoint>: Send + Sync {
     /// Transport implementations may return Unsupported for this method.
     ///
     /// # Arguments
-    /// * `address` - the string address of the recipient.
     /// * `message` - the request message to be sent.
     ///
     /// # Returns
     /// The response message upon successful execution, or a timeout/connection closed error.
     fn request<'a>(
         &'a self,
-        address: &'a str,
         message: Message,
-    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a;
+    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a{
+       async move {
+           let address_str = std::str::from_utf8(&message.address)
+               .map_err(|_| TransportError::Protocol(ProtocolError::InvalidAddressUtf8))?;
+
+           let endpoint = self.resolve(address_str).await?;
+           self.request_to(&endpoint, message).await
+       }
+    }
 
     /// Send a request and wait for a response (InOut mode) to resolved endpoint.
     ///

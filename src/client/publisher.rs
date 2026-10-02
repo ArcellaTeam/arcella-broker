@@ -215,6 +215,12 @@ where
 
         let message_id = message.header.message_id;
 
+        // Ensure InOut mode (Request/Response).
+        // If the calling code accidentally created a message with the InOnly flag,
+        // we forcefully correct this to ensure proper response handling by the receiver.
+        message.header.flags = (message.header.flags & !crate::protocol::TRANSFER_MODE_MASK) 
+            | crate::protocol::TransferMode::InOut.to_flags();
+
         // Force override of `reply_to` to ensure security and correct response routing.
         // Ignore any value that the calling code might have passed.
         message.reply_to = self.reply_address.clone();
