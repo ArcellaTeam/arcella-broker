@@ -32,17 +32,23 @@
 //!    (`ConnectionClosed`), the cache is automatically invalidated, forcing
 //!    the next send attempt to re-resolve the current address.
 
+use bytes::Bytes;
 use std::sync::Arc;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 
-use crate::protocol::Message;
-use crate::broker_core::transport::{
-    Endpoint,
-    ResolvedEndpoint,
-    Transport,
-    TransportError,
-    TransportResult
+use crate::{
+    broker_core::transport::{
+        Endpoint,
+        ResolvedEndpoint,
+        Transport,
+        TransportError,
+        TransportResult
+    },
+    config::BrokerConfig,
+    protocol::Message,
 };
+
+use super::ReplyDispatcher;
 
 /// A universal message publisher for a given logical address.
 ///
@@ -67,6 +73,21 @@ where
     /// A reference to the transport layer used for address resolution and sending.
     transport: Arc<T>,
 
+    /// Address of the reply queue (copied from `BrokerClient`).
+    /// Used for InOut (Request-Reply) mode to guarantee
+    /// that the response arrives specifically at this client instance, ignoring any external substitutions
+    reply_address: Bytes, 
+
+    /// Dispatcher (copied from `BrokerClient`) that manages pending responses
+    /// (waiters) for the Request-Reply pattern.
+    /// Allows safely matching message_id with the response waiting channel (receiver)
+    /// and automatically cleaning up resources when an operation is cancelled (drop guard).
+    reply_dispatcher: Arc<ReplyDispatcher>,
+
+    /// Broker configuration used to retrieve global parameters,
+    /// such as the response wait timeout (request_timeout).    
+    broker_config: Arc<BrokerConfig>, 
+
     /// Cache of the resolved endpoint. `None` means the address has not yet been resolved
     /// or the cache was forcibly invalidated due to a delivery error.
     cached_endpoint: RwLock<Option<ResolvedEndpoint<E>>>,
@@ -81,31 +102,40 @@ where
     ///
     /// Initially, the endpoint cache is empty (`None`). The first call to send
     /// initiates the "cold path" with full address resolution.
-    pub(crate) fn new(address: String, transport: Arc<T>) -> Self {
+    pub(crate) fn new(
+        address: String, 
+        transport: Arc<T>, 
+        reply_address: String, 
+        reply_dispatcher: Arc<ReplyDispatcher>,
+        broker_config: Arc<BrokerConfig>,
+    ) -> Self {
         Self {
             address,
             transport,
+            reply_address: Bytes::from(reply_address),
+            reply_dispatcher,
+            broker_config,
             cached_endpoint: RwLock::new(None),
         }
     }
 
-/// Retrieves the current endpoint using a double-checked locking caching strategy
-/// to minimize lock contention.
-///
-/// # Algorithm
-/// 1. **Fast Path**: Acquires a regular read lock.
-///    If the endpoint exists and `is_valid()` returns `true` (the slot version
-///    is fresh and the channel is not closed), it is returned immediately.
-/// 2. **Address Resolution (Slow Path)**: If the cache is empty or invalid,
-///    `transport.resolve` is called, which performs a registry lookup (O(L) or O(N) for wildcard).
-/// 3. **Upgradable Read**: Before writing to the cache, it checks whether
-///    another thread has updated the cache while the current thread was performing
-///    the "slow" resolution.
-/// 4. **Write**: If the cache is still invalid, the lock is upgraded to
-///    an exclusive write lock, and the new `ResolvedEndpoint` is stored.
-///
-/// This pattern guarantees the absence of data races when a single `Publisher`
-/// is used concurrently from multiple tasks (e.g., when scaling replicas).
+    /// Retrieves the current endpoint using a double-checked locking caching strategy
+    /// to minimize lock contention.
+    ///
+    /// # Algorithm
+    /// 1. **Fast Path**: Acquires a regular read lock.
+    ///    If the endpoint exists and `is_valid()` returns `true` (the slot version
+    ///    is fresh and the channel is not closed), it is returned immediately.
+    /// 2. **Address Resolution (Slow Path)**: If the cache is empty or invalid,
+    ///    `transport.resolve` is called, which performs a registry lookup (O(L) or O(N) for wildcard).
+    /// 3. **Upgradable Read**: Before writing to the cache, it checks whether
+    ///    another thread has updated the cache while the current thread was performing
+    ///    the "slow" resolution.
+    /// 4. **Write**: If the cache is still invalid, the lock is upgraded to
+    ///    an exclusive write lock, and the new `ResolvedEndpoint` is stored.
+    ///
+    /// This pattern guarantees the absence of data races when a single `Publisher`
+    /// is used concurrently from multiple tasks (e.g., when scaling replicas).
     async fn get_or_resolve_endpoint(&self) -> TransportResult<ResolvedEndpoint<E>> {
         // 1. Fast endpoint check (read without write lock)
         {
@@ -136,7 +166,7 @@ where
         // Re-check after acquiring the exclusive lock (classic double-check)
         if let Some(ep) = write_guard.as_ref() {
             if ep.is_valid() {
-                tracing::trace!("Publisher endpoint already updated befor write lock");
+                tracing::trace!("Publisher endpoint already updated before write lock");
                 return Ok(ep.clone());
             }
         }
@@ -162,14 +192,50 @@ where
     pub async fn send(&self, message: Message) -> TransportResult<()> {
         let ep = self.get_or_resolve_endpoint().await?;
 
-        match self.transport.send_to(&ep, message).await {
-            Err(TransportError::ConnectionClosed) => {
-                // Forced cache invalidation on connection loss
-                *self.cached_endpoint.write() = None;
-                Err(TransportError::ConnectionClosed)
-            }
-            other => other,
+        self.transport.send_to(&ep, message).await.map_err(|e| {
+            if matches!(e, TransportError::ConnectionClosed)  { self.invalidate_cache() };
+            e
+        })
+    }
+
+    /// Asynchronously sends a request and awaits a correlated response (Request-Reply / InOut pattern).
+    ///
+    /// # Safety and routing guarantees
+    /// - Forcefully overrides the `reply_to` field to guarantee safety
+    /// and correct routing of the response, ignoring any value that the calling code might have passed.
+    /// - Registers the response wait in `reply_dispatcher` by `message_id`, returning
+    /// a guard for automatic resource cleanup (prevents memory leaks when the future is cancelled).
+    ///
+    /// # Timeout handling
+    /// The response wait is limited by the time configured in `broker_config.request_timeout()`.
+    /// Returns `TransportError::ConnectionClosed` if the receiver channel was closed,
+    /// or `TransportError::Timeout` if the wait time has expired.
+    pub async fn request(&self, mut message: Message) -> TransportResult<Message> {
+        let ep = self.get_or_resolve_endpoint().await?;
+
+        let message_id = message.header.message_id;
+
+        // Force override of `reply_to` to ensure security and correct response routing.
+        // Ignore any value that the calling code might have passed.
+        message.reply_to = self.reply_address.clone();
+
+        // Registering the wait for a reply. Returns a guard for automatic cleanup.
+        let (_guard, receiver) = self.reply_dispatcher
+            .register_waiter(message_id)
+            .map_err(TransportError::Registry)?; 
+
+        self.transport.send_to(&ep, message).await.map_err(|e| {
+            if matches!(e, TransportError::ConnectionClosed) { self.invalidate_cache() };
+            e
+        })?; 
+
+        // Waiting for the reply with a timeout
+        match tokio::time::timeout(self.broker_config.request_timeout(), receiver).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(TransportError::ConnectionClosed),
+            Err(_) => Err(TransportError::Timeout),
         }
+
     }    
 
     /// Returns the logical address associated with this publisher.

@@ -81,7 +81,7 @@ pub struct BrokerClient {
     broker: Arc<Broker>,
 
     /// Transport layer for intra-process delivery.
-    local: Arc<InMemoryTransport>,
+    pub(crate) local: Arc<InMemoryTransport>,
 
     /// The unique logical address of this client within the broker's namespace
     /// (for example, "arcella:core:http-handler").
@@ -91,7 +91,7 @@ pub struct BrokerClient {
 
     /// The dispatcher that manages pending replies to requests (InOut).
     /// Guarantees the absence of memory leaks upon abnormal termination of the component.
-    reply_dispatcher: ReplyDispatcher,
+    reply_dispatcher: Arc<ReplyDispatcher>,
 }
 
 impl BrokerClient {
@@ -118,7 +118,7 @@ impl BrokerClient {
         // The reply channel registration must happen first, so that
         // the component is ready to accept a reply immediately after sending a request.
         let reply_subscriber = Subscriber::new_push(receiver, client_address.clone());
-        let reply_dispatcher = ReplyDispatcher::new(reply_subscriber);
+        let reply_dispatcher = Arc::new(ReplyDispatcher::new(reply_subscriber));
 
         let reply_handle = SubscriptionHandle::new_exclusive(
             client_address.clone(),
@@ -234,7 +234,13 @@ impl BrokerClient {
     /// `LocalRegistry` (radix trees or wildcard scanning) on every
     /// send, which is critically important for high-load components.
     pub fn publisher(&self, address: String) -> Publisher<InMemoryTransport, InMemoryEndpoint> {
-        Publisher::new(address, self.local.clone()) 
+        Publisher::new(
+            address,
+            self.local.clone(),
+            self.client_address.clone(),
+            self.reply_dispatcher.clone(),
+            self.broker.config.clone(),
+        ) 
     }    
 
     /// Asynchronously sends a message without waiting for a reply (InOnly pattern).
