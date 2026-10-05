@@ -10,6 +10,7 @@
 use std::str;
 use thiserror::Error;
 
+mod frame;
 mod message;
 
 use message::{
