@@ -10,8 +10,10 @@
 use std::str;
 use thiserror::Error;
 
+mod codec;
 mod frame;
 mod message;
+pub mod payloads;
 
 use message::{
     MessageError,
@@ -21,6 +23,11 @@ pub use message::{
     Message,
     TransferMode,
 };
+
+/// Utility functions and helpers for testing the broker.
+#[allow(missing_docs)]
+#[cfg(test)]
+pub mod test_utils;
 
 // ============================================================================
 // Protocol constants

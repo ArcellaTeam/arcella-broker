@@ -7,6 +7,7 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use bytes::{Buf, BufMut, Bytes};
 use thiserror::Error;
 
 /// Maximum payload size in bytes(16 МБ).
@@ -15,6 +16,12 @@ pub const FRAME_MAX_PAYLOAD_LENGTH: u32 = 0x00FF_FFFF;
 
 /// Frame header size in bytes: 1 byte (type) + 3 bytes (length).
 pub const FRAME_HEADER_SIZE: usize = 4;
+
+/// Size of the CRC32C field in bytes.
+pub const CRC_SIZE: usize = 4;
+
+/// Size of the full frame excluding the payload: header (4) + CRC (4).
+pub const FRAME_OVERHEAD: usize = FRAME_HEADER_SIZE + CRC_SIZE;
 
 /// Errors that occur when working with frame headers.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -127,6 +134,40 @@ impl FrameHeader {
     }
 }
 
+/// L2 Frame.
+/// 
+/// payload uses Bytes for zero-copy semantics: when extracted from BytesMut,
+/// no data is copied, only the reference count is incremented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub frame_type: u8,
+    pub payload: Bytes,
+}
+
+impl Frame {
+    /// Create new frame.
+    pub fn new(frame_type: u8, payload: Bytes) -> Self {
+        Self { frame_type, payload }
+    }
+
+    /// Create frame Data (0xfe)
+    pub fn data(payload: Bytes) -> Self {
+        Self {
+            frame_type: FrameType::Data as u8,
+            payload,
+        }
+    }
+
+    /// Returns a typed variant of the frame type if it is known.
+    pub fn typed_frame_type(&self) -> Option<FrameType> {
+        FrameType::from_u8(self.frame_type)
+    }
+
+    /// Total frame size in bytes (header + payload + CRC).
+    pub fn total_size(&self) -> usize {
+        FRAME_OVERHEAD + self.payload.len()
+    }
+}
 
 #[cfg(test)]
 mod tests {
