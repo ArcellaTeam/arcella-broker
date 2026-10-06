@@ -273,4 +273,151 @@ mod tests {
         let err = decode_data_payload(&payload).unwrap_err();
         assert_eq!(err, DataFrameError::IncompleteHeader);
     }
+
+    /// Test: message_count declares 10 messages, but there is only enough data for 1.
+    /// The Ingress Bridge, when attempting to decode the 10th message, must get an error.
+    #[test]
+    fn test_message_count_mismatch_too_many_declared() {
+        let session_seq = 1_u64;
+        let address = Bytes::from("test:addr");
+
+        let msg = test_utils::dummy_in_only_message(
+            Bytes::from("test"),
+            Bytes::from("test:addr"),
+            Bytes::from("data"),
+        );
+
+        let mut buf = BytesMut::new();
+        buf.put_u64_le(session_seq);
+        buf.put_u16_le(address.len() as u16);
+        buf.put_slice(&address);
+        buf.put_u16_le(10); // Declare 10 messages
+        msg.encode(&mut buf); // But only put 1
+
+        let payload = buf.freeze();
+        let parsed = decode_data_payload(&payload).unwrap();
+
+        assert_eq!(parsed.session_sequence, session_seq);
+        assert_eq!(parsed.address, address);
+
+        // Now the Ingress Bridge tries to decode 10 messages
+        let mut msg_buf = parsed.messages_raw.as_ref();
+        let declared_count = msg_buf.get_u16_le();
+        assert_eq!(declared_count, 10);
+
+        // The first message decodes successfully
+        let first = Message::decode(&mut msg_buf);
+        assert!(first.is_ok());
+
+        // The second message is an error, there is no more data
+        let second = Message::decode(&mut msg_buf);
+        assert!(second.is_err());
+    }
+
+    /// Test: message_count declares 1, but there is enough data for 2 messages.
+    /// The Ingress Bridge must stop after the first (according to the declared count).
+    #[test]
+    fn test_message_count_mismatch_too_few_declared() {
+        let session_seq = 2_u64;
+        let address = Bytes::from("test:addr");
+
+        let msg1 = test_utils::dummy_in_only_message(
+            Bytes::from("test1"),
+            Bytes::from("test:addr"),
+            Bytes::from("data1"),
+        );
+        let msg2 = test_utils::dummy_in_only_message(
+            Bytes::from("test2"),
+            Bytes::from("test:addr"),
+            Bytes::from("data2"),
+        );
+
+        let mut buf = BytesMut::new();
+        buf.put_u64_le(session_seq);
+        buf.put_u16_le(address.len() as u16);
+        buf.put_slice(&address);
+        buf.put_u16_le(1); // Declare only 1 message
+        msg1.encode(&mut buf);
+        msg2.encode(&mut buf); // But put 2
+
+        let payload = buf.freeze();
+        let parsed = decode_data_payload(&payload).unwrap();
+
+        let mut msg_buf = parsed.messages_raw.as_ref();
+        let declared_count = msg_buf.get_u16_le();
+        assert_eq!(declared_count, 1);
+
+        // The Ingress Bridge decodes exactly 1 message (according to the declared count)
+        let first = Message::decode(&mut msg_buf).unwrap();
+        assert_eq!(first.msg_type.as_ref(), b"test1");
+
+        // The remainder of the buffer contains the "extra" second message — this is data for the next frame
+        // or a protocol error, but the L2 parser has done its job correctly
+        assert!(msg_buf.remaining() > 0);
+    }
+
+    /// Test: the payload contains only the Data header (session_sequence + address),
+    /// but not even message_count.
+    #[test]
+    fn test_payload_truncated_before_message_count() {
+        let mut buf = BytesMut::new();
+        buf.put_u64_le(1); // session_sequence
+        buf.put_u16_le(5); // address_length
+        buf.put_slice(b"test:"); // address
+        // message_count is missing!
+
+        let payload = buf.freeze();
+        let err = decode_data_payload(&payload).unwrap_err();
+        assert_eq!(err, DataFrameError::IncompleteMessageCount);
+    }
+
+    /// Test: address_length declares 1000 bytes, but there is less data.
+    #[test]
+    fn test_address_length_mismatch() {
+        let mut buf = BytesMut::new();
+        buf.put_u64_le(1);
+        buf.put_u16_le(1000); // Declare 1000 bytes of address
+        buf.put_slice(b"short"); // But only put 5
+
+        let payload = buf.freeze();
+        let err = decode_data_payload(&payload).unwrap_err();
+        assert_eq!(err, DataFrameError::IncompleteAddress);
+    }
+
+    /// Test: address_length exceeds the limit MAX_ADDRESS_LEN.
+    #[test]
+    fn test_address_length_exceeds_limit_in_decode() {
+        let mut buf = BytesMut::new();
+        buf.put_u64_le(1);
+        buf.put_u16_le((MAX_ADDRESS_LEN + 1) as u16);
+        buf.put_slice(&vec![b'a'; MAX_ADDRESS_LEN + 1]);
+
+        let payload = buf.freeze();
+        let err = decode_data_payload(&payload).unwrap_err();
+        assert_eq!(err, DataFrameError::AddressTooLong(MAX_ADDRESS_LEN + 1));
+    }
+
+    /// Test: message_count = 0 — a valid case (empty frame).
+    #[test]
+    fn test_zero_messages() {
+        let session_seq = 5_u64;
+        let address = Bytes::from("empty:queue");
+
+        let mut buf = BytesMut::new();
+        buf.put_u64_le(session_seq);
+        buf.put_u16_le(address.len() as u16);
+        buf.put_slice(&address);
+        buf.put_u16_le(0); // 0 messages
+
+        let payload = buf.freeze();
+        let parsed = decode_data_payload(&payload).unwrap();
+
+        assert_eq!(parsed.session_sequence, session_seq);
+        assert_eq!(parsed.address, address);
+
+        let mut msg_buf = parsed.messages_raw.as_ref();
+        let count = msg_buf.get_u16_le();
+        assert_eq!(count, 0);
+        assert_eq!(msg_buf.remaining(), 0);
+    }
 }

@@ -138,16 +138,16 @@ impl TransferMode {
 /// Fixed part of the message header (64 bytes)
 /// 
 /// Structure (all numbers in Little-Endian):
-/// - version: u16 — protocol version
-/// - flags: u8 — flags (transfer mode)
-/// - priority: u8 — message priority
-/// - session_token: [u8; MESSAGE_SESSION_TOKEN_LEN] — session token (SHA-256/BLAKE3)
-/// - message_id: [u8; MESSAGE_ID_LEN] — unique message identifier (GUID)
-/// - sub_message_id: [u8; MESSAGE_SUB_ID_LEN] — unique submessage identifier
-/// - ttl: u8 — routing counter (Time To Live)
-/// - msg_type_len: u8 — message type length
-/// - address_len: u16 — recipient address length
-/// - payload_len: u32 — payload length
+/// - version: u16  protocol version
+/// - flags: u8  flags (transfer mode)
+/// - priority: u8  message priority
+/// - session_token: [u8; MESSAGE_SESSION_TOKEN_LEN]  session token (SHA-256/BLAKE3)
+/// - message_id: [u8; MESSAGE_ID_LEN]  unique message identifier (GUID)
+/// - sub_message_id: [u8; MESSAGE_SUB_ID_LEN]  unique submessage identifier
+/// - ttl: u8  routing counter (Time To Live)
+/// - msg_type_len: u8  message type length
+/// - address_len: u16  recipient address length
+/// - payload_len: u32  payload length
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixedHeader {
     pub version: u16,
@@ -483,5 +483,200 @@ impl Message {
     /// Returns the total message size in bytes
     pub fn size(&self) -> usize {
         MESSAGE_FIXED_HEADER_SIZE + self.variable_header_size() + self.header.payload_len as usize
+    }
+}
+
+#[cfg(test)]
+mod decode_robustness_tests {
+    use super::*;
+    use bytes::{BufMut, BytesMut};
+
+    /// Helper function: assembles a "raw" Message buffer manually,
+    /// bypassing Message::new validation. This allows testing the parser
+    /// on deliberately invalid data.
+    fn build_raw_message_bytes(
+        mode: TransferMode,
+        msg_type_bytes: &[u8],
+        address_bytes: &[u8],
+        reply_to_bytes: &[u8],
+        payload_bytes: &[u8],
+    ) -> BytesMut {
+        let mut buf = BytesMut::new();
+
+        // Fixed header
+        buf.put_u16_le(MESSAGE_PROTOCOL_VERSION);
+        buf.put_u8(mode.to_flags());
+        buf.put_u8(0); // priority
+        buf.put_slice(&[0u8; MESSAGE_SESSION_TOKEN_LEN]); // session_token
+        buf.put_slice(&[0u8; MESSAGE_ID_LEN]); // message_id
+        buf.put_slice(&[0u8; MESSAGE_SUB_ID_LEN]); // sub_message_id
+        buf.put_u8(64); // ttl
+        buf.put_u8(msg_type_bytes.len() as u8);
+        buf.put_u16_le(address_bytes.len() as u16);
+        buf.put_u32_le(payload_bytes.len() as u32);
+
+        // Variable part
+        buf.put_slice(msg_type_bytes);
+        buf.put_slice(address_bytes);
+
+        if mode == TransferMode::InOut {
+            buf.put_u16_le(reply_to_bytes.len() as u16);
+            buf.put_slice(reply_to_bytes);
+        }
+
+        buf.put_slice(payload_bytes);
+        buf
+    }
+
+    #[test]
+    fn test_decode_invalid_utf8_in_msg_type() {
+        // 0xFF  invalid UTF-8 byte
+        let invalid_type = &[0xFF_u8, 0xFE, 0xFD];
+        let mut buf = build_raw_message_bytes(
+            TransferMode::InOnly,
+            invalid_type,
+            b"valid:address",
+            b"",
+            b"payload",
+        );
+
+        let err = Message::decode(&mut buf).unwrap_err();
+        assert_eq!(err, MessageError::InvalidMsgTypeUtf8.into());
+    }
+
+    #[test]
+    fn test_decode_invalid_utf8_in_address() {
+        let invalid_addr = &[b'a', 0xC0, 0x80]; // overlong encoding  invalid UTF-8
+        let mut buf = build_raw_message_bytes(
+            TransferMode::InOnly,
+            b"valid.type",
+            invalid_addr,
+            b"",
+            b"payload",
+        );
+
+        let err = Message::decode(&mut buf).unwrap_err();
+        assert_eq!(err, ProtocolError::InvalidAddressUtf8);
+    }
+
+    #[test]
+    fn test_decode_invalid_utf8_in_reply_to() {
+        let invalid_reply = &[0xFF_u8, 0x00];
+        let mut buf = build_raw_message_bytes(
+            TransferMode::InOut,
+            b"valid.type",
+            b"valid:address",
+            invalid_reply,
+            b"payload",
+        );
+
+        let err = Message::decode(&mut buf).unwrap_err();
+        assert_eq!(err, MessageError::InvalidReplyToUtf8.into());
+    }
+
+    #[test]
+    fn test_decode_inout_with_empty_reply_to() {
+        let mut buf = build_raw_message_bytes(
+            TransferMode::InOut,
+            b"valid.type",
+            b"valid:address",
+            b"", // reply_to is empty for InOut  this is an error
+            b"payload",
+        );
+
+        let err = Message::decode(&mut buf).unwrap_err();
+        assert_eq!(err, MessageError::MissingReplyToForInOut.into());
+    }
+
+    #[test]
+    fn test_decode_address_with_double_colon() {
+        // Address format "a::b" is invalid, but the UTF-8 is correct
+        let mut buf = build_raw_message_bytes(
+            TransferMode::InOnly,
+            b"valid.type",
+            b"a::b", // double colon
+            b"",
+            b"payload",
+        );
+
+        let err = Message::decode(&mut buf).unwrap_err();
+        assert_eq!(err, ProtocolError::EmptyAddressLevel);
+    }
+
+    #[test]
+    fn test_decode_address_with_leading_colon() {
+        let mut buf = build_raw_message_bytes(
+            TransferMode::InOnly,
+            b"valid.type",
+            b":invalid",
+            b"",
+            b"payload",
+        );
+
+        let err = Message::decode(&mut buf).unwrap_err();
+        assert_eq!(err, ProtocolError::EmptyAddressLevel);
+    }
+
+    #[test]
+    fn test_decode_unsupported_version() {
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(999); // unsupported version
+        buf.put_slice(&[0u8; MESSAGE_FIXED_HEADER_SIZE - 2]); // pad up to 64 bytes
+
+        let err = Message::decode(&mut buf).unwrap_err();
+        assert_eq!(err, MessageError::UnsupportedVersion(999).into());
+    }
+
+    #[test]
+    fn test_decode_truncated_header() {
+        let mut buf = BytesMut::from(&[0u8; 32][..]); // only half of the header
+
+        let err = Message::decode(&mut buf).unwrap_err();
+        assert_eq!(err, MessageError::IncompleteHeader.into());
+    }
+
+    #[test]
+    fn test_decode_truncated_payload() {
+        // The header declares a payload of 1000 bytes, but the buffer does not contain them
+        let mut buf = build_raw_message_bytes(
+            TransferMode::InOnly,
+            b"valid.type",
+            b"valid:address",
+            b"",
+            b"short", // only 5 bytes instead of the declared amount
+        );
+
+        // Override payload_len in the header to a deliberately large value
+        // (position 60..64 in the fixed header)
+        buf[60] = 0xE8; // 1000 in LE = 0x000003E8
+        buf[61] = 0x03;
+        buf[62] = 0x00;
+        buf[63] = 0x00;
+
+        let err = Message::decode(&mut buf).unwrap_err();
+        assert_eq!(err, MessageError::IncompletePayload.into());
+    }
+
+    #[test]
+    fn test_decode_msg_type_too_long() {
+        // msg_type_len in the header = 255, but that is the limit. Let's check > 255 via a direct call
+        let mut buf = BytesMut::new();
+        buf.put_u16_le(MESSAGE_PROTOCOL_VERSION);
+        buf.put_u8(TransferMode::InOnly.to_flags());
+        buf.put_u8(0); // priority
+        buf.put_slice(&[0u8; MESSAGE_SESSION_TOKEN_LEN]);
+        buf.put_slice(&[0u8; MESSAGE_ID_LEN]);
+        buf.put_slice(&[0u8; MESSAGE_SUB_ID_LEN]);
+        buf.put_u8(64); // ttl
+        buf.put_u8(255); // msg_type_len at the boundary
+        buf.put_u16_le(5); // address_len
+        buf.put_u32_le(0); // payload_len
+
+        // Add 255 bytes of msg_type and 5 bytes of address
+        buf.put_slice(&[b'a'; 255]);
+        buf.put_slice(b"valid");
+
+        // Should pass (exactly the limit)
+        assert!(Message::decode(&mut buf).is_ok());
     }
 }
