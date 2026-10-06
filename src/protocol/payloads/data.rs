@@ -150,7 +150,6 @@ pub fn decode_data_payload(payload: &Bytes) -> Result<ParsedDataFrame, DataFrame
     if messages_raw_len < 2 {
         return Err(DataFrameError::IncompleteMessageCount);
     }
-    let _message_count = buf.get_u16_le(); // The Ingress Bridge will read this again
 
     // 4. The remaining bytes are the raw messages for the Ingress Bridge
     let messages_raw_start = payload.len() - messages_raw_len;
