@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use super::{
     ProtocolError,
-    validate_address,
+    utils::validate_address,
     MAX_ADDRESS_LEN,
     TRANSFER_MODE_MASK,
     TRANSFER_MODE_SHIFT,
