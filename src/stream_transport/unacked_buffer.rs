@@ -17,6 +17,11 @@ struct Slot {
     frame: Frame,
 }
 
+struct UnackedBufferInner {
+    slots: Vec<Option<Slot>>,
+    occupied_count: usize,
+}
+
 /// Lock-based ring buffer for storing unacknowledged frames.
 /// 
 /// Uses direct indexing: slot index = `sequence % capacity`.
@@ -28,7 +33,7 @@ struct Slot {
 /// The critical section is very short (single slot access),
 /// so lock overhead is negligible in practice.
 pub struct UnackedBuffer {
-    slots: Mutex<Vec<Option<Slot>>>,
+    inner: Mutex<UnackedBufferInner>,
     capacity: usize,
 }
 
@@ -45,9 +50,14 @@ impl UnackedBuffer {
         for _ in 0..capacity {
             slots.push(None);
         }
+
+        let inner = UnackedBufferInner {
+            slots,
+            occupied_count: 0,
+        };
         
         Self {
-            slots: Mutex::new(slots),
+            inner: Mutex::new(inner),
             capacity,
         }
     }
@@ -59,14 +69,15 @@ impl UnackedBuffer {
     /// - `Ok(())` if the frame was successfully pushed.
     /// - `Err(PushError::BufferFull)` if the target slot is already occupied.
     pub fn push(&self, sequence: u64, frame: Frame) -> Result<(), PushError> {
-        let idx = (sequence as usize) % self.capacity;
-        let mut slots = self.slots.lock();
+        let idx = (sequence % (self.capacity as u64)) as usize;
+        let mut inner = self.inner.lock();
         
-        if slots[idx].is_some() {
+        if inner.slots[idx].is_some() {
             return Err(PushError::SlotOccupied { sequence, index: idx });
         }
         
-        slots[idx] = Some(Slot { sequence, frame });
+        inner.slots[idx] = Some(Slot { sequence, frame });
+        inner.occupied_count += 1;
         Ok(())
     }
 
@@ -77,12 +88,13 @@ impl UnackedBuffer {
     /// - `true` if the frame was found and removed.
     /// - `false` if the slot was empty or the sequence number did not match.
     pub fn acknowledge(&self, sequence: u64) -> bool {
-        let idx = (sequence as usize) % self.capacity;
-        let mut slots = self.slots.lock();
+        let idx = (sequence % (self.capacity as u64)) as usize;
+        let mut inner = self.inner.lock();
         
-        if let Some(slot) = &slots[idx] {
+        if let Some(slot) = &inner.slots[idx] {
             if slot.sequence == sequence {
-                slots[idx] = None;
+                inner.slots[idx] = None;
+                inner.occupied_count -= 1;
                 return true;
             }
         }
@@ -92,13 +104,14 @@ impl UnackedBuffer {
 
     /// Returns the number of occupied slots.
     pub fn len(&self) -> usize {
-        let slots = self.slots.lock();
-        slots.iter().filter(|s| s.is_some()).count()
+        let inner = self.inner.lock();
+        inner.occupied_count
     }
 
     /// Returns `true` if the buffer is empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        let inner = self.inner.lock();
+        inner.occupied_count == 0
     }
 
     /// Returns the capacity of the buffer.
