@@ -1,4 +1,4 @@
-// arcella-broker/src/protocol/payloads/mod.rs
+// arcella-broker/src/stream_transport/mod.rs
 //
 // Copyright (c) 2026 Arcella Team
 //
@@ -7,6 +7,11 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-mod data;
+pub mod session;
+pub mod unacked_buffer;
 
-pub use data::*;
+pub use session::SessionState;
+pub use unacked_buffer::{UnackedBuffer, PushError};
+
+#[cfg(test)]
+mod integration_test;

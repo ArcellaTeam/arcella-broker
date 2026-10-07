@@ -356,7 +356,7 @@ impl RequestSender {
 ///
 /// # Example
 /// ```rust
-/// use arcella_broker::transport::create_channel;
+/// use arcella_broker::broker_core::transport::create_channel;
 /// 
 /// // Creating a channel with a capacity of 1024 messages 
 /// let (sender, mut receiver) = create_channel(1024); 

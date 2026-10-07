@@ -12,7 +12,7 @@ use crc32fast::Hasher;
 use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
 
-use super::frame::{
+use super::{
     Frame,
     CRC_SIZE,
     FRAME_HEADER_SIZE, 

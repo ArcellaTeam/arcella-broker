@@ -15,6 +15,15 @@ mod message;
 pub mod payloads;
 pub mod utils;
 
+pub use frame::{
+    Frame, 
+    FrameType,
+    CRC_SIZE,
+    FRAME_HEADER_SIZE, 
+    FRAME_MAX_PAYLOAD_LENGTH, 
+    FRAME_OVERHEAD,
+};
+
 use message::{
     MessageError,
 };
