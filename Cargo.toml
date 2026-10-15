@@ -24,6 +24,7 @@ arc-swap = "1.9"
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive"] }
 crc32fast = "1.5"
+futures = "0.3.34"
 iradix = "0.3"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
@@ -33,7 +34,11 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "serde"] }
 
+[dev-dependencies]
+tempfile = "3.27"
+
 [features]
-default = ["client"]
+default = ["client", "ipc"]
 client = []
+ipc = ["tokio/net"]
 server = ["client"] 

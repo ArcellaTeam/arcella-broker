@@ -24,9 +24,20 @@ use arcella_broker::{
 // ============================================================================
 // Test Configuration
 // ============================================================================
+#[cfg(debug_assertions)]
+const NUM_RECEIVERS: usize = 10;
+#[cfg(debug_assertions)]
+const NUM_SENDERS: usize = 10;
+#[cfg(debug_assertions)]
+const MESSAGES_PER_SENDER: usize = 1_000;
+
+#[cfg(not(debug_assertions))]
 const NUM_RECEIVERS: usize = 100;
+#[cfg(not(debug_assertions))]
 const NUM_SENDERS: usize = 100;
+#[cfg(not(debug_assertions))]
 const MESSAGES_PER_SENDER: usize = 1_000_000;
+
 const TOTAL_MESSAGES: usize = NUM_SENDERS * MESSAGES_PER_SENDER;
 
 fn init_tracing() {

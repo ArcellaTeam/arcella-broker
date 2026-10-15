@@ -1,4 +1,4 @@
-// arcella-broker/src/broker_core/transport/in_memory.rs
+// arcella-broker/src/broker_core/transport/in_memory/transport.rs
 //
 // Copyright (c) 2026 Arcella Team
 //
@@ -40,83 +40,16 @@ use std::{
 };
 
 use crate::protocol::Message;
-use super::super::registry::{LocalRegistry, RouteTarget};
+use crate::broker_core::registry::LocalRegistry;
 
-use super::{
-    Endpoint, 
+use super::super::{
     ResolvedEndpoint, 
     Transport, 
     TransportError, 
     TransportResult,
 };
 
-/// A cached endpoint for in-process message delivery.
-///
-/// # Hot Path optimization
-/// Instead of accessing the LocalRegistry on every message send
-/// (which would require a Radix tree lookup or scanning wildcard rules),
-/// InMemoryEndpoint stores a direct reference to a `RouteTarget`
-///
-/// Before sending, the is_valid() method performs an ultra-fast check:
-/// 1. Whether the slot's current version matches the cached one (guaranteeing that the subscriber
-/// was not removed and recreated with a new channel).
-/// 2. Whether the physical channel is still alive (!is_closed()).
-///
-/// If both conditions hold, the send happens without any locks
-/// or registry lookups.
-pub struct InMemoryEndpoint {
-    // A direct reference to the routing target in the registry for verifying version freshness.
-    target: Arc<RouteTarget>,
-    /// The slot version at the time of caching. Used to detect changes (TOCTOU).
-    cached_version: u64,
-}
-
-impl InMemoryEndpoint {
-    /// Creates a new cached endpoint based on the found registry slot.
-    ///
-    /// # Guarantees
-    /// The expect call here is safe because this method is called exclusively
-    /// from InMemoryTransport::resolve, which returns the slot only if
-    /// it exists and contains a valid MessageSender.
-    pub(crate) fn new(target: Arc<RouteTarget>) -> Self {
-        Self {
-            cached_version: target.version(),
-            target,
-        }
-    }
-}
-
-impl Endpoint for InMemoryEndpoint {
-    /// Sends a message using the cached channel.
-    ///
-    /// This method does not perform a repeated registry lookup. 
-    /// For Single targets: if the channel was closed, returns ConnectionClosed.
-    /// For Group targets: delegates to the group's send logic, which handles 
-    /// individual channel failures internally (e.g., skipping dead members in Broadcast).
-    #[inline]
-    fn send(
-        &self,
-        message: Message,
-    ) -> impl Future<Output = TransportResult<()>> + Send {
-        async move {
-            // Use cached sender without clone
-            self.target.send(message).await
-        }
-    }
-    
-    /// Validates the cached endpoint.
-    ///
-    /// # Validation algorithm
-    /// 1. Compares the atomic version of SubscriptionSlot with cached_version.
-    /// If the version has changed, it means the subscriber was re-registered (e.g.,
-    /// after a component restart), and the old channel is no longer relevant.
-    /// 2. Checks the physical state of the channel via is_closed().
-    #[inline]
-    fn is_valid(&self) -> bool {
-        // Check actual status
-        self.target.version() == self.cached_version && !self.target.is_closed()
-    }
-}
+use super::InMemoryEndpoint;
 
 /// Transport for in-process delivery.
 /// 

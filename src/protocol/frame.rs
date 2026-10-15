@@ -23,12 +23,39 @@ pub const CRC_SIZE: usize = 4;
 /// Size of the full frame excluding the payload: header (4) + CRC (4).
 pub const FRAME_OVERHEAD: usize = FRAME_HEADER_SIZE + CRC_SIZE;
 
-/// Errors that occur when working with frame headers.
+/// Errors that can occur when parsing or constructing an L2 [`FrameHeader`].
+///
+/// These errors are detected **before** the full frame is read, i.e., at the
+/// very first stage of the L2 FSM (waiting for the 4-byte header). They indicate
+/// either a malformed stream or a protocol violation by the peer.
+///
+/// # Design notes
+/// - `InsufficientData` is a *soft* error — it simply means the parser needs
+///   more bytes from the stream and should wait (return `None` in `Decoder`).
+/// - `PayloadTooLarge` is a *hard* error — it violates the protocol's absolute
+///   limit of [`FRAME_MAX_PAYLOAD_LENGTH`] (16 MiB, the maximum value of u24)
+///   and must result in immediate connection termination.
+///
+/// # See also
+/// - [`FrameCodecError`] for errors that occur later in the FSM (CRC mismatch, I/O).
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FrameHeaderError {
+    /// The input buffer contains fewer than [`FRAME_HEADER_SIZE`] (4) bytes,
+    /// so the header cannot be read yet.
+    ///
+    /// Contains the number of bytes actually available.
+    ///
+    /// # Recovery
+    /// This is a normal condition during stream fragmentation — the caller
+    /// should wait for more data rather than treating it as a failure.
     #[error("Insufficient data to read the header: expected {FRAME_HEADER_SIZE} bytes, received {0}")]
     InsufficientData(usize),
     
+    /// The declared payload length exceeds the protocol limit [`FRAME_MAX_PAYLOAD_LENGTH`].
+    ///
+    /// Contains the offending length value. Since the length field is u24,
+    /// this error can only occur if a custom (lower) limit was configured
+    /// via [`FrameCodec::with_max_payload_size`], or if the raw bytes are corrupted.
     #[error("Payload size limit exceeded:{0} > {FRAME_MAX_PAYLOAD_LENGTH}")]
     PayloadTooLarge(u32),
 }
@@ -145,12 +172,136 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Create new frame.
+    /// Creates a new L2 frame with the specified type and payload.
+    ///
+    /// # Design Note: Why `frame_type` is `u8` instead of `FrameType` enum
+    ///
+    /// The `frame_type` field is intentionally stored as a raw `u8` rather than the
+    /// strongly-typed `FrameType` enum. This is a deliberate architectural decision
+    /// to support **forward-compatibility** (protocol extensibility):
+    ///
+    /// - **Unknown frame types are not errors**: When a newer protocol version introduces
+    ///   new frame types, older implementations can safely ignore them (or log a warning)
+    ///   instead of failing to parse the entire stream.
+    /// - **Graceful degradation**: The [`Frame::typed_frame_type`] method returns
+    ///   `Option<FrameType>`, allowing the caller to decide how to handle unknown types.
+    /// - **Zero-cost abstraction**: Storing `u8` avoids the overhead of enum validation
+    ///   on every frame parse, which is critical for the hot path.
+    ///
+    /// # Zero-Copy Semantics
+    ///
+    /// The `payload` parameter uses [`Bytes`] to enable **zero-copy** data handling:
+    /// - When a frame is extracted from a `BytesMut` buffer (e.g., in `FrameCodec::decode`),
+    ///   the payload is not copied; only the reference count is incremented.
+    /// - This is essential for high-throughput scenarios where frames may be large
+    ///   (up to 16 MB) and copying would introduce significant latency.
+    ///
+    /// # Arguments
+    ///
+    /// * `frame_type` - The frame type as a raw byte. Known types are defined in
+    ///   [`FrameType`] (e.g., `0xfe` for Data, `0x03` for Acknowledge). Unknown types
+    ///   are preserved as-is for forward-compatibility.
+    /// * `payload` - The frame payload as a `Bytes` instance. The payload can be empty
+    ///   (for control frames like `Close`) or up to 16 MB (for `Data` frames).
+    ///
+    /// # Guarantees
+    ///
+    /// - **No validation**: This method does not validate the `frame_type` or `payload` size.
+    ///   Validation is performed by the transport layer (e.g., `FrameCodec`) or the caller.
+    /// - **Ownership transfer**: The `payload` is moved into the frame; the caller loses
+    ///   access to the original `Bytes` instance.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arcella_broker::protocol::{Frame, FrameType};
+    /// use bytes::Bytes;
+    ///
+    /// // Create a Data frame (0xfe)
+    /// let payload = Bytes::from("hello, world");
+    /// let frame = Frame::new(FrameType::Data as u8, payload);
+    /// assert_eq!(frame.frame_type, 0xfe);
+    /// ```
+    ///
+    /// # See Also
+    ///
+    /// - [`Frame::data`] - A convenience constructor for Data frames.
+    /// - [`Frame::typed_frame_type`] - Convert the raw `u8` to a typed `FrameType`.
     pub fn new(frame_type: u8, payload: Bytes) -> Self {
         Self { frame_type, payload }
     }
 
-    /// Create frame Data (0xfe)
+    /// Creates a Data frame (type `0xfe`) containing the specified payload.
+    ///
+    /// This is a convenience constructor equivalent to:
+    /// ```rust,ignore
+    /// Frame::new(FrameType::Data as u8, payload)
+    /// ```
+    ///
+    /// # Purpose
+    ///
+    /// Data frames are the primary carrier of L3 messages (application-level data)
+    /// in the Arcella protocol. Each Data frame contains:
+    /// - A `session_sequence` (u64) for ordering and acknowledgment.
+    /// - A destination `address` (extracted by L2 for the credit system).
+    /// - One or more serialized L3 `Message` instances (aggregated for efficiency).
+    ///
+    /// The payload is typically constructed using [`encode_data_payload`], which
+    /// handles the serialization of the Data frame's internal structure.
+    ///
+    /// # Zero-Copy Semantics
+    ///
+    /// Like [`Frame::new`], this method uses [`Bytes`] for zero-copy payload handling.
+    /// The payload is not copied when the frame is created or transmitted; only
+    /// reference counts are adjusted.
+    ///
+    /// # Arguments
+    ///
+    /// * `payload` - The serialized Data frame payload (including `session_sequence`,
+    ///   `address`, and `messages`). Use [`encode_data_payload`] to construct this.
+    ///
+    /// # Guarantees
+    ///
+    /// - **Frame type is fixed**: The `frame_type` is always `0xfe` (`FrameType::Data`).
+    /// - **No validation**: The payload is not validated here; validation occurs during
+    ///   encoding (in `FrameCodec`) or decoding (in `decode_data_payload`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arcella_broker::protocol::{Frame, Message, TransferMode};
+    /// use arcella_broker::protocol::payloads::encode_data_payload;
+    /// use bytes::Bytes;
+    ///
+    /// // Create a sample L3 message
+    /// let msg = Message::new(
+    ///     TransferMode::InOnly,
+    ///     [0u8; 32], // session_token
+    ///     [1u8; 16], // message_id
+    ///     [0u8; 4],  // sub_message_id
+    ///     0,         // priority
+    ///     64,        // ttl
+    ///     Bytes::from("test.msg"),
+    ///     Bytes::from("worker:1"),
+    ///     Bytes::new(), // reply_to (empty for InOnly)
+    ///     Bytes::from("payload data"),
+    /// ).unwrap();
+    ///
+    /// // Encode into a Data frame payload
+    /// let session_seq = 42;
+    /// let address = Bytes::from("worker:1");
+    /// let payload = encode_data_payload(session_seq, &address, &[msg]).unwrap();
+    ///
+    /// // Create the Data frame
+    /// let frame = Frame::data(payload);
+    /// assert_eq!(frame.frame_type, 0xfe);
+    /// ```
+    ///
+    /// # See Also
+    ///
+    /// - [`encode_data_payload`] - Serialize L3 messages into a Data frame payload.
+    /// - [`decode_data_payload`] - Parse a Data frame payload back into L2 metadata and L3 messages.
+    /// - [`Frame::new`] - Generic frame constructor for other frame types.
     pub fn data(payload: Bytes) -> Self {
         Self {
             frame_type: FrameType::Data as u8,
@@ -158,12 +309,59 @@ impl Frame {
         }
     }
 
-    /// Returns a typed variant of the frame type if it is known.
+    /// Returns the typed variant of the frame type if it is known.
+    ///
+    /// This method attempts to convert the raw `frame_type` byte into a strongly-typed
+    /// [`FrameType`] enum variant. If the frame type is unknown (e.g., introduced in a
+    /// newer protocol version), this method returns `None`.
+    ///
+    /// # Forward-Compatibility Strategy
+    ///
+    /// Returning `Option<FrameType>` instead of `Result` or panicking allows the caller
+    /// to implement graceful handling of unknown frame types:
+    /// - **Ignore**: Skip the frame and continue processing (for non-critical extensions).
+    /// - **Log**: Record a warning for debugging or monitoring.
+    /// - **Error**: Terminate the connection (for critical protocol violations).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arcella_broker::protocol::{Frame, FrameType};
+    /// use bytes::Bytes;
+    ///
+    /// let frame = Frame::new(0xfe, Bytes::from("data"));
+    /// assert_eq!(frame.typed_frame_type(), Some(FrameType::Data));
+    ///
+    /// let unknown_frame = Frame::new(0x55, Bytes::new());
+    /// assert_eq!(unknown_frame.typed_frame_type(), None);
+    /// ```
+    ///
+    /// # See Also
+    ///
+    /// - [`FrameType::from_u8`] - The underlying conversion logic.
     pub fn typed_frame_type(&self) -> Option<FrameType> {
         FrameType::from_u8(self.frame_type)
     }
 
-    /// Total frame size in bytes (header + payload + CRC).
+    /// Returns the total size of the frame in bytes, including the header and CRC.
+    ///
+    /// The total size is calculated as:
+    /// ```text
+    /// total_size = FRAME_OVERHEAD + payload.len()
+    ///            = (FRAME_HEADER_SIZE + CRC_SIZE) + payload.len()
+    ///            = (4 + 4) + payload.len()
+    ///            = 8 + payload.len()
+    /// ```
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arcella_broker::protocol::{Frame, FRAME_OVERHEAD};
+    /// use bytes::Bytes;
+    ///
+    /// let frame = Frame::new(0xfe, Bytes::from("hello"));
+    /// assert_eq!(frame.total_size(), FRAME_OVERHEAD + 5); // 8 + 5 = 13 bytes
+    /// ```
     pub fn total_size(&self) -> usize {
         FRAME_OVERHEAD + self.payload.len()
     }

@@ -68,12 +68,12 @@ impl UnackedBuffer {
     /// 
     /// - `Ok(())` if the frame was successfully pushed.
     /// - `Err(PushError::BufferFull)` if the target slot is already occupied.
-    pub fn push(&self, sequence: u64, frame: Frame) -> Result<(), PushError> {
+    pub fn push(&self, sequence: u64, frame: Frame) -> Result<(), UnackedBufferError> {
         let idx = (sequence % (self.capacity as u64)) as usize;
         let mut inner = self.inner.lock();
         
         if inner.slots[idx].is_some() {
-            return Err(PushError::SlotOccupied { sequence, index: idx });
+            return Err(UnackedBufferError::SlotOccupied { sequence, index: idx });
         }
         
         inner.slots[idx] = Some(Slot { sequence, frame });
@@ -122,22 +122,22 @@ impl UnackedBuffer {
 
 /// Errors that can occur when pushing a frame into the buffer.
 #[derive(Debug, PartialEq, Eq)]
-pub enum PushError {
+pub enum UnackedBufferError {
     /// The target slot is already occupied (buffer full or protocol error).
     SlotOccupied { sequence: u64, index: usize },
 }
 
-impl std::fmt::Display for PushError {
+impl std::fmt::Display for UnackedBufferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PushError::SlotOccupied { sequence, index } => {
+            UnackedBufferError::SlotOccupied { sequence, index } => {
                 write!(f, "Slot {} is already occupied for sequence {}", index, sequence)
             }
         }
     }
 }
 
-impl std::error::Error for PushError {}
+impl std::error::Error for UnackedBufferError {}
 
 #[cfg(test)]
 mod tests {
@@ -207,7 +207,7 @@ mod tests {
         buffer.push(0, dummy_frame(b"test1")).unwrap();
         
         let result = buffer.push(4, dummy_frame(b"test2"));
-        assert!(matches!(result, Err(PushError::SlotOccupied { sequence: 4, index: 0 })));
+        assert!(matches!(result, Err(UnackedBufferError::SlotOccupied { sequence: 4, index: 0 })));
     }
 
     #[test]

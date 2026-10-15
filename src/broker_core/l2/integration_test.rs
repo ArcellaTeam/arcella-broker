@@ -1,4 +1,4 @@
-// arcella-broker/src/stream_transport/integration_test.rs
+// arcella-broker/src/broker_core/l2/integration_test.rs
 //
 // Copyright (c) 2026 Arcella Team
 //
@@ -11,11 +11,14 @@
 mod integration_tests {
     use bytes::{Bytes, Buf, BufMut};
     use std::sync::Arc;
+    
+    use super::super::{SessionState, UnackedBuffer};
 
-    use crate::stream_transport::{SessionState, UnackedBuffer};
-    use crate::protocol::{Frame, FrameType};
-    use crate::protocol::payloads::{decode_data_payload, encode_data_payload};
-    use crate::protocol::test_utils;
+    use crate::protocol::{
+        {Frame, FrameType},
+        payloads::{decode_data_payload, encode_data_payload},
+        test_utils,
+    };
 
     fn create_data_frame(sequence: u64, address: Bytes, msg_payload: Bytes) -> Frame {
 

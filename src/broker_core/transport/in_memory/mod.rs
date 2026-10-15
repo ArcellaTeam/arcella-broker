@@ -1,4 +1,4 @@
-// arcella-broker/src/stream_transport/mod.rs
+// arcella-broker/src/broker_core/transport/in_memory/mod.rs
 //
 // Copyright (c) 2026 Arcella Team
 //
@@ -7,11 +7,9 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-pub mod session;
-pub mod unacked_buffer;
+pub mod endpoint;
+pub mod transport;
 
-pub use session::SessionState;
-pub use unacked_buffer::{UnackedBuffer, PushError};
+pub use endpoint::InMemoryEndpoint;
+pub use transport::InMemoryTransport;
 
-#[cfg(test)]
-mod integration_test;

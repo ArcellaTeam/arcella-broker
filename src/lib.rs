@@ -39,8 +39,6 @@ pub mod protocol;
 
 pub mod broker_core;
 
-pub mod stream_transport;
-
 /// Client frontend for interacting with the Arcella message broker.
 #[cfg(feature = "client")]
 pub mod client;

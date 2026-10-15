@@ -7,6 +7,12 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+/// Errors that can occur when parsing or constructing an L3 [`Message`].
+///
+/// These errors are specific to the **L3 message layer** and are distinct from
+/// L2 frame-level errors ([`FrameHeaderError`], [`FrameCodecError`]) and
+/// address-level errors ([`ProtocolError`]).
+
 use bytes::{Buf, BufMut, Bytes};
 use thiserror::Error;
 
@@ -52,47 +58,138 @@ pub const MESSAGE_FIXED_HEADER_SIZE: usize = 64;
 // Message errors
 // ============================================================================
 
+///
+/// # Error categories
+///
+/// The variants can be grouped into four logical categories:
+///
+/// 1. **Structural / incomplete data** — the buffer does not contain enough bytes
+///    to complete a field (`IncompleteHeader`, `IncompleteMsgType`, etc.).
+///    These are typical for streaming parsers and indicate "need more data".
+///
+/// 2. **Protocol version / mode violations** — the message uses an unsupported
+///    protocol version or an unknown transfer mode (`UnsupportedVersion`,
+///    `UnknownTransferMode`).
+///
+/// 3. **Length limit violations** — a field exceeds its maximum allowed size
+///    (`MsgTypeTooLong`, `ReplyToTooLong`, `PayloadTooLarge`).
+///
+/// 4. **Semantic / consistency violations** — the message is structurally valid
+///    but logically inconsistent (`MissingReplyToForInOut`,
+///    `UnexpectedReplyToForInOnly`, invalid UTF-8 in text fields).
+///
+/// # Design notes
+/// - The enum is `PartialEq + Eq` to simplify assertions in tests.
+/// - All variants carry the offending value (where applicable) for diagnostics.
+/// - UTF-8 errors are reported separately for each text field (`msg_type`,
+///   `reply_to`) to pinpoint the exact source of corruption.
+///
+/// # See also
+/// - [`ProtocolError::MessageError`] — the wrapper variant that enables `?` propagation.
+/// - [`crate::protocol::MESSAGE_MAX_TYPE_LEN`], [`crate::protocol::MESSAGE_MAX_PAYLOAD_LEN`]
+///   for the concrete limits.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MessageError {
-    #[error("Insufficient data to read header")]
-    IncompleteHeader,
+    // ------------------------------------------------------------------------
+    // Structural / incomplete data
+    // ------------------------------------------------------------------------
 
-    #[error("Unsupported protocol version: {0}")]
-    UnsupportedVersion(u16),
-
-    #[error("Unknown transfer mode: {0}")]
-    UnknownTransferMode(u8),
-
-    #[error("Message type length ({0}) exceeds limit {MESSAGE_MAX_TYPE_LEN}")]
-    MsgTypeTooLong(u8),
-
-    #[error("ReplyTo length ({0}) exceeds limit {MAX_ADDRESS_LEN}")]
-    ReplyToTooLong(u16),
-
-    #[error("Payload size ({0}) exceeds limit {MESSAGE_MAX_PAYLOAD_LEN}")]
-    PayloadTooLarge(u32),
-
-    #[error("Insufficient data to read message type")]
-    IncompleteMsgType,
-
+    /// The buffer does not contain enough bytes to read the recipient address.
+    ///
+    /// The declared `address_len` exceeds the remaining bytes in the buffer.
     #[error("Insufficient data to read address")]
     IncompleteAddress,
 
-    #[error("Insufficient data to read reply_to address")]
-    IncompleteReplyTo,
+    /// The buffer does not contain enough bytes to read the full 64-byte fixed header.
+    #[error("Insufficient data to read header")]
+    IncompleteHeader,
 
+    /// The buffer does not contain enough bytes to read the message type string.
+    ///
+    /// The declared `msg_type_len` exceeds the remaining bytes in the buffer.
+    #[error("Insufficient data to read message type")]
+    IncompleteMsgType,
+
+    /// The buffer does not contain enough bytes to read the declared payload.
+    ///
+    /// The declared `payload_len` exceeds the remaining bytes in the buffer.
     #[error("Insufficient data to read payload")]
     IncompletePayload,
 
+    /// The buffer does not contain enough bytes to read the `reply_to` address.
+    ///
+    /// Only applicable to `InOut` messages, where `reply_to` is mandatory.
+    #[error("Insufficient data to read reply_to address")]
+    IncompleteReplyTo,
+
+    // ------------------------------------------------------------------------
+    // Protocol version / mode violations
+    // ------------------------------------------------------------------------
+
+    /// The message uses a protocol version that this implementation does not support.
+    ///
+    /// Contains the unsupported version number. Currently only
+    /// [`MESSAGE_PROTOCOL_VERSION`] (1) is supported.
+    #[error("Unsupported protocol version: {0}")]
+    UnsupportedVersion(u16),
+
+    /// The `flags` field contains an unknown transfer mode in its low bits.
+    ///
+    /// Contains the raw mode bits (only bit 0 is defined: 0 = `InOnly`, 1 = `InOut`).
+    #[error("Unknown transfer mode: {0}")]
+    UnknownTransferMode(u8),
+
+    // ------------------------------------------------------------------------
+    // Length limit violations
+    // ------------------------------------------------------------------------
+
+    /// The message type string exceeds [`MESSAGE_MAX_TYPE_LEN`] (255 bytes).
+    ///
+    /// Contains the actual length that was rejected.
+    #[error("Message type length ({0}) exceeds limit {MESSAGE_MAX_TYPE_LEN}")]
+    MsgTypeTooLong(u8),
+
+    /// The `reply_to` address exceeds [`crate::protocol::MAX_ADDRESS_LEN`] (1024 bytes).
+    ///
+    /// Contains the actual length that was rejected.
+    #[error("ReplyTo length ({0}) exceeds limit {MAX_ADDRESS_LEN}")]
+    ReplyToTooLong(u16),
+
+    /// The payload exceeds [`MESSAGE_MAX_PAYLOAD_LEN`] (1 MiB).
+    ///
+    /// Contains the actual payload size that was rejected.
+    #[error("Payload size ({0}) exceeds limit {MESSAGE_MAX_PAYLOAD_LEN}")]
+    PayloadTooLarge(u32),
+
+    // ------------------------------------------------------------------------
+    // UTF-8 / encoding violations
+    // ------------------------------------------------------------------------
+
+    /// The message type field contains bytes that are not valid UTF-8.
     #[error("Invalid UTF-8 in message type")]
     InvalidMsgTypeUtf8,
 
+    /// The `reply_to` address field contains bytes that are not valid UTF-8.
     #[error("Invalid UTF-8 in reply_to address")]
     InvalidReplyToUtf8,
 
+    // ------------------------------------------------------------------------
+    // Semantic / consistency violations
+    // ------------------------------------------------------------------------
+
+    /// An `InOut` (request/response) message was provided with an empty `reply_to` address.
+    ///
+    /// The `InOut` transfer mode **requires** a non-empty `reply_to` so that the
+    /// responder knows where to send the reply. This is a semantic invariant
+    /// enforced at construction time.
     #[error("InOut mode requires a non-empty reply_to address")]
     MissingReplyToForInOut,
 
+    /// An `InOnly` (fire-and-forget) message was provided with a non-empty `reply_to` address.
+    ///
+    /// The `InOnly` transfer mode **forbids** a `reply_to` address, since no reply
+    /// is expected. Allowing a non-empty value would waste bandwidth and could
+    /// mislead responders.
     #[error("InOnly mode must have an empty reply_to address")]
     UnexpectedReplyToForInOnly,
 }

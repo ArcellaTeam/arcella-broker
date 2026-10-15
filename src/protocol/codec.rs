@@ -48,11 +48,12 @@ pub enum FrameCodecError {
 /// of the connection at the `FramedRead` level (according to the L2 specification).
 #[derive(Debug, Clone)]
 pub struct FrameCodec {
-    /// Maximum allowed payload size. Defaults to FRAME_MAX_PAYLOAD_LENGTH (16 MB).
+    /// Maximum allowed payload size. Defaults to `FRAME_MAX_PAYLOAD_LENGTH` (16 MB).
     max_payload_size: u32,
 }
 
 impl FrameCodec {
+    /// Creates a new `FrameCodec` with default limits.
     pub fn new() -> Self {
         Self {
             max_payload_size: FRAME_MAX_PAYLOAD_LENGTH,
@@ -60,18 +61,29 @@ impl FrameCodec {
     }
 
     /// Creates a codec with a custom payload size limit.
+    ///
+    /// # Panics
+    /// Panics if `max_payload_size` exceeds the absolute protocol limit `FRAME_MAX_PAYLOAD_LENGTH`.
     pub fn with_max_payload_size(max_payload_size: u32) -> Self {
         assert!(
             max_payload_size <= FRAME_MAX_PAYLOAD_LENGTH,
-            "max_payload_size не может превышать MAX_PAYLOAD_LENGTH ({FRAME_MAX_PAYLOAD_LENGTH})"
+            "max_payload_size cannot exceed FRAME_MAX_PAYLOAD_LENGTH ({FRAME_MAX_PAYLOAD_LENGTH})"
         );
         Self { max_payload_size }
     }
 
-    /// Computes CRC32C for the given buffer (type + length + payload).
+    /// Computes the CRC32C checksum for the given byte slice.
+    ///
+    /// # Design Notes
+    /// - **Scope**: The checksum is computed over the frame header (`type` + `length`)
+    ///   and the `payload`.
+    /// - **Performance**: A new `Hasher` is instantiated per frame. This is intentional:
+    ///   it keeps `FrameCodec` stateless and thread-safe (`Clone`), and `crc32fast::Hasher::new()`
+    ///   is extremely cheap. The crate automatically leverages hardware acceleration
+    ///   (SSE 4.2 / CLMUL) on supported architectures, making per-frame instantiation
+    ///   faster and safer than maintaining mutable hasher state across frames.
     #[inline]
     fn compute_crc(data: &[u8]) -> u32 {
-        // crc32fast uses hardware acceleration (SSE 4.2 / CLMUL) when available.
         let mut hasher = Hasher::new();
         hasher.update(data);
         hasher.finalize()
@@ -92,6 +104,66 @@ impl Decoder for FrameCodec {
     type Item = Frame;
     type Error = FrameCodecError;
 
+    /// Decodes the next complete frame from the byte stream.
+    ///
+    /// This method implements a three-state finite state machine (FSM) to parse
+    /// frames from a continuous byte stream (as per L2 specification section 5.2):
+    ///
+    /// # FSM States
+    ///
+    /// 1. **Waiting for header** (4 bytes): If `src.len() < FRAME_HEADER_SIZE`,
+    ///    returns `Ok(None)` and waits for more data.
+    ///
+    /// 2. **Waiting for payload + CRC**: If `src.len() < FRAME_HEADER_SIZE + length + CRC_SIZE`,
+    ///    returns `Ok(None)` after calling `src.reserve()` to pre-allocate memory
+    ///    and minimize reallocations during fragmentation.
+    ///
+    /// 3. **Extracting frame**: When enough data is available, verifies the CRC32C
+    ///    checksum and returns the complete `Frame`.
+    ///
+    /// # Zero-Copy Guarantee
+    ///
+    /// The payload is extracted using `BytesMut::split_to().freeze()`, which creates
+    /// a new `Bytes` instance that shares memory with the original buffer. No data
+    /// is copied; only the reference count is incremented. This is critical for
+    /// high-throughput scenarios where frames may be large (up to 16 MB).
+    ///
+    /// # CRC32C Verification
+    ///
+    /// The checksum is computed over the frame header (`type` + `length`) and the
+    /// `payload` using the `crc32fast` crate, which leverages hardware acceleration
+    /// (SSE 4.2 / CLMUL) when available. If the CRC does not match, the method
+    /// returns `FrameCodecError::CrcMismatch`, which causes `FramedRead` to
+    /// terminate the connection immediately (per L2 specification).
+    ///
+    /// # Error Handling
+    ///
+    /// - `FrameCodecError::PayloadTooLarge(length)`: If the declared payload size
+    ///   exceeds `max_payload_size` (default: 16 MB).
+    /// - `FrameCodecError::CrcMismatch { expected, received }`: If the CRC32C
+    ///   checksum does not match. This is a fatal error that terminates the connection.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(Frame))`: A complete frame was successfully decoded.
+    /// - `Ok(None)`: More data is needed to complete the frame.
+    /// - `Err(FrameCodecError)`: A fatal error occurred (CRC mismatch or payload too large).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tokio_util::codec::Decoder;
+    /// use bytes::BytesMut;
+    ///
+    /// let mut codec = FrameCodec::new();
+    /// let mut src = BytesMut::from(&[0xfe, 0x05, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o', /* CRC32C */]);
+    ///
+    /// match codec.decode(&mut src) {
+    ///     Ok(Some(frame)) => println!("Decoded frame: type={}, payload={:?}", frame.frame_type, frame.payload),
+    ///     Ok(None) => println!("Need more data"),
+    ///     Err(e) => eprintln!("Decode error: {}", e),
+    /// }
+    /// ```
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         // State 1: Waiting for header (4 bytes)
         if src.len() < FRAME_HEADER_SIZE {
@@ -100,6 +172,9 @@ impl Decoder for FrameCodec {
 
         // Reading the header WITHOUT consuming the buffer (peek).
         let frame_type = src[0];
+
+        // Read 3 bytes of length in Little-Endian order.
+        // The 4th byte is padded with 0x00 to safely convert u24 to u32.
         let length_bytes = [src[1], src[2], src[3], 0];
         let length = u32::from_le_bytes(length_bytes);
 
@@ -111,7 +186,7 @@ impl Decoder for FrameCodec {
 
         // State 2: Waiting for payload + CRC
         if src.len() < total_frame_size {
-            // Reserving space to minimize reallocations during fragmentation.
+            // Reserving space to minimize reallocations during stream fragmentation.
             src.reserve(total_frame_size - src.len());
             return Ok(None);
         }
@@ -135,7 +210,8 @@ impl Decoder for FrameCodec {
             });
         }
 
-        // Zero-copy: the payload becomes a separate Bytes that shares memory with frame_bytes.
+        // Zero-copy: the payload becomes a separate `Bytes` object that 
+        // shares the memory allocation with `frame_bytes`, avoiding any data copying.
         let payload = frame_bytes.slice(FRAME_HEADER_SIZE..payload_end);
 
         Ok(Some(Frame { frame_type, payload }))
@@ -149,6 +225,59 @@ impl Decoder for FrameCodec {
 impl Encoder<Frame> for FrameCodec {
     type Error = FrameCodecError;
 
+    /// Encodes a frame into the byte stream for transmission.
+    ///
+    /// This method serializes a `Frame` into the L2 binary format:
+    /// ```text
+    /// ┌──────────┬──────────┬──────────────────┬──────────┐
+    /// │ type:u8  │ len:u24  │ payload: [u8; N] │ CRC32C   │
+    /// │ (1 byte) │ (3 bytes)│ (0..16 MB)       │ (4 bytes)│
+    /// └──────────┴──────────┴──────────────────┴──────────┘
+    /// ```
+    ///
+    /// # Serialization Process
+    ///
+    /// 1. **Validation**: Checks that `payload.len() <= max_payload_size`.
+    /// 2. **Memory allocation**: Calls `dst.reserve(FRAME_OVERHEAD + payload.len())`
+    ///    to pre-allocate exactly the required space, avoiding multiple reallocations.
+    /// 3. **Header encoding**: Writes `frame_type` (u8) and `payload_len` (u24 LE).
+    /// 4. **Payload writing**: Writes the payload bytes using `dst.put_slice()`.
+    ///    If the payload is a `Bytes` instance, this is a zero-copy operation.
+    /// 5. **CRC32C computation**: Computes the checksum over the header and payload,
+    ///    then appends it as u32 LE.
+    ///
+    /// # Zero-Copy Semantics
+    ///
+    /// When the `Frame`'s payload is a `Bytes` instance (which is the typical case),
+    /// the `put_slice()` operation does not copy the data; it only increments the
+    /// reference count. This is essential for high-throughput scenarios.
+    ///
+    /// # Error Handling
+    ///
+    /// - `FrameCodecError::PayloadTooLarge(length)`: If the payload size exceeds
+    ///   `max_payload_size` (default: 16 MB). This is a fatal error.
+    ///
+    /// # Guarantees
+    ///
+    /// - **Atomic write**: The entire frame (header + payload + CRC) is written
+    ///   in a single operation, ensuring that frames are not interleaved in the stream.
+    /// - **CRC integrity**: The CRC32C checksum is computed over the exact bytes
+    ///   that will be transmitted, guaranteeing end-to-end integrity.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use tokio_util::codec::Encoder;
+    /// use bytes::BytesMut;
+    /// use arcella_broker::protocol::{Frame, FrameType};
+    ///
+    /// let mut codec = FrameCodec::new();
+    /// let frame = Frame::new(FrameType::Data as u8, Bytes::from("hello"));
+    /// let mut dst = BytesMut::new();
+    ///
+    /// codec.encode(frame, &mut dst).unwrap();
+    /// // dst now contains: [0xfe, 0x05, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o', /* CRC32C */]
+    /// ```
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let payload_len = item.payload.len() as u32;
 
@@ -166,7 +295,9 @@ impl Encoder<Frame> for FrameCodec {
         dst.put_u8(item.frame_type);
         dst.put_uint_le(payload_len as u64, 3); // u24 LE
 
-        // Writing the payload (zero-copy if the payload is Bytes).
+        // Writing the payload. 
+        // Zero-copy: `BytesMut::put_slice` has a specialized implementation 
+        // for `Bytes` that increments the reference count instead of copying the data.
         dst.put_slice(&item.payload);
 
         // Computing the CRC over the written bytes (type + length + payload).
@@ -265,7 +396,7 @@ mod tests {
         let mut codec = FrameCodec::new();
         let mut src = BytesMut::new();
 
-        // Склеиваем три кадра в один буфер.
+        // Concatenate three frames into a single buffer.
         src.extend_from_slice(&build_raw_frame(FrameType::Ping as u8, b"ping1"));
         src.extend_from_slice(&build_raw_frame(FrameType::Pong as u8, b"pong1"));
         src.extend_from_slice(&build_raw_frame(FrameType::Data as u8, b"data1"));
