@@ -36,6 +36,7 @@ pub use message::{
 
 pub use server_limits::{
     ServerLimits,
+    DEFAULT_MAX_FRAME_SIZE,
     DEFAULT_HOT_CREDIT,
     DEFAULT_COLD_CREDIT,
 };

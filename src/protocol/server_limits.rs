@@ -22,7 +22,7 @@ pub const DEFAULT_HOT_CREDIT: u32 = 50;
 pub const DEFAULT_COLD_CREDIT: u32 = 10;
 pub const DEFAULT_CELL_TTL_MS: u32 = 50;
 pub const DEFAULT_POOL_SIZE: u32 = 10;
-pub const SESSION_TTL_MS: u32 = 3_600_000; // 1 hour
+pub const DEFAULT_SESSION_TTL_MS: u32 = 3_600_000; // 1 hour
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ServerLimitsError {
@@ -64,7 +64,7 @@ impl Default for ServerLimits {
             cold_credit: DEFAULT_COLD_CREDIT,
             cell_ttl_ms: DEFAULT_CELL_TTL_MS,
             buffer_pool_size: DEFAULT_POOL_SIZE,
-            session_ttl_ms: SESSION_TTL_MS,
+            session_ttl_ms: DEFAULT_SESSION_TTL_MS,
         }
     }
 }
