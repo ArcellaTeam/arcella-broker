@@ -7,12 +7,19 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use bytes::Bytes;
 use getrandom::fill as getrandom_fill;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::protocol::payloads::HelloPayload;
-use crate::protocol::payloads::WelcomePayload;
-use crate::protocol::ServerLimits;
+use crate::protocol::{
+    ServerLimits,
+    payloads::{
+        HelloPayload,
+        WelcomePayload,
+        AuthResponsePayload,
+        AuthResultPayload,
+    },
+};
 
 use crate::broker_core::transport::TransportError;
 
@@ -74,7 +81,7 @@ impl HandshakeHandler {
         }
 
         // 1. Generating session_id (monotonically increasing u64)
-        let session_id = self.session_counter.fetch_add(1, Ordering::Relaxed);
+        let session_id = self.session_counter.fetch_add(1, Ordering::SeqCst);
 
         // 2. Generating session_token (32 bytes, CSPRNG)
         let mut session_token = [0u8; 32];
@@ -93,6 +100,29 @@ impl HandshakeHandler {
             server_challenge,
             server_capabilities: 0, // Reserved for future server capability flags
             limits: ServerLimits::default(),
+        })
+    }
+
+    /// Handles an incoming AuthResponse packet and forms an AuthResult response.
+    ///
+    /// # Algorithm
+    /// 1. Validates that the session_id is valid (basic check for now).
+    /// 2. Since algorithm is 0x00, skips cryptographic HMAC verification.
+    /// 3. Returns AuthResult with status = 0 (success).
+    pub fn process_auth_response(
+        &self,
+        auth_response: &AuthResponsePayload,
+    ) -> Result<AuthResultPayload, HandshakeError> {
+        // В Этапе 5 здесь будет проверка: 
+        // if !self.session_manager.exists(auth_response.session_id) { return Err(...) }
+        
+        // Для Этапа 4: просто принимаем любой запрос для алгоритма None, 
+        // так как криптография отключена.
+        
+        Ok(AuthResultPayload {
+            session_id: auth_response.session_id,
+            status: 0, // 0 = success
+            error_message: Bytes::new(),
         })
     }
 }
@@ -171,5 +201,22 @@ mod tests {
         assert_eq!(welcome1.session_id, 1);
         assert_eq!(welcome2.session_id, 2);
         assert_eq!(welcome3.session_id, 3);
+    }
+
+    #[test]
+    fn test_process_auth_response_success_none() {
+        let handler = HandshakeHandler::new();
+        
+        let auth_response = AuthResponsePayload {
+            session_id: 1,
+            client_nonce: [0xBB; 32],
+            response: Bytes::new(), // Пустой response для алгоритма None
+        };
+
+        let result = handler.process_auth_response(&auth_response).unwrap();
+
+        assert_eq!(result.session_id, 1);
+        assert_eq!(result.status, 0); // success
+        assert!(result.error_message.is_empty());
     }
 }

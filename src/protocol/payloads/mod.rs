@@ -7,10 +7,14 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+mod auth_response;
+mod auth_result;
 mod data;
 mod hello;
 mod welcome;
 
+pub use auth_response::*;
+pub use auth_result::*;
 pub use data::*;
 pub use hello::*;
 pub use welcome::*;
