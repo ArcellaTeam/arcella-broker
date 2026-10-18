@@ -23,8 +23,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
-/// Current L2 protocol version
-pub const L2_PROTOCOL_VERSION: u16 = 1;
+use super::L2_PROTOCOL_VERSION;
 
 /// Errors specific to Hello payload parsing
 #[derive(Debug, Error, PartialEq, Eq)]

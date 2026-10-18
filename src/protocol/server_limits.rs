@@ -15,6 +15,15 @@
 use bytes::{Buf, BufMut, BytesMut};
 use thiserror::Error;
 
+pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024; // 16 MB
+pub const DEFAULT_MAX_SESSIONS_PER_CLIENT: u32 = 100;
+pub const DEFAULT_MAX_ADDRESSES_PER_SESSION: u32 = 1000;
+pub const DEFAULT_HOT_CREDIT: u32 = 50;
+pub const DEFAULT_COLD_CREDIT: u32 = 10;
+pub const DEFAULT_CELL_TTL_MS: u32 = 50;
+pub const DEFAULT_POOL_SIZE: u32 = 10;
+pub const SESSION_TTL_MS: u32 = 3_600_000; // 1 hour
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ServerLimitsError {
     #[error("Insufficient data to read ServerLimits (expected 32 bytes)")]
@@ -48,14 +57,14 @@ pub struct ServerLimits {
 impl Default for ServerLimits {
     fn default() -> Self {
         Self {
-            max_frame_size: 16 * 1024 * 1024, // 16 MB
-            max_sessions_per_client: 100,
-            max_addresses_per_session: 1000,
-            hot_credit: 50,
-            cold_credit: 10,
-            cell_ttl_ms: 50,
-            buffer_pool_size: 10,
-            session_ttl_ms: 3_600_000, // 1 hour
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            max_sessions_per_client: DEFAULT_MAX_SESSIONS_PER_CLIENT,
+            max_addresses_per_session: DEFAULT_MAX_ADDRESSES_PER_SESSION,
+            hot_credit: DEFAULT_HOT_CREDIT,
+            cold_credit: DEFAULT_COLD_CREDIT,
+            cell_ttl_ms: DEFAULT_CELL_TTL_MS,
+            buffer_pool_size: DEFAULT_POOL_SIZE,
+            session_ttl_ms: SESSION_TTL_MS,
         }
     }
 }

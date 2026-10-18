@@ -14,3 +14,6 @@ mod welcome;
 pub use data::*;
 pub use hello::*;
 pub use welcome::*;
+
+/// Current L2 protocol version
+pub const L2_PROTOCOL_VERSION: u16 = 1;

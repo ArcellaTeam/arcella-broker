@@ -34,6 +34,12 @@ pub use message::{
     TransferMode,
 };
 
+pub use server_limits::{
+    ServerLimits,
+    DEFAULT_HOT_CREDIT,
+    DEFAULT_COLD_CREDIT,
+};
+
 /// Utility functions and helpers for testing the broker.
 #[allow(missing_docs)]
 #[cfg(test)]
