@@ -7,11 +7,13 @@
     // This file may not be copied, modified, or distributed
     // except according to those terms.
 
+    pub mod l2;
+
     /// Local recipient registry for routing messages to local recipients.
     pub mod registry;
 
+    pub mod security;
+
     /// Abstract transport layer for message routing and delivery.
     pub mod transport;
-
-    pub mod l2;
 

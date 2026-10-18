@@ -13,6 +13,7 @@ pub mod codec;
 mod frame;
 mod message;
 pub mod payloads;
+mod server_limits;
 pub mod utils;
 
 pub use frame::{

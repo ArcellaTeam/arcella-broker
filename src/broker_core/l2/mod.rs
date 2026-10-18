@@ -1,4 +1,4 @@
-// arcella-broker/src/stream_transport/mod.rs
+// arcella-broker/src/l2/mod.rs
 //
 // Copyright (c) 2026 Arcella Team
 //
@@ -7,8 +7,8 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-pub mod session;
-pub mod unacked_buffer;
+mod session;
+mod unacked_buffer;
 
 pub use session::SessionState;
 pub use unacked_buffer::{UnackedBuffer, UnackedBufferError};

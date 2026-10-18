@@ -65,18 +65,34 @@ pub enum FrameHeaderError {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
-    Hello       = 0x00,
-    Welcome     = 0x01,
-    CreditGrant = 0x02,
-    Acknowledge = 0x03,
-    Drop        = 0x04,
-    Close       = 0x07,
-    Resume      = 0x08,
-    Resumed     = 0x09,
-    Ping        = 0x10,
-    Pong        = 0x11,
-    Data        = 0xfe,
-    Error       = 0xff,
+    /// Client → Server: initiate connection with auth algorithm selection
+    Hello        = 0x00,
+    /// Server → Client: confirm connection with server challenge
+    Welcome      = 0x01,
+    /// Bidirectional: grant credit for an address
+    CreditGrant  = 0x02,
+    /// Bidirectional: acknowledge successful frame processing
+    Acknowledge  = 0x03,
+    /// Bidirectional: notify about dropped frame
+    Drop         = 0x04,
+    /// Client → Server: authentication response (HMAC)
+    AuthResponse = 0x05,
+    /// Server → Client: authentication result
+    AuthResult   = 0x06,
+    /// Bidirectional: close connection
+    Close        = 0x07,
+    /// Client → Server: request session resumption
+    Resume       = 0x08,
+    /// Server → Client: confirm session resumption
+    Resumed      = 0x09,
+    /// Bidirectional: connectivity check
+    Ping         = 0x10,
+    /// Bidirectional: response to Ping
+    Pong         = 0x11,
+    /// Bidirectional: L3 payload carrier
+    Data         = 0xfe,
+    /// Bidirectional: error notification
+    Error        = 0xff,
 }
 
 impl FrameType {
@@ -90,6 +106,8 @@ impl FrameType {
             0x02 => Some(Self::CreditGrant),
             0x03 => Some(Self::Acknowledge),
             0x04 => Some(Self::Drop),
+            0x05 => Some(Self::AuthResponse),
+            0x06 => Some(Self::AuthResult),            
             0x07 => Some(Self::Close),
             0x08 => Some(Self::Resume),
             0x09 => Some(Self::Resumed),
