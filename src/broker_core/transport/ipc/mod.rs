@@ -17,5 +17,5 @@ pub use endpoint::IPCEndpoint;
 pub use transport::IPCTransport;
 pub use uds::UdsConnector;
 
-//#[cfg(test)]
-//mod integration_test;
+#[cfg(test)]
+mod integration_test;
