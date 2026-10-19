@@ -9,17 +9,19 @@
 
 use thiserror::Error;
 
+mod hello;
+mod welcome;
+mod credit_grant;
 mod auth_response;
 mod auth_result;
 mod data;
-mod hello;
-mod welcome;
 
+pub use hello::*;
+pub use welcome::*;
+pub use credit_grant::*;
 pub use auth_response::*;
 pub use auth_result::*;
 pub use data::*;
-pub use hello::*;
-pub use welcome::*;
 
 /// Current L2 protocol version
 pub const L2_PROTOCOL_VERSION: u16 = 1;
@@ -50,6 +52,14 @@ pub enum PayloadError {
     /// (e.g., missing session token or server limits).
     #[error("Welcome payload (0x01): {0}")]
     Welcome(#[from] WelcomePayloadError),
+
+    /// CreditGrant payload parsing or serialization error (frame 0x02).
+    ///
+    /// Occurs when the protocol's binary format is violated: insufficient buffer size,
+    /// exceeding the maximum address size (1024 bytes), or an incorrect frame structure.
+    /// Automatically converted to TransportError::Protocol via the From mechanism.
+    #[error("CreditGrant payload error: {0}")]
+    CreditGrant(#[from] CreditGrantPayloadError),
 
     /// Error parsing/encoding an AuthResponse payload (0x05).
     ///

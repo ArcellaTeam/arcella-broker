@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::protocol::{
     Message,
     {Frame, FrameType},
-    payloads::DataPayload,
+    payloads::{PayloadError, CreditGrantPayload, DataPayload},
 };
 use super::super::super::l2::{SessionState, UnackedBuffer};
 use super::super::TransportError;
@@ -46,7 +46,7 @@ pub struct IPCEndpoint<S> {
 
 impl<S> IPCEndpoint<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     /// Creates a new endpoint with the given stream and hot credit limit.
     ///
@@ -68,6 +68,51 @@ where
             session,
             unacked_buffer,
         }
+    }
+
+    /// Sends a CreditGrant frame (0x02) to the peer.
+    ///
+    /// This method is used to grant credits to the peer, allowing it to send
+    /// Data frames for the specified address. CreditGrant frames are sent
+    /// immediately after successful authentication to initialize the credit
+    /// system, and dynamically during the session to replenish credits.
+    ///
+    /// # Important
+    /// - CreditGrant frames consume a `session_sequence` number (shared with Data frames).
+    /// - They are NOT stored in `UnackedBuffer` (no acknowledgment required).
+    /// - The `session_sequence` is automatically generated via `session.next_sequence()`.
+    ///
+    /// # Arguments
+    /// * `address` — address prefix for which credits are granted
+    /// * `credit_type` — `CreditGrantPayload::CREDIT_TYPE_HOT` or `CREDIT_TYPE_COLD`
+    /// * `credit_amount` — number of credits being granted
+    ///
+    /// # Returns
+    /// The `session_sequence` assigned to this CreditGrant frame.
+    ///
+    /// # Errors
+    /// - `TransportError::Protocol(PayloadError::CreditGrant(...))` if encoding fails
+    /// - `TransportError::Io(...)` if the stream write fails
+    pub async fn send_credit_grant(
+        &mut self,
+        address: Bytes,
+        credit_type: u8,
+        credit_amount: u32,
+    ) -> Result<u64, TransportError> {
+        let session_sequence = self.session.next_sequence();
+        let payload = CreditGrantPayload::new(session_sequence, address, credit_type, credit_amount);
+        let encoded = payload.encode().map_err(|e| TransportError::Protocol(PayloadError::from(e).into()))?;
+        let frame = Frame::new(FrameType::CreditGrant as u8, encoded);
+        self.transport.send(frame).await?;
+        Ok(session_sequence)
+    }
+
+    /// Sends an Acknowledge frame (0x03) for the given sequence number.
+    pub async fn send_ack(&mut self, sequence: u64) -> Result<(), TransportError> {
+        let mut payload = BytesMut::with_capacity(8);
+        payload.put_u64_le(sequence);
+        let frame = Frame::new(FrameType::Acknowledge as u8, payload.freeze());
+        self.transport.send(frame).await
     }
 
     /// Sends a Data frame (0xfe) containing one or more L3 messages.
@@ -150,10 +195,10 @@ where
     pub async fn send_data(
         &mut self,
         address: Bytes,
-        messages: Vec<Message>,
+        messages: &[Message],
     ) -> Result<u64, TransportError> {
         let seq = self.session.next_sequence();
-        let payload = DataPayload::new(seq, address, messages);
+        let payload = DataPayload::new(seq, address, &messages);
         let encoded = payload.encode()?;
         let frame = Frame::data(encoded);
 
@@ -165,13 +210,23 @@ where
         Ok(seq)
     }
 
-    /// Sends an Acknowledge frame (0x03) for the given sequence number.
-    pub async fn send_ack(&mut self, sequence: u64) -> Result<(), TransportError> {
-        let mut payload = BytesMut::with_capacity(8);
-        payload.put_u64_le(sequence);
-        let frame = Frame::new(FrameType::Acknowledge as u8, payload.freeze());
+    /// Sends a raw frame to the peer without any additional processing.
+    ///
+    /// This is a low-level method intended for:
+    /// - Sending control frames (Hello, Welcome, AuthResponse, AuthResult, etc.)
+    /// - Testing and debugging
+    /// - Future protocol extensions
+    ///
+    /// # Important
+    /// - The frame is sent as-is, without sequence number assignment or buffering.
+    /// - The caller is responsible for ensuring the frame is properly formatted.
+    /// - For Data frames, prefer `send_data()` which handles sequencing and buffering.
+    ///
+    /// # Arguments
+    /// * `frame` — the complete frame to send
+    pub async fn send_raw_frame(&mut self, frame: Frame) -> Result<(), TransportError> {
         self.transport.send(frame).await
-    }
+    }    
 
     /// Receives the next frame from the peer.
     ///

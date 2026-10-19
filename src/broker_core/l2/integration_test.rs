@@ -28,7 +28,8 @@ mod integration_tests {
             msg_payload,
         );
         
-        let data_payload = DataPayload::new(sequence, address, vec![msg.clone()]);
+        let messages = [msg.clone()];
+        let data_payload = DataPayload::new(sequence, address, &messages);
         Frame::data(data_payload.encode().unwrap())
     }
 

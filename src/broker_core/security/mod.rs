@@ -8,3 +8,6 @@
 // except according to those terms.
 
 pub mod handshake;
+
+#[cfg(test)]
+mod integration_test;

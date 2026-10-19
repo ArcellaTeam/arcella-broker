@@ -23,7 +23,7 @@
 //! payload of a Data frame. It holds structured data:
 //! - `session_sequence`: the monotonic frame number for ordering/acknowledgment.
 //! - `address`: the destination address (extracted from L3 messages by L2 sender).
-//! - `messages`: a `Vec<Message>` containing one or more L3 messages to be
+//! - `messages`: Slice of [`Message`] containing one or more L3 messages to be
 //!   aggregated (coalesced) into a single frame for efficiency.
 //!
 //! The `encode()` method serializes this structured data into the binary format
@@ -37,7 +37,7 @@
 //! - `messages_raw`: the remaining bytes containing the serialized L3 messages,
 //!   passed **as-is** (zero-copy) to the Ingress Bridge for full deserialization.
 //!
-//! The `decode()` method uses `Bytes::slice()` to extract `address` and
+//! The `decode()` method uses [`bytes::Bytes::slice`] to extract `address` and
 //! `messages_raw` without copying data, ensuring high throughput for large frames.
 //!
 //! # Why Two Types Instead of One?
@@ -71,10 +71,11 @@
 //!
 //! // === Sender Side ===
 //! let msg = create_message("test.msg", Bytes::from("worker:1"), Bytes::from("hello"));
+//! let messages = [msg];
 //! let payload = DataPayload::new(
 //!     42,                                    // session_sequence
 //!     Bytes::from("worker:1"),               // address
-//!     vec![msg],                             // messages
+//!     &messages,                             // messages
 //! );
 //! let encoded_bytes = payload.encode()?;
 //!
@@ -115,10 +116,6 @@ pub enum DataPayloadError {
     /// Not enough data to read the message count field.
     #[error("Not enough data to read the message count")]
     IncompleteMessageCount,
-
-    /// Not enough data to read the declared number of messages.
-    #[error("Not enough data to read messages: expected {expected}, available {available}")]
-    IncompleteMessages { expected: usize, available: usize },
 }
 
 // =========================================================
@@ -138,7 +135,7 @@ pub enum DataPayloadError {
 ///   ordering, acknowledgment, and the credit system.
 /// * `address` — Destination address (extracted by the L2 sender from the L3
 ///   messages). Used by the L2 credit system for routing and flow control.
-/// * `messages` — One or more L3 `Message` instances to be aggregated
+/// * `messages` — One or more [`Message`] instances to be aggregated
 ///   (coalesced) into a single Data frame for efficiency.
 ///
 /// # Usage
@@ -153,16 +150,16 @@ pub enum DataPayloadError {
 /// let frame = Frame::data(encoded_bytes);
 /// ```
 #[derive(Debug, Clone)]
-pub struct DataPayload {
+pub struct DataPayload<'a> {
     /// Monotonic frame number within the session.
     pub session_sequence: u64,
     /// Destination address (extracted by the L2 sender from Message).
     pub address: Bytes,
-	/// L3 messages to be aggregated into a single Data frame.
-    pub messages: Vec<Message>, 
+	/// Slice of [`Message`] to be aggregated into a single Data frame.
+    pub messages: &'a [Message], 
 }
 
-impl DataPayload {
+impl<'a> DataPayload<'a> {
     /// Creates a new `DataPayload` for sending.
     ///
     /// # Arguments
@@ -174,13 +171,14 @@ impl DataPayload {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let payload = DataPayload::new(42, Bytes::from("worker:1"), vec![msg]);
+    /// let messages = [msg];
+    /// let payload = DataPayload::new(42, Bytes::from("worker:1"), &messages);
     /// ```
-    pub fn new(session_sequence: u64, address: Bytes, messages: Vec<Message>) -> Self {
+    pub fn new(session_sequence: u64, address: Bytes, messages: &'a [Message]) -> Self {
         Self { 
             session_sequence, 
             address, 
-            messages 
+            messages, 
         }
     }
 
@@ -220,7 +218,7 @@ impl DataPayload {
             + self.address.len()
             + 2; // message_count (u16)
 
-        for msg in &self.messages {
+        for msg in self.messages {
             estimated_size += msg.size();
         }
 
@@ -230,16 +228,19 @@ impl DataPayload {
         buf.put_u64_le(self.session_sequence);
 
         // 2. address_length (u16 LE) + address bytes
-        buf.put_u16_le(self.address.len() as u16);
+        let address_len = self.address.len();
+        if address_len > u16::MAX as usize {
+            return Err(DataPayloadError::AddressTooLong(address_len).into());
+        }
+        buf.put_u16_le(address_len as u16);
         buf.put_slice(&self.address);
-												   
 
         // 3. message_count (u16 LE)
-        let message_count = self.messages.len() as u16;
-        buf.put_u16_le(message_count);
+        let msg_len = self.messages.len();
+        buf.put_u16_le(msg_len as u16);
 
         // 4. Serialize all messages
-        for msg in &self.messages {
+        for msg in self.messages {
             msg.encode(&mut buf);
         }
 
@@ -259,7 +260,7 @@ impl DataPayload {
 ///
 /// # Zero-Copy Guarantee
 ///
-/// The `address` and `messages_raw` fields are extracted using `Bytes::slice()`,
+/// The `address` and `messages_raw` fields are extracted using [`bytes::Bytes::slice`],
 /// which creates new `Bytes` instances that share memory with the original
 /// payload buffer. No data is copied; only reference counts are incremented.
 /// This is critical for high-throughput scenarios where frames may be large
@@ -322,7 +323,7 @@ impl ParsedDataPayload {
     ///
     /// # Zero-Copy Guarantee
     ///
-    /// The `address` and `messages_raw` fields are extracted using `Bytes::slice()`,
+    /// The `address` and `messages_raw` fields are extracted using [`bytes::Bytes::slice`],
     /// which creates new `Bytes` instances that share memory with the original
     /// payload buffer. No data is copied.
     pub fn decode(payload: &Bytes) -> Result<Self, PayloadError> {
@@ -393,7 +394,8 @@ mod tests {
             Bytes::from("hello"),
         );
 
-        let payload = DataPayload::new(session_seq, address.clone(), vec![msg.clone()]);
+        let messages = [msg.clone()];
+        let payload = DataPayload::new(session_seq, address.clone(), &messages);
         let encoded = payload.encode().unwrap();
         let parsed = ParsedDataPayload::decode(&encoded).unwrap();
 
@@ -426,10 +428,11 @@ mod tests {
             Bytes::from("data2"),
         );
         
+        let messages = [msg1.clone(), msg2.clone()];
         let payload = DataPayload::new(
             session_seq,
             address.clone(),
-            vec![msg1.clone(), msg2.clone()],
+            &messages,
         );
         let encoded = payload.encode().unwrap();
         let parsed = ParsedDataPayload::decode(&encoded).unwrap();
@@ -454,7 +457,7 @@ mod tests {
         let session_seq = 5_u64;
         let address = Bytes::from("empty:queue");
 
-        let payload = DataPayload::new(session_seq, address.clone(), vec![]);
+        let payload = DataPayload::new(session_seq, address.clone(), &[]);
         let encoded = payload.encode().unwrap();
         let parsed = ParsedDataPayload::decode(&encoded).unwrap();
 
@@ -482,7 +485,8 @@ mod tests {
             Bytes::from("data"),
         );
 
-        let payload = DataPayload::new(session_seq, address, vec![msg]);
+        let messages = [msg];
+        let payload = DataPayload::new(session_seq, address, &messages);
         let encoded = payload.encode().unwrap();
         
         let original_ptr: usize = encoded.as_ptr() as usize;
@@ -520,7 +524,8 @@ mod tests {
             Bytes::from("y"),
         );
 
-        let payload = DataPayload::new(1, address, vec![msg]);
+        let messages = [msg];
+        let payload = DataPayload::new(1, address, &messages);
         let err = payload.encode().unwrap_err();
         assert!(matches!(
             err,
