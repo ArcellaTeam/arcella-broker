@@ -10,7 +10,7 @@
 use bytes::{Buf, BufMut, Bytes};
 use thiserror::Error;
 
-/// Maximum payload size in bytes(16 МБ).
+/// Maximum payload size in bytes(16 ).
 /// Corresponds to the maximum value of u24 (0x00FF_FFFF).
 pub const FRAME_MAX_PAYLOAD_LENGTH: u32 = 0x00FF_FFFF;
 
@@ -30,14 +30,14 @@ pub const FRAME_OVERHEAD: usize = FRAME_HEADER_SIZE + CRC_SIZE;
 /// either a malformed stream or a protocol violation by the peer.
 ///
 /// # Design notes
-/// - `InsufficientData` is a *soft* error — it simply means the parser needs
+/// - `InsufficientData` is a *soft* error  it simply means the parser needs
 ///   more bytes from the stream and should wait (return `None` in `Decoder`).
-/// - `PayloadTooLarge` is a *hard* error — it violates the protocol's absolute
+/// - `PayloadTooLarge` is a *hard* error  it violates the protocol's absolute
 ///   limit of [`FRAME_MAX_PAYLOAD_LENGTH`] (16 MiB, the maximum value of u24)
 ///   and must result in immediate connection termination.
 ///
 /// # See also
-/// - [`FrameCodecError`] for errors that occur later in the FSM (CRC mismatch, I/O).
+/// - [`crate::protocol::codec::FrameCodecError`] for errors that occur later in the FSM (CRC mismatch, I/O).
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FrameHeaderError {
     /// The input buffer contains fewer than [`FRAME_HEADER_SIZE`] (4) bytes,
@@ -46,7 +46,7 @@ pub enum FrameHeaderError {
     /// Contains the number of bytes actually available.
     ///
     /// # Recovery
-    /// This is a normal condition during stream fragmentation — the caller
+    /// This is a normal condition during stream fragmentation  the caller
     /// should wait for more data rather than treating it as a failure.
     #[error("Insufficient data to read the header: expected {FRAME_HEADER_SIZE} bytes, received {0}")]
     InsufficientData(usize),
@@ -55,7 +55,7 @@ pub enum FrameHeaderError {
     ///
     /// Contains the offending length value. Since the length field is u24,
     /// this error can only occur if a custom (lower) limit was configured
-    /// via [`FrameCodec::with_max_payload_size`], or if the raw bytes are corrupted.
+    /// via [`crate::protocol::codec::FrameCodec::with_max_payload_size`], or if the raw bytes are corrupted.
     #[error("Payload size limit exceeded:{0} > {FRAME_MAX_PAYLOAD_LENGTH}")]
     PayloadTooLarge(u32),
 }
@@ -65,9 +65,9 @@ pub enum FrameHeaderError {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
-    /// Client → Server: initiate connection with auth algorithm selection
+    /// Client � Server: initiate connection with auth algorithm selection
     Hello        = 0x00,
-    /// Server → Client: confirm connection with server challenge
+    /// Server � Client: confirm connection with server challenge
     Welcome      = 0x01,
     /// Bidirectional: grant credit for an address
     CreditGrant  = 0x02,
@@ -75,15 +75,15 @@ pub enum FrameType {
     Acknowledge  = 0x03,
     /// Bidirectional: notify about dropped frame
     Drop         = 0x04,
-    /// Client → Server: authentication response (HMAC)
+    /// Client � Server: authentication response (HMAC)
     AuthResponse = 0x05,
-    /// Server → Client: authentication result
+    /// Server � Client: authentication result
     AuthResult   = 0x06,
     /// Bidirectional: close connection
     Close        = 0x07,
-    /// Client → Server: request session resumption
+    /// Client � Server: request session resumption
     Resume       = 0x08,
-    /// Server → Client: confirm session resumption
+    /// Server � Client: confirm session resumption
     Resumed      = 0x09,
     /// Bidirectional: connectivity check
     Ping         = 0x10,
@@ -264,7 +264,7 @@ impl Frame {
     /// - A destination `address` (extracted by L2 for the credit system).
     /// - One or more serialized L3 `Message` instances (aggregated for efficiency).
     ///
-    /// The payload is typically constructed using [`encode_data_payload`], which
+    /// The payload is typically constructed using [`DataPayload`](super::payloads::DataPayload), which
     /// handles the serialization of the Data frame's internal structure.
     ///
     /// # Zero-Copy Semantics
@@ -276,49 +276,35 @@ impl Frame {
     /// # Arguments
     ///
     /// * `payload` - The serialized Data frame payload (including `session_sequence`,
-    ///   `address`, and `messages`). Use [`encode_data_payload`] to construct this.
+    ///   `address`, and `messages`). Use [`DataPayload::encode`](super::payloads::DataPayload::encode) to construct this.
     ///
     /// # Guarantees
     ///
     /// - **Frame type is fixed**: The `frame_type` is always `0xfe` (`FrameType::Data`).
     /// - **No validation**: The payload is not validated here; validation occurs during
-    ///   encoding (in `FrameCodec`) or decoding (in `decode_data_payload`).
+    ///   encoding (in `FrameCodec`) or decoding (in `ParsedDataPayload::decode`).
     ///
     /// # Example
     ///
     /// ```rust
-    /// use arcella_broker::protocol::{Frame, Message, TransferMode};
-    /// use arcella_broker::protocol::payloads::encode_data_payload;
+    /// use arcella_broker::protocol::Frame;
     /// use bytes::Bytes;
     ///
-    /// // Create a sample L3 message
-    /// let msg = Message::new(
-    ///     TransferMode::InOnly,
-    ///     [0u8; 32], // session_token
-    ///     [1u8; 16], // message_id
-    ///     [0u8; 4],  // sub_message_id
-    ///     0,         // priority
-    ///     64,        // ttl
-    ///     Bytes::from("test.msg"),
-    ///     Bytes::from("worker:1"),
-    ///     Bytes::new(), // reply_to (empty for InOnly)
-    ///     Bytes::from("payload data"),
-    /// ).unwrap();
+    /// // In a real application, the payload is constructed using `DataPayload`:
+    /// // use arcella_broker::protocol::payloads::DataPayload;
+    /// // let payload = DataPayload::new(session_seq, address, vec![msg]).encode().unwrap();
     ///
-    /// // Encode into a Data frame payload
-    /// let session_seq = 42;
-    /// let address = Bytes::from("worker:1");
-    /// let payload = encode_data_payload(session_seq, &address, &[msg]).unwrap();
+    /// // For this example, we use a dummy payload to demonstrate Frame::data.
+    /// let dummy_payload = Bytes::from("dummy serialized L3 data");
+    /// let frame = Frame::data(dummy_payload);
     ///
-    /// // Create the Data frame
-    /// let frame = Frame::data(payload);
     /// assert_eq!(frame.frame_type, 0xfe);
     /// ```
     ///
     /// # See Also
     ///
-    /// - [`encode_data_payload`] - Serialize L3 messages into a Data frame payload.
-    /// - [`decode_data_payload`] - Parse a Data frame payload back into L2 metadata and L3 messages.
+    /// - [`DataPayload`](super::payloads::DataPayload) - Serialize L3 messages into a Data frame payload.
+    /// - [`ParsedDataPayload`](super::payloads::ParsedDataPayload) - Parse a Data frame payload back into L2 metadata and L3 messages.
     /// - [`Frame::new`] - Generic frame constructor for other frame types.
     pub fn data(payload: Bytes) -> Self {
         Self {
@@ -421,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_insufficient_data() {
-        let short_bytes = [0xfe, 0x40, 0x42]; // Всего 3 байта
+        let short_bytes = [0xfe, 0x40, 0x42];
         let err = FrameHeader::from_bytes(&short_bytes).unwrap_err();
         assert_eq!(err, FrameHeaderError::InsufficientData(3));
     }

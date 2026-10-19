@@ -9,8 +9,8 @@
 
 use crate::protocol::{
     ProtocolError,
+    payloads::PayloadError,
     codec::FrameCodecError,
-    payloads::DataFrameError,
 };
 use crate::broker_core::{
     l2::UnackedBufferError,
@@ -67,9 +67,6 @@ pub enum TransportError {
     #[error("Frame codec error: {0}")]
     FrameCodec(#[from] FrameCodecError),
 
-    #[error("Data frame payload error: {0}")]
-    DataFrame(#[from] DataFrameError), 
-
     #[error("L2 unacked buffer error: {0}")]
     UnackedBuffer(#[from] UnackedBufferError),       
 
@@ -82,6 +79,14 @@ pub enum TransportError {
     /// or network connections rather than in-process memory.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<PayloadError> for TransportError {
+    fn from(err: PayloadError) -> Self {
+        // Либо добавьте вариант Payload(PayloadError) в TransportError,
+        // либо оберните в существующий, например, TransportError::Protocol(err.into())
+        TransportError::Protocol(err.into()) 
+    }
 }
 
 /// The standard result type for broker transport layer operations.

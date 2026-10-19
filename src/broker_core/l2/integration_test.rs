@@ -16,7 +16,7 @@ mod integration_tests {
 
     use crate::protocol::{
         {Frame, FrameType},
-        payloads::{decode_data_payload, encode_data_payload},
+        payloads::{DataPayload, ParsedDataPayload},
         test_utils,
     };
 
@@ -28,8 +28,8 @@ mod integration_tests {
             msg_payload,
         );
         
-        let data_payload = encode_data_payload(sequence, &address, &[msg]).unwrap();
-        Frame::data(data_payload)
+        let data_payload = DataPayload::new(sequence, address, vec![msg.clone()]);
+        Frame::data(data_payload.encode().unwrap())
     }
 
     fn create_ack_frame(sequence: u64) -> Frame {
@@ -63,7 +63,7 @@ mod integration_tests {
             let payload_bytes = Bytes::from(payload_str);
             let frame = create_data_frame(seq, Bytes::from(address), payload_bytes);
             
-            let parsed = decode_data_payload(&frame.payload).unwrap();
+            let parsed = ParsedDataPayload::decode(&frame.payload).unwrap();
             
             assert!(session.update_last_received(parsed.session_sequence));
 

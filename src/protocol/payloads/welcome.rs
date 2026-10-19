@@ -11,6 +11,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
 use super::super::server_limits::ServerLimits;
+use super::PayloadError;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WelcomePayloadError {
@@ -40,10 +41,10 @@ impl WelcomePayload {
         buf.freeze()
     }
 
-    pub fn decode(buf: &mut impl Buf) -> Result<Self, WelcomePayloadError> {
+    pub fn decode(buf: &mut impl Buf) -> Result<Self, PayloadError> {
         let min_size = 2 + 8 + 32 + 32 + 4 + ServerLimits::ENCODED_SIZE;
         if buf.remaining() < min_size {
-            return Err(WelcomePayloadError::IncompleteData);
+            return Err(WelcomePayloadError::IncompleteData.into());
         }
         let protocol_version = buf.get_u16_le();
         let session_id = buf.get_u64_le();

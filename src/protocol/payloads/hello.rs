@@ -23,7 +23,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
-use super::L2_PROTOCOL_VERSION;
+use super::{L2_PROTOCOL_VERSION, PayloadError};
 
 /// Errors specific to Hello payload parsing
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -79,42 +79,42 @@ impl HelloPayload {
     }
 
     /// Decodes the Hello payload from bytes
-    pub fn decode(buf: &mut impl Buf) -> Result<Self, HelloPayloadError> {
+    pub fn decode(buf: &mut impl Buf) -> Result<Self, PayloadError> {
         if buf.remaining() < 2 {
-            return Err(HelloPayloadError::IncompleteHeader);
+            return Err(HelloPayloadError::IncompleteHeader.into());
         }
 
         let protocol_version = buf.get_u16_le();
         if protocol_version != L2_PROTOCOL_VERSION {
-            return Err(HelloPayloadError::UnsupportedVersion(protocol_version));
+            return Err(HelloPayloadError::UnsupportedVersion(protocol_version).into());
         }
 
         if buf.remaining() < 2 {
-            return Err(HelloPayloadError::IncompleteHeader);
+            return Err(HelloPayloadError::IncompleteHeader.into());
         }
 
         let client_id_len = buf.get_u16_le() as usize;
         if buf.remaining() < client_id_len {
-            return Err(HelloPayloadError::IncompleteClientId { expected: client_id_len, available: buf.remaining() });
+            return Err(HelloPayloadError::IncompleteClientId { expected: client_id_len, available: buf.remaining() }.into());
         }
         let client_id = buf.copy_to_bytes(client_id_len);
 
         if buf.remaining() < 1 {
-            return Err(HelloPayloadError::IncompleteHeader);
+            return Err(HelloPayloadError::IncompleteHeader.into());
         }
         let algorithm = buf.get_u8();
 
         if buf.remaining() < 2 {
-            return Err(HelloPayloadError::IncompleteHeader);
+            return Err(HelloPayloadError::IncompleteHeader.into());
         }
         let auth_data_len = buf.get_u16_le() as usize;
         if buf.remaining() < auth_data_len {
-            return Err(HelloPayloadError::IncompleteAuthData { expected: auth_data_len, available: buf.remaining() });
+            return Err(HelloPayloadError::IncompleteAuthData { expected: auth_data_len, available: buf.remaining() }.into());
         }
         let auth_data = buf.copy_to_bytes(auth_data_len);
 
         if buf.remaining() < 4 {
-            return Err(HelloPayloadError::IncompleteHeader);
+            return Err(HelloPayloadError::IncompleteHeader.into());
         }
         let capabilities = buf.get_u32_le();
 

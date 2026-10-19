@@ -91,7 +91,7 @@ mod tests {
             for i in 0..total_frames {
                 let msg = create_test_msg(i as u32);
                 let _seq = client_endpoint
-                    .send_data(Bytes::from("worker:1"), &[msg])
+                    .send_data(Bytes::from("worker:1"), vec![msg])
                     .await
                     .expect("Client send_data failed");
                 

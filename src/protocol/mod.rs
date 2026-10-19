@@ -41,6 +41,8 @@ pub use server_limits::{
     DEFAULT_COLD_CREDIT,
 };
 
+use payloads::PayloadError;
+
 /// Utility functions and helpers for testing the broker.
 #[allow(missing_docs)]
 #[cfg(test)]
@@ -114,4 +116,8 @@ pub enum ProtocolError {
     /// handle both address and message errors uniformly.
     #[error("Message error: {0}")]
     MessageError (#[from] MessageError),
+
+    /// A wrapped [`PayloadError`] from the L2 layer.
+    #[error("Payload error: {0}")]
+    PayloadError (#[from] PayloadError),
 }

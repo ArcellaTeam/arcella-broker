@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::protocol::{
     Message,
     {Frame, FrameType},
-    payloads::encode_data_payload,
+    payloads::DataPayload,
 };
 use super::super::super::l2::{SessionState, UnackedBuffer};
 use super::super::TransportError;
@@ -118,10 +118,10 @@ where
     ///
     /// # Backpressure and Flow Control
     ///
-    /// In the current implementation (Stage 2), this method does not enforce
-    /// backpressure based on the `UnackedBuffer` size. The buffer can grow
-    /// unbounded if the peer does not send acknowledgments. This will be
-    /// addressed in Stage 9 with the full credit system (hot_credit limit).
+    /// The method provides natural backpressure: the size of `UnackedBuffer`
+    /// is strictly limited by the `hot_credit` value. If the buffer is full (all frames
+    /// are in the in-flight status), the `push` method will return a `BufferFull` error,
+    /// preventing unbounded memory growth (O(1) guarantee).
     ///
     /// # Guarantees
     ///
@@ -150,11 +150,12 @@ where
     pub async fn send_data(
         &mut self,
         address: Bytes,
-        messages: &[Message],
+        messages: Vec<Message>,
     ) -> Result<u64, TransportError> {
         let seq = self.session.next_sequence();
-        let payload = encode_data_payload(seq, &address, messages)?;
-        let frame = Frame::data(payload);
+        let payload = DataPayload::new(seq, address, messages);
+        let encoded = payload.encode()?;
+        let frame = Frame::data(encoded);
 
         self.transport.send(frame.clone()).await?;
         self.unacked_buffer
