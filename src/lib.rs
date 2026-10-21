@@ -50,4 +50,4 @@ pub(crate) mod server;
 /// Utility functions and helpers for testing the broker.
 #[allow(missing_docs)]
 #[cfg(test)]
-mod test_utils;
+pub mod test_utils;

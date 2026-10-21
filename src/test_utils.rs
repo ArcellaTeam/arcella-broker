@@ -8,6 +8,7 @@
 // except according to those terms.
 
 use std::sync::Arc;
+use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::{
     broker::Broker,
@@ -25,4 +26,18 @@ pub fn test_client(address: String) -> Result<BrokerClient, BrokerError> {
     let broker = Arc::new(Broker::new(broker_config));
     let client_config = ClientConfig::default();
     broker.client(client_config, address)
+}
+
+pub fn init_tracing(directives: &str) {
+    // Attempt to read the logging level from RUST_LOG,
+    // if not set, default to "info"
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(directives));
+
+    fmt()
+        .with_env_filter(env_filter)
+        .with_thread_ids(true)       // Useful for multithreaded tests (shows thread ID)
+        .with_target(true)           // Optional: hides the long module path for brevity
+        .with_level(true)            // Shows the level (DEBUG, TRACE, INFO)
+        .init();
 }

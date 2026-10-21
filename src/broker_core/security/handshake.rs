@@ -21,30 +21,28 @@ use crate::protocol::{
     },
 };
 
-use crate::broker_core::transport::TransportError;
-
 #[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
-    #[error("authentication failed: {0}")]
+    #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
 
-    #[error("protocol version mismatch: expected {expected}, got {got}")]
+    #[error("Protocol version mismatch: expected {expected}, got {got}")]
     ProtocolVersionMismatch { expected: u16, got: u16 },
 
-    #[error("connection closed during handshake")]
+    #[error("Connection closed during handshake")]
     ConnectionClosed,
 
-    #[error("unsupported authentication algorithm: 0x{0:02x}")]
+    #[error("Unsupported authentication algorithm: 0x{0:02x}")]
     UnsupportedAlgorithm(u8),
 
-    #[error("payload decode error: {0}")]
+    #[error("Payload decode error: {0}")]
     PayloadDecode(String),
+
+    #[error("Get unexpected frame: {0}")]
+    UnexpectedFrame(String),
 
     #[error("Cryptographic RNG failure")]
     RngFailure(#[from] getrandom::Error),
-
-    #[error("transport error: {0}")]
-    Transport(#[from] TransportError),
 }
 
 /// Server-side handshake handler.
@@ -144,13 +142,17 @@ impl HandshakeHandler {
     /// 3. Returns AuthResult with status = 0 (success).
     pub fn process_auth_response(
         &self,
+        expected_session_id: u64,
         auth_response: &AuthResponsePayload,
     ) -> Result<AuthResultPayload, HandshakeError> {
-        // В Этапе 5 здесь будет проверка: 
-        // if !self.session_manager.exists(auth_response.session_id) { return Err(...) }
-        
-        // Для Этапа 4: просто принимаем любой запрос для алгоритма None, 
-        // так как криптография отключена.
+        // Strict check: the client must respond with the session_id we issued to it
+        if auth_response.session_id != expected_session_id {
+            return Err(HandshakeError::AuthenticationFailed(
+                "Session ID mismatch in AuthResponse".into(),
+            ));
+        }
+
+        // TODO: In Stage 11, verification of HMAC(client_secret, server_challenge || client_nonce) will be added here
         
         Ok(AuthResultPayload {
             session_id: auth_response.session_id,
@@ -304,16 +306,18 @@ mod tests {
     #[test]
     fn test_process_auth_response_success_none() {
         let handler = HandshakeHandler::new();
+
+        let expected_session_id = 1;
         
         let auth_response = AuthResponsePayload {
-            session_id: 1,
+            session_id: expected_session_id,
             client_nonce: [0xBB; 32],
-            response: Bytes::new(), // Пустой response для алгоритма None
+            response: Bytes::new(), // Empty response for the None algorithm
         };
 
-        let result = handler.process_auth_response(&auth_response).unwrap();
+        let result = handler.process_auth_response(expected_session_id, &auth_response).unwrap();
 
-        assert_eq!(result.session_id, 1);
+        assert_eq!(result.session_id, expected_session_id);
         assert_eq!(result.status, 0); // success
         assert!(result.error_message.is_empty());
     }

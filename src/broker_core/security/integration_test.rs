@@ -109,7 +109,7 @@ mod handshake_tests {
             let auth_response = AuthResponsePayload::decode(&mut auth_response_payload).unwrap();
 
             // 4. Process AuthResponse → AuthResult
-            let auth_result = handshake_handler.process_auth_response(&auth_response).unwrap();
+            let auth_result = handshake_handler.process_auth_response(welcome.session_id, &auth_response).unwrap();
             assert_eq!(auth_result.status, 0); // success
             let auth_result_frame = Frame::new(FrameType::AuthResult as u8, auth_result.encode());
             server_endpoint.send_raw_frame(auth_result_frame).await.unwrap();
@@ -242,7 +242,7 @@ mod handshake_tests {
             let auth_response_frame = server_endpoint.recv().await.unwrap().unwrap();
             let mut auth_response_payload = auth_response_frame.payload.clone();
             let auth_response = AuthResponsePayload::decode(&mut auth_response_payload).unwrap();
-            let auth_result = handshake_handler.process_auth_response(&auth_response).unwrap();
+            let auth_result = handshake_handler.process_auth_response(welcome.session_id, &auth_response).unwrap();
             server_endpoint
                 .send_raw_frame(Frame::new(FrameType::AuthResult as u8, auth_result.encode()))
                 .await

@@ -292,7 +292,7 @@ impl Frame {
     ///
     /// // In a real application, the payload is constructed using `DataPayload`:
     /// // use arcella_broker::protocol::payloads::DataPayload;
-    /// // let payload = DataPayload::new(session_seq, address, vec![msg]).encode().unwrap();
+    /// // let payload = DataPayload::new(session_seq, address, &[msg]).encode().unwrap();
     ///
     /// // For this example, we use a dummy payload to demonstrate Frame::data.
     /// let dummy_payload = Bytes::from("dummy serialized L3 data");

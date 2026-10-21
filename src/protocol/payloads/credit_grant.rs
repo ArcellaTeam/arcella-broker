@@ -31,6 +31,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
+use super::PayloadError;
+
 /// Maximum allowed address length in a CreditGrant payload (1024 bytes).
 /// Matches the L3 Message address limit for consistency.
 pub const MAX_CREDIT_GRANT_ADDRESS_LEN: usize = 1024;
@@ -143,12 +145,12 @@ impl CreditGrantPayload {
     /// Returns `CreditGrantPayloadError::IncompleteHeader` or
     /// `CreditGrantPayloadError::IncompleteAddress` if the payload
     /// is truncated or malformed.
-    pub fn decode(payload: &Bytes) -> Result<Self, CreditGrantPayloadError> {
+    pub fn decode(payload: &Bytes) -> Result<Self, PayloadError> {
         let mut buf = payload.clone();
 
         // Minimum size: 8 (seq) + 2 (addr_len) + 0 (addr) + 1 (type) + 4 (amount) = 15
         if buf.remaining() < 8 + 2 {
-            return Err(CreditGrantPayloadError::IncompleteHeader);
+            return Err(CreditGrantPayloadError::IncompleteHeader.into());
         }
 
         let session_sequence = buf.get_u64_le();
@@ -159,7 +161,7 @@ impl CreditGrantPayload {
             return Err(CreditGrantPayloadError::IncompleteAddress {
                 expected: addr_len + 1 + 4,
                 available: buf.remaining(),
-            });
+            }.into());
         }
 
         let address = buf.copy_to_bytes(addr_len);
@@ -182,6 +184,7 @@ impl CreditGrantPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::PayloadError;
 
     #[test]
     fn test_encode_decode_roundtrip_hot() {
@@ -242,7 +245,7 @@ mod tests {
     fn test_decode_incomplete_header() {
         let truncated = Bytes::from(vec![0u8; 5]); // Need at least 10 bytes
         let result = CreditGrantPayload::decode(&truncated);
-        assert!(matches!(result, Err(CreditGrantPayloadError::IncompleteHeader)));
+        assert!(matches!(result, Err(PayloadError::CreditGrant(CreditGrantPayloadError::IncompleteHeader))));
     }
 
     #[test]
@@ -257,7 +260,7 @@ mod tests {
         let result = CreditGrantPayload::decode(&truncated);
         assert!(matches!(
             result,
-            Err(CreditGrantPayloadError::IncompleteAddress { .. })
+            Err(PayloadError::CreditGrant(CreditGrantPayloadError::IncompleteAddress { .. }))
         ));
     }
 

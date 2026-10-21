@@ -40,7 +40,7 @@ const MESSAGES_PER_SENDER: usize = 1_000_000;
 
 const TOTAL_MESSAGES: usize = NUM_SENDERS * MESSAGES_PER_SENDER;
 
-fn init_tracing() {
+pub fn init_tracing() {
     // Attempt to read the logging level from RUST_LOG,
     // if not set, default to "info"
     let env_filter = EnvFilter::try_from_default_env()

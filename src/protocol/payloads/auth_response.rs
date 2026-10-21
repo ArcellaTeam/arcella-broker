@@ -10,6 +10,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
+use super::PayloadError;
+
 /// Errors specific to AuthResponse payload parsing
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthResponsePayloadError {
@@ -48,20 +50,20 @@ impl AuthResponsePayload {
     }
 
     /// Decodes the AuthResponse payload from bytes
-    pub fn decode(buf: &mut impl Buf) -> Result<Self, AuthResponsePayloadError> {
+    pub fn decode(buf: &mut impl Buf) -> Result<Self, PayloadError> {
         if buf.remaining() < 8 {
-            return Err(AuthResponsePayloadError::IncompleteHeader);
+            return Err(AuthResponsePayloadError::IncompleteHeader.into());
         }
         let session_id = buf.get_u64_le();
 
         if buf.remaining() < 32 {
-            return Err(AuthResponsePayloadError::IncompleteNonce);
+            return Err(AuthResponsePayloadError::IncompleteNonce.into());
         }
         let mut client_nonce = [0u8; 32];
         buf.copy_to_slice(&mut client_nonce);
 
         if buf.remaining() < 2 {
-            return Err(AuthResponsePayloadError::IncompleteHeader);
+            return Err(AuthResponsePayloadError::IncompleteHeader.into());
         }
         let response_len = buf.get_u16_le() as usize;
         
@@ -69,7 +71,7 @@ impl AuthResponsePayload {
             return Err(AuthResponsePayloadError::IncompleteResponse { 
                 expected: response_len, 
                 available: buf.remaining() 
-            });
+            }.into());
         }
         let response = buf.copy_to_bytes(response_len);
 

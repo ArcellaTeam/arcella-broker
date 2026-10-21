@@ -15,6 +15,7 @@ use crate::protocol::{
 use crate::broker_core::{
     l2::UnackedBufferError,
     registry::RegistryError,
+    security::HandshakeError,
 };
 
 /// Errors that occur at the broker's transport level during message delivery.
@@ -72,7 +73,10 @@ pub enum TransportError {
 
     #[error("Operation is unsupported")]
     Unsupported,
-    
+
+    #[error("Handshake error: {0}")]
+    Handshake(#[from] HandshakeError),
+
     /// A low-level I/O error.
     ///
     /// Characteristic of transport implementations that use IPC (Unix sockets)
@@ -83,8 +87,6 @@ pub enum TransportError {
 
 impl From<PayloadError> for TransportError {
     fn from(err: PayloadError) -> Self {
-        // Либо добавьте вариант Payload(PayloadError) в TransportError,
-        // либо оберните в существующий, например, TransportError::Protocol(err.into())
         TransportError::Protocol(err.into()) 
     }
 }

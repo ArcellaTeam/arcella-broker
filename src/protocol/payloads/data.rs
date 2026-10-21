@@ -229,9 +229,6 @@ impl<'a> DataPayload<'a> {
 
         // 2. address_length (u16 LE) + address bytes
         let address_len = self.address.len();
-        if address_len > u16::MAX as usize {
-            return Err(DataPayloadError::AddressTooLong(address_len).into());
-        }
         buf.put_u16_le(address_len as u16);
         buf.put_slice(&self.address);
 

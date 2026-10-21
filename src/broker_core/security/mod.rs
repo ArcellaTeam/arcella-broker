@@ -7,7 +7,11 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-pub mod handshake;
+mod handshake;
+mod session_manager;
+
+pub use handshake::{HandshakeError, HandshakeHandler};
+pub use session_manager::{SessionContext, SessionManager};
 
 #[cfg(test)]
 mod integration_test;

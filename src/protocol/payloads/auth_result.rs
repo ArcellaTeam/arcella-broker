@@ -10,6 +10,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
+use super::PayloadError;
+
 /// Errors specific to AuthResult payload parsing
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthResultPayloadError {
@@ -45,15 +47,15 @@ impl AuthResultPayload {
     }
 
     /// Decodes the AuthResult payload from bytes
-    pub fn decode(buf: &mut impl Buf) -> Result<Self, AuthResultPayloadError> {
+    pub fn decode(buf: &mut impl Buf) -> Result<Self, PayloadError> {
         if buf.remaining() < 9 { // 8 (session_id) + 1 (status)
-            return Err(AuthResultPayloadError::IncompleteHeader);
+            return Err(AuthResultPayloadError::IncompleteHeader.into());
         }
         let session_id = buf.get_u64_le();
         let status = buf.get_u8();
 
         if buf.remaining() < 2 {
-            return Err(AuthResultPayloadError::IncompleteHeader);
+            return Err(AuthResultPayloadError::IncompleteHeader.into());
         }
         let msg_len = buf.get_u16_le() as usize;
         
@@ -61,7 +63,7 @@ impl AuthResultPayload {
             return Err(AuthResultPayloadError::IncompleteErrorMessage { 
                 expected: msg_len, 
                 available: buf.remaining() 
-            });
+            }.into());
         }
         let error_message = buf.copy_to_bytes(msg_len);
 

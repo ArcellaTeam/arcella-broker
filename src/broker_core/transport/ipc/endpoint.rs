@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::protocol::{
@@ -69,6 +69,20 @@ where
             unacked_buffer,
         }
     }
+
+    /// Creates an endpoint with an existing `IPCTransport` (for saving buffer) 
+    /// and with an existing session state (for session resumption).
+    pub fn with_transport_and_session(
+        transport: IPCTransport<S>,
+        session: Arc<SessionState>,
+        unacked_buffer: Arc<UnackedBuffer>,
+    ) -> Self {
+        Self {
+            transport,
+            session,
+            unacked_buffer,
+        }
+    }    
 
     /// Sends a CreditGrant frame (0x02) to the peer.
     ///

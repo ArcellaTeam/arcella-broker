@@ -16,7 +16,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "arcella-broker"
 path = "src/bin/arcella-broker.rs"
-required-features = ["server"]
+required-features = ["bin"]
 
 [dependencies]
 anyhow = "1"
@@ -39,7 +39,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json",
 tempfile = "3.27"
 
 [features]
-default = ["client", "ipc"]
+default = ["client", "ipc", "server"]
 client = []
 ipc = ["tokio/net"]
 server = ["client"] 
+bin = [] 
