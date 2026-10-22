@@ -112,7 +112,7 @@ impl HandshakeHandler {
         }
 
         // 1. Generating session_id (monotonically increasing u64)
-        let session_id = self.session_counter.fetch_add(1, Ordering::SeqCst);
+        let session_id = self.session_counter.fetch_add(1, Ordering::Relaxed);
 
         // 2. Generating session_token (32 bytes, CSPRNG)
         let mut session_token = [0u8; 32];

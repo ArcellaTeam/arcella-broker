@@ -139,20 +139,13 @@ where
     ///
     /// 1. **Sequence number generation**: Calls `session.next_sequence()` to obtain
     ///    a monotonically increasing sequence number for this frame.
-    /// 2. **Payload encoding**: Calls `encode_data_payload(session_sequence, address, messages)`
-    ///    to serialize the L3 messages into the Data frame payload format:
-    ///    ```text
-    ///    - session_sequence: u64 LE
-    ///    - address_length: u16 LE
-    ///    - address: [u8; address_length]
-    ///    - message_count: u16 LE
-    ///    - messages: [Message; message_count]
-    ///    ```
-    /// 3. **Frame creation**: Wraps the encoded payload in a `Frame` with type `0xfe` (Data).
-    /// 4. **Buffering**: Stores the frame in `UnackedBuffer` with the mapping
-    ///    `session_sequence -> frame` for potential retransmission (if the peer
-    ///    does not acknowledge receipt).
-    /// 5. **Transmission**: Sends the frame over the underlying stream via `IPCTransport::send()`.
+    /// 2. **Payload encoding**: Calls `DataPayload::new` to serialize the L3 messages 
+    ///    into the Data frame payload format.
+    /// 3. **Buffering (with Rollback guarantee)**: Stores the frame in `UnackedBuffer` 
+    ///    with the mapping `session_sequence -> frame`. If the subsequent network send 
+    ///    fails, the frame is immediately removed from the buffer to prevent phantom 
+    ///    slots from blocking the `hot_credit` window.
+    /// 4. **Transmission**: Sends the frame over the underlying stream via `IPCTransport::send()`.
     ///
     /// # Arguments
     ///
@@ -170,56 +163,46 @@ where
     ///
     /// - `TransportError::DataFrame(err)`: If the payload encoding fails (e.g.,
     ///   address too long).
-    /// - `TransportError::FrameCodec(err)`: If the frame encoding fails (e.g.,
-    ///   payload too large).
+    /// - `TransportError::UnackedBuffer(err)`: If the buffer is full or sequence is invalid.
     /// - `TransportError::Io(io_error)`: If the stream write fails (e.g., connection
-    ///   closed, broken pipe).
+    ///   closed, broken pipe). In this case, the frame is rolled back from the buffer.
     ///
     /// # Backpressure and Flow Control
     ///
     /// The method provides natural backpressure: the size of `UnackedBuffer`
-    /// is strictly limited by the `hot_credit` value. If the buffer is full (all frames
-    /// are in the in-flight status), the `push` method will return a `BufferFull` error,
-    /// preventing unbounded memory growth (O(1) guarantee).
+    /// is strictly limited by the `hot_credit` value. If the buffer is full, the `push` 
+    /// method will return an error *before* any I/O occurs, preventing unbounded 
+    /// memory growth (O(1) guarantee).
     ///
     /// # Guarantees
     ///
-    /// - **Atomic operation**: The frame is either fully sent or an error is returned.
-    ///   Partial sends are not possible.
+    /// - **Atomic operation**: The frame is either fully sent and buffered, or an 
+    ///   error is returned and the buffer state is cleanly rolled back.
     /// - **Sequence ordering**: Each call to `send_data()` increments the sequence
     ///   number, ensuring strict ordering of frames.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use arcella_broker::protocol::Message;
-    /// use bytes::Bytes;
-    ///
-    /// let messages = vec![
-    ///     create_message("test.msg", Bytes::from("hello")),
-    ///     create_message("test.msg", Bytes::from("world")),
-    /// ];
-    ///
-    /// let sequence = endpoint.send_data(Bytes::from("worker:1"), &messages).await?;
-    /// println!("Sent frame with sequence {}", sequence);
-    ///
-    /// // Later, when acknowledgment is received:
-    /// endpoint.acknowledge(sequence);
-    /// ```
     pub async fn send_data(
         &mut self,
         address: Bytes,
         messages: &[Message],
     ) -> Result<u64, TransportError> {
         let seq = self.session.next_sequence();
-        let payload = DataPayload::new(seq, address, &messages);
+        let payload = DataPayload::new(seq, address.clone(), messages);
         let encoded = payload.encode()?;
         let frame = Frame::data(encoded);
 
-        self.transport.send(frame.clone()).await?;
+        // 1. Reserve slot in UnackedBuffer FIRST (Backpressure guarantee)
         self.unacked_buffer
-            .push(seq, frame)
+            .push(seq, frame.clone())
             .map_err(TransportError::UnackedBuffer)?;
+
+        // 2. Attempt to send over the network
+        if let Err(e) = self.transport.send(frame).await {
+            // 3. ROLLBACK: If send fails, remove the frame from the buffer.
+            // This prevents a "phantom" frame from permanently occupying a slot
+            // and blocking the hot_credit window.
+            self.unacked_buffer.remove(seq);
+            return Err(e);
+        }
 
         Ok(seq)
     }
@@ -255,6 +238,10 @@ where
     pub fn acknowledge(&self, sequence: u64) -> bool {
         self.unacked_buffer.acknowledge(sequence)
     }
+
+    pub fn get_frames_for_retransmission(&self) -> Vec<(u64, Frame)> {
+        self.unacked_buffer.get_unacked_frames()
+    }    
 
     /// Returns a reference to the session state.
     pub fn session(&self) -> &Arc<SessionState> {
