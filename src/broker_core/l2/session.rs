@@ -156,9 +156,36 @@ impl SessionState {
     /// assert_eq!(session.next_sequence(), 2);
     /// assert_eq!(session.next_sequence(), 3);
     /// ```
+    #[inline]
     pub fn next_sequence(&self) -> u64 {
         self.next_session_sequence.fetch_add(1, Ordering::Relaxed)
     }
+
+    /// Returns the next sequence number WITHOUT consuming it.
+    ///
+    /// This method is used by `IPCEndpoint::send_data` to perform a
+    /// **zero-allocation backpressure check** before committing to
+    /// frame encoding and transmission.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arcella_broker::broker_core::l2::SessionState;
+    ///
+    /// let session = SessionState::new(1);
+    ///
+    /// // Peek does not increment the counter
+    /// assert_eq!(session.peek_next_sequence(), 1);
+    /// assert_eq!(session.peek_next_sequence(), 1); // Still 1
+    ///
+    /// // next_sequence() consumes the number
+    /// assert_eq!(session.next_sequence(), 1); // Returns 1, counter becomes 2
+    /// assert_eq!(session.peek_next_sequence(), 2); // Now peek returns 2
+    /// ```
+    #[inline]
+    pub fn peek_next_sequence(&self) -> u64 {
+        self.next_session_sequence.load(Ordering::Relaxed)
+    }    
 
     /// Updates the last received sequence number if the provided sequence is greater
     /// than the current value.
@@ -257,6 +284,7 @@ impl SessionState {
     /// session.next_sequence(); // Generates 1, counter becomes 2
     /// assert_eq!(session.current_send_sequence(), 2); // Next frame will be 2
     /// ```
+    #[inline]
     pub fn current_send_sequence(&self) -> u64 {
         self.next_session_sequence.load(Ordering::Relaxed)
     }
@@ -290,6 +318,7 @@ impl SessionState {
     /// session.update_last_received(5);
     /// assert_eq!(session.last_received_sequence(), 5);
     /// ```
+    #[inline]
     pub fn last_received_sequence(&self) -> u64 {
         self.last_received_sequence.load(Ordering::Relaxed)
     }

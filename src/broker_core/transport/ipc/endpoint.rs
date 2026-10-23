@@ -17,7 +17,7 @@ use crate::protocol::{
     {Frame, FrameType},
     payloads::{PayloadError, CreditGrantPayload, DataPayload},
 };
-use super::super::super::l2::{SessionState, UnackedBuffer};
+use super::super::super::l2::{SessionState, UnackedBuffer, UnackedBufferError};
 use super::super::TransportError;
 use super::transport::IPCTransport;
 
@@ -185,19 +185,36 @@ where
         address: Bytes,
         messages: &[Message],
     ) -> Result<u64, TransportError> {
+        // 1. Quick check WITHOUT allocations
+        let next_seq = self.session.peek_next_sequence();
+        if self.unacked_buffer.is_full() {
+            return Err(UnackedBufferError::SlotOccupied { 
+                sequence: next_seq, 
+                index: (next_seq % self.unacked_buffer.capacity() as u64) as usize 
+            }.into());
+        }
+
+        // 2. Only now do we allocate
         let seq = self.session.next_sequence();
         let payload = DataPayload::new(seq, address.clone(), messages);
         let encoded = payload.encode()?;
         let frame = Frame::data(encoded);
 
-        // 1. Reserve slot in UnackedBuffer FIRST (Backpressure guarantee)
+        // 3. Reserve slot in UnackedBuffer FIRST (Backpressure guarantee)
         self.unacked_buffer
             .push(seq, frame.clone())
-            .map_err(TransportError::UnackedBuffer)?;
+            .map_err(|e| {
+                debug_assert!(
+                    !matches!(e, UnackedBufferError::SequenceTooOld { .. }),
+                    "Protocol violation: attempted to send sequence {} which is <= base_sequence",
+                    seq
+                );
+                TransportError::UnackedBuffer(e)
+            })?;
 
-        // 2. Attempt to send over the network
+        // 4. Attempt to send over the network
         if let Err(e) = self.transport.send(frame).await {
-            // 3. ROLLBACK: If send fails, remove the frame from the buffer.
+            // 5. ROLLBACK: If send fails, remove the frame from the buffer.
             // This prevents a "phantom" frame from permanently occupying a slot
             // and blocking the hot_credit window.
             self.unacked_buffer.remove(seq);

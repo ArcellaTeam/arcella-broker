@@ -105,6 +105,7 @@ impl UnackedBuffer {
     /// 
     /// - `true` if the frame was found and removed.
     /// - `false` if the slot was empty or the sequence number did not match.
+    #[inline]
     pub fn acknowledge(&self, sequence: u64) -> bool {
         self.remove(sequence)
     }
@@ -163,24 +164,36 @@ impl UnackedBuffer {
         unacked_frames
     }
 
+    #[inline]
     pub fn base_sequence(&self) -> Option<u64> {
         let inner = self.inner.lock();
         inner.base_sequence
     }    
 
     /// Returns the number of occupied slots.
+    #[inline]
     pub fn len(&self) -> usize {
         let inner = self.inner.lock();
         inner.occupied_count
     }
 
     /// Returns `true` if the buffer is empty.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         let inner = self.inner.lock();
         inner.occupied_count == 0
     }
 
+    /// Returns true if the buffer is at full capacity.
+    /// O(1) operation, no allocations.
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.occupied_count >= self.capacity
+    }    
+
     /// Returns the capacity of the buffer.
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
