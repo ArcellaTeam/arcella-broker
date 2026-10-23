@@ -9,7 +9,7 @@
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
+    use bytes::{Buf, Bytes};
     use std::path::Path;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -25,13 +25,18 @@ mod tests {
 
     use crate::protocol::{
         payloads::{
-            AuthResponsePayload, AuthResultPayload, CreditGrantPayload, HelloPayload,
-            WelcomePayload, L2_PROTOCOL_VERSION,
+            HelloPayload,
+            WelcomePayload,
+            AuthResponsePayload,
+            AuthResultPayload,
+            CreditGrantPayload,
+            DataPayload,
+            L2_PROTOCOL_VERSION,
         },
         Frame, FrameType, ServerLimits,
     };
 
-    use crate::test_utils::init_tracing;
+    use crate::test_utils::{init_tracing, dummy_in_only_message};
     
     use super::super::{config::ServerConfig, BrokerServer};
 
@@ -39,7 +44,7 @@ mod tests {
     // Helpers
     // =========================================================================
 
-    /// Создаёт `ServerConfig` с короткими таймаутами для ускорения тестов.
+    /// Creates a `ServerConfig` with short timeouts to speed up tests.
     fn fast_test_config(socket_path: std::path::PathBuf) -> ServerConfig {
         ServerConfig {
             socket_path,
@@ -49,15 +54,15 @@ mod tests {
                 session_ttl_ms: 60_000,
                 ..ServerLimits::default()
             },
-            session_timeout_ms: 2000, // 200ms для теста таймаута
-            gc_interval_ms: 50,      // GC каждые 50ms
+            session_timeout_ms: 2000, // 2000ms for the timeout test
+            gc_interval_ms: 50,      // GC every 50ms
         }
     }
 
-    /// Запускает `BrokerServer` в фоновой tokio-задаче.
+    /// Starts `BrokerServer` in a background tokio task.
     ///
-    /// Возвращает `Arc<BrokerServer>` (для вызова `shutdown()` и доступа к
-    /// `session_manager`) и `JoinHandle` задачи сервера.
+    /// Returns `Arc<BrokerServer> (for calling `shutdown()` and accessing
+    /// `session_manager`) and the server task's `JoinHandle`.
     async fn spawn_test_server(
         config: ServerConfig,
     ) -> (Arc<BrokerServer>, tokio::task::JoinHandle<anyhow::Result<()>>) {
@@ -75,23 +80,23 @@ mod tests {
         let server_clone = Arc::clone(&server);
         let handle = tokio::spawn(async move { server_clone.run().await });
 
-        // Даём серверу время забиндить сокет
+        // Give the server time to bind the socket
         sleep(Duration::from_millis(50)).await;
 
         (server, handle)
     }
 
-    /// Выполняет **клиентскую сторону** полного рукопожатия:
+    /// Performs the client side of the full handshake:
     /// `Hello → Welcome → AuthResponse → AuthResult → CreditGrant (client) → CreditGrant (server)`.
     ///
-    /// Возвращает `IPCEndpoint` и полученный `WelcomePayload` (с `session_id` и `limits`).
+    /// Returns `IPCEndpoint` and the received `WelcomePayload` (with `session_id` and `limits`).
     async fn client_handshake(
         socket_path: &Path,
     ) -> anyhow::Result<(IPCEndpoint<UnixStream>, WelcomePayload)> {
         let connector = UdsConnector::new(socket_path);
         let stream = connector.connect().await?;
 
-        // Фаза 1: используем голый транспорт для рукопожатия
+        // Phase 1: use the bare transport for the handshake
         let mut transport = IPCTransport::new(stream);
         tracing::info!("Connected to server");
 
@@ -139,7 +144,7 @@ mod tests {
             "Received AuthResult from server"
         );        
 
-        // Фаза 2: создаём endpoint ПОСЛЕ успешной аутентификации
+        // Phase 2: create the endpoint AFTER successful authentication
         let l2_state = Arc::new(SessionState::new(1));
         let unacked_buffer = Arc::new(UnackedBuffer::new(welcome.limits.hot_credit as usize));
         
@@ -177,26 +182,26 @@ mod tests {
     // Tests
     // =========================================================================
 
-    /// **Test 1:** Полное рукопожатие + регистрация сессии.
+    /// **Test 1:** Full handshake + session registration.
     ///
-    /// Проверяет, что:
-    /// - После handshake `active_sessions_count() == 1` и `get_session(id)` возвращает `Some`.
-    /// - После закрытия соединения клиентом сессия удаляется из `SessionManager`.
+    /// Verifies that:
+    /// - After the handshake `active_sessions_count() == 1`and `get_session(id)` returns `Some`.
+    /// - After the client closes the connection, the session is removed from `SessionManager`.
     #[tokio::test]
     async fn test_full_handshake_session_registered() {
         init_tracing("trace");
 
         let temp_dir = tempdir().unwrap();
-        let socket_path = temp_dir.path().join("test.sock");
+        let socket_path = temp_dir.path().join("test.sock.1");
         let config = fast_test_config(socket_path.clone());
 
         let (server, server_handle) = spawn_test_server(config).await;
         let session_manager = server.session_manager();
 
-        // Изначально нет активных сессий
+        // Initially there are no active sessions
         assert_eq!(session_manager.active_sessions_count(), 0);
 
-        // Клиент подключается и проходит handshake
+        // The client connects and completes the handshake
         let (endpoint, welcome) = client_handshake(&socket_path).await.unwrap();
         tracing::info!(
             session_id = welcome.session_id,
@@ -205,10 +210,10 @@ mod tests {
 
         let session_id = welcome.session_id;
 
-        // Даём серверу время зарегистрировать сессию в main loop
+        // Give the server time to register the session in the main loop
         sleep(Duration::from_millis(50)).await;
 
-        // Сессия должна быть зарегистрирована
+        // The session must be registered
         assert_eq!(
             session_manager.active_sessions_count(),
             1,
@@ -219,17 +224,22 @@ mod tests {
             "Session must be retrievable by id"
         );
 
-        // Клиент корректно закрывает соединение
+        // The client closes the connection gracefully
         drop(endpoint);
         tracing::info!(
             session_id = welcome.session_id,
             "Droped endpoint"
         );         
 
-        // Даём серверу время обнаружить разрыв и удалить сессию
-        sleep(Duration::from_millis(150)).await;
+        // Waiting for session removal with polling
+        for _ in 0..10 {
+            sleep(Duration::from_millis(50)).await;
+            if server.session_manager().active_sessions_count() == 0 {
+                break;
+            }
+        }
 
-        // Сессия должна быть удалена
+        // The session must be removed
         assert_eq!(
             session_manager.active_sessions_count(),
             0,
@@ -240,4 +250,194 @@ mod tests {
         let _ = server_handle.await;
     }
 
+    /// **Test 2:** Data before handshake → Error → disconnect
+    #[tokio::test]
+    async fn test_data_before_handshake_rejected() {
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock.2");
+        let config = fast_test_config(socket_path.clone());
+
+        let (server, server_handle) = spawn_test_server(config).await;
+        let connector = UdsConnector::new(&socket_path);
+        let stream = connector.connect().await.unwrap();
+        let mut transport = IPCTransport::new(stream);
+
+        // Send Data WITHOUT Hello
+        let msg = dummy_in_only_message(
+            Bytes::from("test"),
+            Bytes::from("arcella:unknown:address"),
+            Bytes::from("")
+        );
+        let messages = &[msg];
+        let payload = DataPayload::new(1, Bytes::from("test"), messages);
+        transport.send(Frame::new(FrameType::Data as u8, payload.encode().unwrap())).await.unwrap();
+
+        // Expect an Error frame
+        let err_frame = transport.recv().await.unwrap().unwrap();
+        assert_eq!(err_frame.frame_type, FrameType::Error as u8);
+
+        // Check the contents of the Error payload
+        let mut err_payload = err_frame.payload.clone();
+        let error_code = err_payload.get_u16_le();
+        let msg_len = err_payload.get_u16_le() as usize;
+        let err_split = err_payload.split_to(msg_len);
+        let error_msg = String::from_utf8_lossy(&err_split);
+
+        assert_eq!(error_code, 400); // Bad Protocol
+        assert!(error_msg.contains("Hello") || error_msg.contains("handshake"));                
+
+        // The connection must be closed
+        assert!(transport.recv().await.unwrap().is_none());
+
+        server.shutdown();
+        let _ = server_handle.await;
+    }    
+
+    /// **Test 3:** Session timeout → forced disconnect
+    #[tokio::test]
+    async fn test_session_timeout_force_close() {
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock.3");
+        let config = fast_test_config(socket_path.clone());
+
+        let (server, server_handle) = spawn_test_server(config).await;
+        let (mut endpoint, welcome) = client_handshake(&socket_path).await.unwrap();
+        let session_id = welcome.session_id;
+
+        // The session is active
+        assert_eq!(server.session_manager().active_sessions_count(), 1);
+
+        // Wait for the session timeout to definitely expire
+        // session_timeout_ms = 2000, add a 500ms margin
+        sleep(Duration::from_millis(2500)).await;
+
+        // Waiting for session removal with polling
+        for _ in 0..10 {
+            sleep(Duration::from_millis(50)).await;
+            if server.session_manager().active_sessions_count() == 0 {
+                break;
+            }
+        }
+
+        // GC should have removed the session
+        assert_eq!(server.session_manager().active_sessions_count(), 0);
+        assert!(server.session_manager().get_session(session_id).is_none());
+
+        // The connection must be closed by the server
+        assert!(endpoint.recv().await.unwrap().is_none());
+
+        server.shutdown();
+        let _ = server_handle.await;
+    }
+
+    /// **Test 4:** Reconnect → new session_id
+    #[tokio::test]
+    async fn test_reconnect_creates_new_session() {
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock.4");
+        let config = fast_test_config(socket_path.clone());
+
+        let (server, server_handle) = spawn_test_server(config).await;
+
+        // First connection
+        let (endpoint1, welcome1) = client_handshake(&socket_path).await.unwrap();
+        let session_id_1 = welcome1.session_id;
+
+        // Explicitly close the first connection
+        drop(endpoint1);
+
+        sleep(Duration::from_millis(150)).await;
+
+        // Second connection
+        let (_, welcome2) = client_handshake(&socket_path).await.unwrap();
+        let session_id_2 = welcome2.session_id;
+
+        // session_ids must be different and monotonically increasing
+        assert_ne!(session_id_1, session_id_2);
+        assert!(session_id_2 > session_id_1);
+
+        server.shutdown();
+        let _ = server_handle.await;
+    }
+
+    /// **Test 5:** Bidirectional backpressure stress test (Backpressure O(1) guarantee).
+    ///
+    /// Verifies that:
+    /// - When attempting to send more frames than hot_credit allows,
+    /// the client receives a TransportError::UnackedBuffer error.
+    /// - The error occurs BEFORE network I/O (natural backpressure).
+    /// - The buffer size is strictly bounded by the limit (O(1) memory consumption guarantee).
+    #[tokio::test]
+    async fn test_backpressure_o1_guarantee_client_server() {
+        init_tracing("trace");
+
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock.5");
+        
+        // Set an extremely low hot_credit to quickly test backpressure
+        let config = ServerConfig {
+            socket_path: socket_path.clone(),
+            limits: ServerLimits {
+                hot_credit: 2, // Лимит всего 2 кадра
+                cold_credit: 1,
+                session_ttl_ms: 60_000,
+                ..ServerLimits::default()
+            },
+            session_timeout_ms: 5000,
+            gc_interval_ms: 1000,
+        };
+
+        let (server, server_handle) = spawn_test_server(config).await;
+
+        // 1. The client connects and completes the handshake
+        let (mut endpoint, welcome) = client_handshake(&socket_path).await.unwrap();
+        
+        // Verify that the client received the correct limit from the server
+        assert_eq!(welcome.limits.hot_credit, 2);
+        assert_eq!(endpoint.unacked_buffer().capacity(), 2);
+
+        let address = Bytes::from("test:backpressure");
+        let msg = crate::protocol::test_utils::dummy_in_only_message(
+            Bytes::from("test.type"),
+            address.clone(),
+            Bytes::from("payload"),
+        );
+
+        // 2. Send the 1st frame (should succeed, buffer len = 1)
+        let seq1 = endpoint.send_data(address.clone(), &[msg.clone()]).await.unwrap();
+        assert_eq!(endpoint.in_flight_count(), 1);
+
+        // 3. Send the 2nd frame (should succeed, buffer len = 2, limit reached)
+        let seq2 = endpoint.send_data(address.clone(), &[msg.clone()]).await.unwrap();
+        assert_eq!(endpoint.in_flight_count(), 2);
+
+        // 4. Send the 3rd frame (must FAIL with a backpressure error)
+        // The server intentionally does NOT send an Ack, so the buffer is not freed.
+        let result = endpoint.send_data(address.clone(), &[msg.clone()]).await;
+        
+        // Verify that the returned error is specifically a buffer overflow error
+        assert!(matches!(
+            result,
+            Err(crate::broker_core::transport::TransportError::UnackedBuffer(
+                crate::broker_core::l2::UnackedBufferError::SlotOccupied { .. }
+            ))
+        ), "Expected UnackedBuffer::SlotOccupied error, got: {:?}", result);
+
+        // 5. CRITICAL CHECK: O(1) guarantee.
+        // Despite 3 send attempts, the buffer must contain exactly 2 elements.
+        // No additional allocations beyond the limit occurred
+        assert_eq!(
+            endpoint.in_flight_count(), 
+            2, 
+            "UnackedBuffer size must strictly equal hot_credit limit (O(1) guarantee violated)"
+        );
+
+        // 6. Cleanup: free the client's local buffer (do NOT send an Ack to the server).
+        // This is needed so the endpoint drops correctly and there are no memory leaks.
+        endpoint.acknowledge(seq1);
+        endpoint.acknowledge(seq2);
+        
+        server.shutdown();
+        let _ = server_handle.await;
+    }
 }
