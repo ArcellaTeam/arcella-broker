@@ -115,9 +115,12 @@ pub enum ProtocolError {
     /// This variant enables automatic conversion via `?`, so callers can
     /// handle both address and message errors uniformly.
     #[error("Message error: {0}")]
-    MessageError (#[from] MessageError),
+    MessageError(#[from] MessageError),
 
     /// A wrapped [`PayloadError`] from the L2 layer.
     #[error("Payload error: {0}")]
-    PayloadError (#[from] PayloadError),
+    PayloadError(#[from] PayloadError),
+
+    #[error("Unexpected frame: {0}")]
+    UnexpectedFrame(String),
 }

@@ -13,9 +13,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use arcella_broker::protocol;
 
 
-/// Arcella Broker — микроброкер Arcella
+/// Arcella Broker — microbroker Arcella
 #[derive(Parser)]
-#[command(version, about = "Arcella Broker — микроброкер Arcella", long_about = None)]
+#[command(version, about = "Arcella Broker — microbroker Arcella", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -24,7 +24,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
 
-    /// Получить статус broker'а
+    /// Get the broker status
     Status,
 }
 

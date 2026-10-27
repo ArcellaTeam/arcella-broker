@@ -7,9 +7,13 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+mod credit_manager;
+mod credit_pool;
 mod session;
 mod unacked_buffer;
 
+pub use credit_manager::CreditManager;
+pub use credit_pool::CreditPool;
 pub use session::SessionState;
 pub use unacked_buffer::{UnackedBuffer, UnackedBufferError};
 

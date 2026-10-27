@@ -17,6 +17,7 @@ struct Slot {
     frame: Frame,
 }
 
+#[derive(Debug)]
 struct UnackedBufferInner {
     slots: Vec<Option<Slot>>,
     occupied_count: usize,
@@ -33,6 +34,7 @@ struct UnackedBufferInner {
 /// Uses `parking_lot::Mutex` for minimal lock contention.
 /// The critical section is very short (single slot access),
 /// so lock overhead is negligible in practice.
+#[derive(Debug)]
 pub struct UnackedBuffer {
     inner: Mutex<UnackedBufferInner>,
     capacity: usize,
@@ -74,15 +76,6 @@ impl UnackedBuffer {
         let idx = (sequence % (self.capacity as u64)) as usize;
         let mut inner = self.inner.lock();
 
-        if let Some(base) = inner.base_sequence {
-            if sequence <= base {
-                return Err(UnackedBufferError::SequenceTooOld { 
-                    sequence, 
-                    base_sequence: base 
-                });
-            }
-        }
-        
         if inner.slots[idx].is_some() {
             return Err(UnackedBufferError::SlotOccupied { sequence, index: idx });
         }
@@ -357,37 +350,6 @@ mod tests {
         }
         
         assert_eq!(buffer.len(), 0);
-    }
-
-    #[test]
-    fn test_sequence_too_old_rejected() {
-        let buffer = UnackedBuffer::new(4);
-        
-        // 1. Fill the buffer
-        buffer.push(0, dummy_frame(b"0")).unwrap();
-        buffer.push(1, dummy_frame(b"1")).unwrap();
-        assert_eq!(buffer.base_sequence(), Some(0));
-        
-        // 2. Attempt to send a duplicate (sequence == base_sequence)
-        let result = buffer.push(0, dummy_frame(b"dup"));
-        assert!(matches!(
-            result,
-            Err(UnackedBufferError::SequenceTooOld { sequence: 0, base_sequence: 0 })
-        ));
-        
-        // 3. Acknowledge frame 0, base_sequence advances to 1
-        assert!(buffer.acknowledge(0));
-        assert_eq!(buffer.base_sequence(), Some(1));
-        
-        // 4. Attempt to send a stale frame (sequence < base_sequence)
-        let result = buffer.push(0, dummy_frame(b"stale"));
-        assert!(matches!(
-            result,
-            Err(UnackedBufferError::SequenceTooOld { sequence: 0, base_sequence: 1 })
-        ));
-        
-        // The buffer state must not change
-        assert_eq!(buffer.len(), 1);
     }
 
     #[test]

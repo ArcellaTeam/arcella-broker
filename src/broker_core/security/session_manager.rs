@@ -8,97 +8,21 @@
 // except according to those terms.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{
+    Arc, 
+    atomic::Ordering,
+    OnceLock,
+    RwLock,
+};
 use std::time::Instant;
-
 use tokio::time::{interval, Duration};
-use tokio_util::sync::CancellationToken;
-
-use bytes::Bytes;
 
 use crate::broker_core::l2::SessionState;
 use crate::protocol::ServerLimits;
 
+use super::{SessionContextInner, ServerSessionContext};
+
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
-
-/// Active session context.
-///
-/// Stores all metadata required for validating and processing L2 frames.
-/// Wrapped in `Arc` for safe and fast access from connection processing tasks
-/// without holding the session manager lock.
-#[derive(Debug)]
-pub struct SessionContext {
-    /// Unique session identifier.
-    pub session_id: u64,
-    
-    /// Session token issued by the server (for validation during Resume).
-    pub session_token: [u8; 32],
-    
-    /// Source identifier (source prefix) extracted during authentication.
-    /// Will be used in Stage 11 for strict validation of routing permissions.
-    pub source_prefix: Bytes,
-    
-    /// Server limits negotiated during the handshake (Hello/Welcome).
-    pub limits: ServerLimits,
-    
-    /// L2 session state (monotonic sequence number counters).
-    pub l2_state: Arc<SessionState>,
-    
-    /// Time of last activity in milliseconds (Unix timestamp ms).
-    /// Atomic updates ensure zero-lock on the hot path.
-    pub last_activity_ms: AtomicU64,
-
-    /// Token to forcefully terminate the connection processing task
-    /// when the session expires or is explicitly removed.
-    pub cancellation_token: CancellationToken,    
-}
-
-impl SessionContext {
-    pub fn new(
-        session_id: u64,
-        session_token: [u8; 32],
-        limits: ServerLimits,
-        l2_state: Arc<SessionState>,
-    ) -> Self {
-        Self {
-            session_id,
-            session_token,
-            source_prefix: Bytes::new(),
-            limits,
-            l2_state,
-            last_activity_ms: AtomicU64::new(Self::now_ms()),
-            cancellation_token: CancellationToken::new(),
-        }
-    }
-    
-    /// Updates the last activity time.
-    #[inline]
-    pub fn touch(&self) {
-        self.last_activity_ms.store(Self::now_ms(), Ordering::Relaxed);
-    }
-
-    /// Checks whether the session lifetime has expired.
-    #[inline]
-    pub fn is_expired(&self, timeout_ms: u64) -> bool {
-        let now = Self::now_ms();
-        let last = self.last_activity_ms.load(Ordering::Relaxed);
-        now.saturating_sub(last) > timeout_ms
-    }
-
-    /// Gets the current monotonic time in milliseconds
-    /// (resilient to system clock changes).
-    #[inline]
-    fn now_ms() -> u64 {
-        PROCESS_START.get_or_init(Instant::now).elapsed().as_millis() as u64
-    }
-
-    /// Signals the connection processing task to terminate.
-    pub fn force_close(&self) {
-        self.cancellation_token.cancel();
-    }
-}
 
 /// Server-side active session manager.
 ///
@@ -107,7 +31,7 @@ impl SessionContext {
 /// - Fast lookup of a session by `session_id` when processing incoming frames.
 /// - Cleaning up expired (timeout) sessions via a background task.
 pub struct SessionManager {
-    sessions: RwLock<HashMap<u64, Arc<SessionContext>>>,
+    sessions: RwLock<HashMap<u64, Arc<ServerSessionContext>>>,
 }
 
 impl SessionManager {
@@ -125,17 +49,22 @@ impl SessionManager {
         session_token: [u8; 32],
         limits: ServerLimits,
         l2_state: Arc<SessionState>,
-    ) -> Arc<SessionContext> {
+    ) -> Arc<ServerSessionContext> {
         let mut sessions = self.sessions.write().expect("SessionManager RwLock write poisoned");
         sessions.entry(session_id).or_insert_with(|| {
-            Arc::new(SessionContext::new(session_id, session_token, limits, l2_state))
+            Arc::new(ServerSessionContext::new(
+                session_id, 
+                session_token, 
+                limits, 
+                l2_state, 
+            ))
         }).clone()
     }
 
     /// Retrieves the session context by ID.
     /// Returns a clone of the Arc so as not to hold the RwLock
     /// during frame processing (zero-lock hot path).
-    pub fn get_session(&self, session_id: u64) -> Option<Arc<SessionContext>> {
+    pub fn get_session(&self, session_id: u64) -> Option<Arc<ServerSessionContext>> {
         let sessions = self.sessions.read().expect("SessionManager RwLock read poisoned");
         sessions.get(&session_id).map(Arc::clone)
     }
@@ -184,25 +113,25 @@ impl SessionManager {
     /// The method does not block the hot path for the duration of a full traversal.
     /// The `write` lock is held strictly in proportion to the number of sessions being removed.
     pub fn cleanup_expired(&self, timeout_ms: u64) -> usize {
-        let now = SessionContext::now_ms();
+        let now = SessionContextInner::now_ms();
         let mut expired_ids = Vec::new();
 
-        // 1. Fast pass over the Read lock (does not block new get_session calls for long)
+        // Phase 1: Scan with read lock (doesn't block get_session for long)
         {
             let sessions = self.sessions.read().expect("SessionManager RwLock read poisoned");
             for (&id, ctx) in sessions.iter() {
-                let last = ctx.last_activity_ms.load(Ordering::Relaxed);
+                let last = ctx.inner.last_activity_ms.load(Ordering::Relaxed);
                 if now.saturating_sub(last) > timeout_ms {
                     expired_ids.push(id);
                 }
             }
         }        
 
-        // 2. Short Write lock only for deletion
+        // Phase 2: Delete with write lock (brief, only for removed sessions)
         if !expired_ids.is_empty() {
             let mut sessions = self.sessions.write().expect("SessionManager RwLock write poisoned");
             for id in &expired_ids {
-                if let Some(ctx) = sessions.remove(&id) {
+                if let Some(ctx) = sessions.remove(id) {
                     ctx.force_close(); // Signal the task to drop the socket    
                 }
             }
@@ -247,7 +176,7 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{self, Duration};
+    use super::super::SessionContext;
 
     fn make_test_l2_state() -> Arc<SessionState> {
         Arc::new(SessionState::new(1))
@@ -259,7 +188,7 @@ mod tests {
         let l2 = make_test_l2_state();
         
         let ctx = mgr.register_session(1, [0xAA; 32], ServerLimits::default(), l2);
-        assert_eq!(ctx.session_id, 1);
+        assert_eq!(ctx.session_id(), 1);
         
         let retrieved = mgr.get_session(1).unwrap();
         assert!(Arc::ptr_eq(&ctx, &retrieved));
