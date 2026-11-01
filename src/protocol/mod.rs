@@ -23,6 +23,8 @@ pub use frame::{
     FRAME_HEADER_SIZE, 
     FRAME_MAX_PAYLOAD_LENGTH, 
     FRAME_OVERHEAD,
+    build_error_frame,
+    create_ack_frame,
 };
 
 use message::{

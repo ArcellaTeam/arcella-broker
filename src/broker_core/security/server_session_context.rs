@@ -12,7 +12,7 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::{SessionContext, SessionContextInner};
-use crate::broker_core::l2::{SessionState, UnackedBuffer, CreditManager, CreditPool};
+use crate::broker_core::l2::{SessionState, UnackedBuffer, CreditManager, CreditPool, HotBuffer};
 use crate::protocol::ServerLimits;
 
 /// Server-side session context.
@@ -106,6 +106,11 @@ impl SessionContext for ServerSessionContext {
     fn outgoing_credit_pool(&self) -> &Arc<CreditPool> {
         &self.inner.outgoing_credit_pool
     }
+
+    #[inline]
+    fn incoming_hot_buffer(&self) -> &Arc<HotBuffer> {
+        &self.inner.incoming_hot_buffer()
+    }    
 
     #[inline]
     fn incoming_credit_manager(&self) -> &CreditManager {

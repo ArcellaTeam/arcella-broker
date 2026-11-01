@@ -7,10 +7,10 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
-/// Maximum payload size in bytes(16 ).
+/// Maximum payload size in bytes(16).
 /// Corresponds to the maximum value of u24 (0x00FF_FFFF).
 pub const FRAME_MAX_PAYLOAD_LENGTH: u32 = 0x00FF_FFFF;
 
@@ -30,9 +30,9 @@ pub const FRAME_OVERHEAD: usize = FRAME_HEADER_SIZE + CRC_SIZE;
 /// either a malformed stream or a protocol violation by the peer.
 ///
 /// # Design notes
-/// - `InsufficientData` is a *soft* error  it simply means the parser needs
+/// - `InsufficientData` is a *soft* error - it simply means the parser needs
 ///   more bytes from the stream and should wait (return `None` in `Decoder`).
-/// - `PayloadTooLarge` is a *hard* error  it violates the protocol's absolute
+/// - `PayloadTooLarge` is a *hard* error - it violates the protocol's absolute
 ///   limit of [`FRAME_MAX_PAYLOAD_LENGTH`] (16 MiB, the maximum value of u24)
 ///   and must result in immediate connection termination.
 ///
@@ -46,7 +46,7 @@ pub enum FrameHeaderError {
     /// Contains the number of bytes actually available.
     ///
     /// # Recovery
-    /// This is a normal condition during stream fragmentation  the caller
+    /// This is a normal condition during stream fragmentation - the caller
     /// should wait for more data rather than treating it as a failure.
     #[error("Insufficient data to read the header: expected {FRAME_HEADER_SIZE} bytes, received {0}")]
     InsufficientData(usize),
@@ -369,6 +369,27 @@ impl Frame {
     pub fn total_size(&self) -> usize {
         FRAME_OVERHEAD + self.payload.len()
     }
+}
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+/// Helper to build a standardized Error frame.
+/// Format: error_code (u16 LE) + message_length (u16 LE) + message (UTF-8)
+pub fn build_error_frame(code: u16, message: &str) -> Frame {
+    let mut payload = BytesMut::with_capacity(4 + message.len());
+    payload.put_u16_le(code);
+    payload.put_u16_le(message.len() as u16);
+    payload.put_slice(message.as_bytes());
+    Frame::new(FrameType::Error as u8, payload.freeze())
+}
+
+/// Creates an Acknowledge frame payload for the given sequence number.
+pub fn create_ack_frame(sequence: u64) -> Frame {
+    let mut payload = BytesMut::with_capacity(8);
+    payload.put_u64_le(sequence);
+    Frame::new(FrameType::Acknowledge as u8, payload.freeze())
 }
 
 #[cfg(test)]

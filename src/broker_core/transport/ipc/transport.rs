@@ -234,17 +234,6 @@ where
     }
 }
 
-// ============================================================================
-// Helper functions
-// ============================================================================
-
-/// Creates an Acknowledge frame payload for the given sequence number.
-pub fn create_ack_frame(sequence: u64) -> Frame {
-    let mut payload = BytesMut::with_capacity(8);
-    payload.put_u64_le(sequence);
-    Frame::new(FrameType::Acknowledge as u8, payload.freeze())
-}
-
 /// Extracts the sequence number from an Acknowledge frame payload.
 pub fn parse_ack_sequence(frame: &Frame) -> Result<u64, TransportError> {
     if frame.frame_type != FrameType::Acknowledge as u8 {

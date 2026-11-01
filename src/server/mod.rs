@@ -25,22 +25,32 @@ use crate::broker_core::security::{
     HandshakeHandler,
 };
 use crate::broker_core::registry::LocalRegistry;
+use crate::broker_core::l2::IngressBridge;
+
 
 /// Main server component of the Arcella Broker
-pub struct BrokerServer {
+pub struct BrokerServer<B>
+where
+    B: IngressBridge + 'static
+{
     config: ServerConfig,
     session_manager: Arc<SessionManager>,
     handshake_handler: Arc<HandshakeHandler>,
     local_registry: Arc<LocalRegistry>,
     shutdown_token: CancellationToken,
+    ingress_bridge: Arc<B>,
 }
 
-impl BrokerServer {
-    pub fn new(
+impl<B> BrokerServer<B>
+where
+    B: IngressBridge + 'static,
+{
+    pub fn new_with_bridge(
         config: ServerConfig,
         session_manager: Arc<SessionManager>,
         handshake_handler: Arc<HandshakeHandler>,
         local_registry: Arc<LocalRegistry>,
+        ingress_bridge: Arc<B>,
     ) -> Self {
         Self {
             config,
@@ -48,8 +58,10 @@ impl BrokerServer {
             handshake_handler,
             local_registry,
             shutdown_token: CancellationToken::new(),
+            ingress_bridge,
         }
     }
+    
 
     /// Returns a reference to the SessionManager (for integration tests and metrics).
     pub fn session_manager(&self) -> &Arc<SessionManager> {
@@ -71,6 +83,7 @@ impl BrokerServer {
             Arc::clone(&self.handshake_handler),
             Arc::clone(&self.local_registry),
             self.shutdown_token.clone(),
+            self.ingress_bridge.clone(),
         );
 
         // 3. Wait for the shutdown signal or an error

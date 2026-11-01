@@ -14,18 +14,23 @@ use tokio_util::sync::CancellationToken;
 
 use crate::broker_core::security::{HandshakeHandler, SessionManager};
 use crate::broker_core::registry::LocalRegistry;
+use crate::broker_core::l2::IngressBridge;
 use super::config::ServerConfig;
 use super::connection_handler;
 
 /// Starts the accept loop for incoming IPC connections.
 /// Terminates upon receiving a shutdown signal or on a socket error.
-pub async fn run_listener(
+pub async fn run_listener<B>(
     config: ServerConfig,
     session_manager: Arc<SessionManager>,
     handshake_handler: Arc<HandshakeHandler>,
     local_registry: Arc<LocalRegistry>,
     shutdown_token: CancellationToken,
-) -> anyhow::Result<()> {
+    ingress_bridge: Arc<B>,
+) -> anyhow::Result<()>
+where
+    B: IngressBridge + 'static,
+{
     let listener = UnixListener::bind(&config.socket_path)?;
     tracing::info!("BrokerServer listening on {:?}", config.socket_path);
 
@@ -44,11 +49,18 @@ pub async fn run_listener(
                         let sm = Arc::clone(&session_manager);
                         let hh = Arc::clone(&handshake_handler);
                         let lr = Arc::clone(&local_registry);
-                        
+
+                        let peer_addr = stream
+                                .peer_addr()
+                                .ok()
+                                .and_then(|a| a.as_pathname().map(|p| p.to_string_lossy().into_owned()))
+                                .unwrap_or_else(|| "unix:unnamed".to_string());                        
+
                         // Spawn connection handling in a separate task
+                        let ingress_bridge_clone = ingress_bridge.clone(); // Clone for async move
                         tokio::spawn(async move {
                             if let Err(e) = connection_handler::handle_connection(
-                                stream, sm, hh, lr
+                                stream, peer_addr, sm, hh, lr, ingress_bridge_clone,
                             ).await {
                                 tracing::debug!("Connection terminated: {}", e);
                             }

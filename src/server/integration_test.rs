@@ -9,18 +9,19 @@
 
 #[cfg(test)]
 mod tests {
-    use bytes::{Buf, Bytes};
+    use bytes::{Buf, BufMut, Bytes, BytesMut};
     use std::path::Path;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::net::UnixStream;
     use tokio::time::{sleep, Duration};
+    use tokio::sync::Mutex;
 
     use crate::broker_core::{
-        l2::{SessionState, UnackedBuffer},
+        l2::{SessionState, UnackedBuffer, IngressBridge, IngressResult},
         registry::LocalRegistry,
-        security::{HandshakeHandler, SessionManager, ClientSessionContext},
-        transport::{IPCConnector, IPCTransport, IPCEndpoint, UdsConnector},
+        security::{HandshakeHandler, SessionManager, ClientSessionContext, ServerSessionContext},
+        transport::{IPCConnector, IPCTransport, IPCEndpoint, UdsConnector, TransportError},
     };
 
     use crate::protocol::{
@@ -33,16 +34,93 @@ mod tests {
             DataPayload,
             L2_PROTOCOL_VERSION,
         },
-        Frame, FrameType, ServerLimits,
+        Frame, 
+        FrameType, 
+        ServerLimits,
     };
 
     use crate::test_utils::{init_tracing, dummy_in_only_message};
     
     use super::super::{config::ServerConfig, BrokerServer};
+    use super::super::connection_handler::handle_data_frame;
+
 
     // =========================================================================
-    // Helpers
+    // Test-only IngressBridge Implementation
     // =========================================================================
+
+    /// Test-only stub implementation of IngressBridge for integration tests.
+    /// This allows tests to control the behavior of frame processing without
+    /// depending on the actual Ingress Bridge implementation.
+    struct StubIngressBridge {
+        /// If set, delays processing by the specified number of milliseconds
+        delay_ms: Option<u64>,
+        /// If set, blocked frames after the specified count
+        blocked_after: Option<usize>,
+        /// Counter for processed frames
+        frame_counter: std::sync::atomic::AtomicUsize,
+    }
+
+
+    impl StubIngressBridge {
+        fn new() -> Self {
+            Self {
+                delay_ms: None,
+                blocked_after: None,
+                frame_counter: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn with_delay(mut self, delay_ms: u64) -> Self {
+            self.delay_ms = Some(delay_ms);
+            self
+        }
+
+        fn with_blocked_after(mut self, n: usize) -> Self {
+            self.blocked_after = Some(n);
+            self
+        }
+    } 
+
+    impl IngressBridge for StubIngressBridge {
+        fn process<'a>(
+            &'a self,
+            _address: &Bytes,
+            _messages_raw: &Bytes,
+            _session_ctx: &ServerSessionContext,
+        ) -> impl std::future::Future<Output = IngressResult> + Send + 'a {
+            async move {
+                // Apply delay if configured
+                if let Some(delay) = self.delay_ms {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+
+                // Check rejection logic if configured
+                if let Some(reject_after) = self.blocked_after {
+                    let frame_num = self.frame_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if frame_num > reject_after {
+                        return IngressResult::AddressBlocked;
+                    }
+                }
+
+                // Default: accept all frames
+                IngressResult::Accepted
+            }
+        }
+    }       
+
+    fn create_data_frame(sequence: u64, address: Bytes, msg_payload: Bytes) -> Frame {
+
+        let msg = dummy_in_only_message(
+            Bytes::from("test.msg"),
+            address.clone(),
+            msg_payload,
+        );
+        
+        let messages = [msg.clone()];
+        let data_payload = DataPayload::new(sequence, address, &messages);
+        Frame::data(data_payload.encode().unwrap())
+    }       
 
     /// Creates a `ServerConfig` with short timeouts to speed up tests.
     fn fast_test_config(socket_path: std::path::PathBuf) -> ServerConfig {
@@ -65,26 +143,42 @@ mod tests {
     /// `session_manager`) and the server task's `JoinHandle`.
     async fn spawn_test_server(
         config: ServerConfig,
-    ) -> (Arc<BrokerServer>, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    ) -> (Arc<BrokerServer<StubIngressBridge>>, tokio::task::JoinHandle<anyhow::Result<()>>) {
+
+        let ingress_bridge = Arc::new(StubIngressBridge::new());
+        let (server, handle) = spawn_test_server_with_bridge(config, ingress_bridge).await;
+
+        (server, handle)
+    }
+
+    /// Starts `BrokerServer` with a custom IngressBridge in a background tokio task.
+    async fn spawn_test_server_with_bridge<B>(
+        config: ServerConfig,
+        ingress_bridge: Arc<B>,
+    ) -> (Arc<BrokerServer<B>>, tokio::task::JoinHandle<anyhow::Result<()>>)
+    where
+        B: IngressBridge + 'static,
+    {
         let session_manager = Arc::new(SessionManager::new());
         let handshake_handler = Arc::new(HandshakeHandler::with_limits(config.limits.clone()));
         let local_registry = Arc::new(LocalRegistry::new());
 
-        let server = Arc::new(BrokerServer::new(
+
+        let server = Arc::new(BrokerServer::new_with_bridge(
             config,
             session_manager,
             handshake_handler,
             local_registry,
+            ingress_bridge,
         ));
 
         let server_clone = Arc::clone(&server);
         let handle = tokio::spawn(async move { server_clone.run().await });
 
-        // Give the server time to bind the socket
         sleep(Duration::from_millis(50)).await;
 
         (server, handle)
-    }
+    }    
 
     /// Performs the client side of the full handshake:
     /// `Hello → Welcome → AuthResponse → AuthResult → CreditGrant (client) → CreditGrant (server)`.
@@ -512,7 +606,7 @@ mod tests {
         let _ = server_handle.await;
     }
 
-    /*/// **Test 7:** Server detects credit protocol violation.
+    /// **Test 7:** Server detects credit protocol violation.
     ///
     /// Verifies that:
     /// - Client sends more frames than hot_credit allows (by ignoring backpressure).
@@ -540,7 +634,11 @@ mod tests {
             gc_interval_ms: 1000,
         };
 
-        let (server, server_handle) = spawn_test_server(config).await;
+        let ingress_bridge = Arc::new(StubIngressBridge::new()
+            .with_blocked_after(2)
+        );
+
+        let (server, server_handle) = spawn_test_server_with_bridge(config, ingress_bridge).await;
 
         // Perform handshake using raw transport (to bypass client-side backpressure)
         let connector = UdsConnector::new(&socket_path);
@@ -571,7 +669,7 @@ mod tests {
         let auth_result = AuthResultPayload::decode(&mut auth_result_frame.payload.clone()).unwrap();
         assert_eq!(auth_result.status, 0);
 
-        // Send CreditGrant (required by protocol)
+        // Send CreditGrant (required by protocol to initialize server-side credit tracking)
         let cg = CreditGrantPayload::hot(1, Bytes::new(), welcome.limits.hot_credit);
         let cg_encoded = cg.encode().unwrap();
         transport.send(Frame::new(FrameType::CreditGrant as u8, cg_encoded)).await.unwrap();
@@ -588,42 +686,56 @@ mod tests {
             Bytes::from("payload"),
         );
 
-        // Send frame 1 (should succeed)
-        let messages = [msg.clone()];
-        let payload1 = DataPayload::new(2, address.clone(), &messages);
-        transport.send(Frame::new(FrameType::Data as u8, payload1.encode().unwrap())).await.unwrap();
+        // Send all 5 frames in quick succession
+        for seq in 2..=6 {
+            let messages = [msg.clone()];
+            let payload = DataPayload::new(seq, address.clone(), &messages);
+            transport.send(Frame::new(FrameType::Data as u8, payload.encode().unwrap())).await.unwrap();
+            tracing::debug!("Sended Data (seq: {})", seq);
+        }
 
-        // Send frame 2 (should succeed)
-        let messages = [msg.clone()];
-        let payload2 = DataPayload::new(3, address.clone(), &messages);
-        transport.send(Frame::new(FrameType::Data as u8, payload2.encode().unwrap())).await.unwrap();
+        // === Expect server to process first two and Drop the third ===
+        // We must drain Acks until we find the Drop frame, as they may arrive first.
+        let mut received_drop = false;
+        let mut ack_count = 0;
 
-        // Send frame 3 (VIOLATION: no credits available, server didn't send Ack yet)
-        let messages = [msg.clone()];
-        let payload3 = DataPayload::new(4, address.clone(), &messages);
-        transport.send(Frame::new(FrameType::Data as u8, payload3.encode().unwrap())).await.unwrap();
+        while let Some(frame) = transport.recv().await.unwrap() {
+            match frame.frame_type {
+                t if t == FrameType::Acknowledge as u8 => {
+                    ack_count += 1;
+                    tracing::debug!("Received expected Acknowledge (total: {})", ack_count);
+                }
+                t if t == FrameType::Drop as u8 => {
+                    received_drop = true;
+                    tracing::debug!("Received expected Drop");
 
-        // === Expect Drop frame from server ===
-        let drop_frame = transport.recv().await.unwrap().unwrap();
-        assert_eq!(drop_frame.frame_type, FrameType::Drop as u8);
+                    // Parse Drop payload: session_sequence (u64) + reason (u8)
+                    let mut drop_payload = frame.payload.clone();
+                    let drop_seq = drop_payload.get_u64_le();
+                    let drop_reason = drop_payload.get_u8();
 
-        // Parse Drop payload: session_sequence (u64) + reason (u8)
-        let mut drop_payload = drop_frame.payload.clone();
-        let drop_seq = drop_payload.get_u64_le();
-        let drop_reason = drop_payload.get_u8();
-        
-        // The dropped sequence should be 4 (the violation frame)
-        assert_eq!(drop_seq, 4);
-        // Reason should be 1 (buffer_overflow)
-        assert_eq!(drop_reason, 1);
+                    assert_eq!(drop_seq, 6, "Dropped sequence should be 6 (the violation frame)");
+                    assert_eq!(drop_reason, 1, "Reason should be 1 (buffer_overflow)");
+                    break; // Found what we were looking for
+                }
+                _ => {
+                    panic!("Unexpected frame type: 0x{:02x}", frame.frame_type);
+                }    
+            }
 
-        // Server should close the connection after Drop
+        }
+
+        // === 4. Assertions ===
+        assert!(received_drop, "Server failed to send Drop frame after credit exhaustion");
+        assert_eq!(ack_count, 2, "Server should have sent exactly 2 Acks before the Drop");
+
+        // Verify connection is closed by server immediately after sending Drop
         let next_frame = transport.recv().await.unwrap();
-        assert!(next_frame.is_none(), "Server should close connection after Drop");
+        assert!(next_frame.is_none(), "Server must close connection immediately after sending Drop");
 
         tracing::info!("Server credit violation detection test passed");
 
         server.shutdown();
         let _ = server_handle.await;
-    }*/        
+    }        
 }

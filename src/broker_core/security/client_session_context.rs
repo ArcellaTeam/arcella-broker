@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use super::{SessionContext, SessionContextInner};
-use crate::broker_core::l2::{SessionState, UnackedBuffer, CreditManager, CreditPool};
+use crate::broker_core::l2::{SessionState, UnackedBuffer, CreditManager, CreditPool, HotBuffer};
 use crate::protocol::ServerLimits;
 
 /// Client-side session context.
@@ -100,6 +100,11 @@ impl SessionContext for ClientSessionContext {
     fn outgoing_credit_pool(&self) -> &Arc<CreditPool> {
         &self.inner.outgoing_credit_pool
     }
+
+    #[inline]
+    fn incoming_hot_buffer(&self) -> &Arc<HotBuffer> {
+        &self.inner.incoming_hot_buffer()
+    }    
 
     #[inline]
     fn incoming_credit_manager(&self) -> &CreditManager {

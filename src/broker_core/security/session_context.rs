@@ -11,9 +11,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use bytes::Bytes;
-
-use crate::broker_core::l2::{SessionState, UnackedBuffer, CreditManager, CreditPool};
+use crate::broker_core::l2::{
+    CreditManager, 
+    CreditPool, 
+    HotBuffer,
+    SessionState, 
+    UnackedBuffer, 
+};
 use crate::protocol::ServerLimits;
 
 /// Internal core of the session context, shared by client and server.
@@ -56,6 +60,8 @@ pub struct SessionContextInner {
     /// When the peer sends a CreditGrant, this pool is replenished.
     pub outgoing_credit_pool: Arc<CreditPool>,
 
+    incoming_hot_buffer: Arc<HotBuffer>, 
+
     /// Credit manager for incoming frames (shadow counter).
     /// Used to detect protocol violations by the peer.
     pub incoming_credit_manager: CreditManager,
@@ -90,11 +96,18 @@ impl SessionContextInner {
             limits: limits.clone(),
             l2_state,
             outgoing_unacked_buffer: Arc::new(UnackedBuffer::new(hot_credit)),
-            incoming_credit_manager: CreditManager::new(&limits),
             outgoing_credit_pool: Arc::new(CreditPool::new(outgoing_credits)),
+            incoming_hot_buffer: Arc::new(HotBuffer::new(limits.hot_credit as usize)),
+            incoming_credit_manager: CreditManager::new(&limits),
             last_activity_ms: AtomicU64::new(Self::now_ms()),
         }
     }
+
+    /// Hot buffer for incoming frames.
+    #[inline]
+    pub fn incoming_hot_buffer(&self) -> &Arc<HotBuffer> {
+        &self.incoming_hot_buffer
+    }    
 
     /// Updates the last activity time.
     #[inline]
@@ -156,6 +169,9 @@ pub trait SessionContext {
 
     /// Credit pool for outgoing frames (granted by the peer).
     fn outgoing_credit_pool(&self) -> &Arc<CreditPool>;
+
+    /// Hot buffer for incoming frames.
+    fn incoming_hot_buffer(&self) -> &Arc<HotBuffer>;
 
     /// Credit manager for incoming frames.
     fn incoming_credit_manager(&self) -> &CreditManager;

@@ -88,7 +88,7 @@ mod tests {
         };
 
         let encoded = original.encode();
-        let mut buf = encoded.clone();
+        let mut buf = encoded.as_ref();
         let decoded = AuthResultPayload::decode(&mut buf).unwrap();
 
         assert_eq!(original, decoded);

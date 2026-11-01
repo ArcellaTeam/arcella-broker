@@ -323,9 +323,7 @@ impl ParsedDataPayload {
     /// The `address` and `messages_raw` fields are extracted using [`bytes::Bytes::slice`],
     /// which creates new `Bytes` instances that share memory with the original
     /// payload buffer. No data is copied.
-    pub fn decode(payload: &Bytes) -> Result<Self, PayloadError> {
-        let mut buf = payload.as_ref();
-
+    pub fn decode(buf: &mut impl Buf) -> Result<Self, PayloadError> {
         // 1. Read session_sequence (u64 LE, 8 bytes)
         if buf.remaining() < 8 {
             return Err(DataPayloadError::IncompleteHeader.into());
@@ -344,20 +342,17 @@ impl ParsedDataPayload {
             return Err(DataPayloadError::IncompleteAddress.into());
         }
         
-        // Zero-copy address extraction using Bytes::slice()
-        let address_start = payload.len() - buf.remaining();
-        let address = payload.slice(address_start..address_start + address_len);
-        buf.advance(address_len);
+        // Zero-copy address extraction (O(1) for Bytes/BytesMut)
+        let address = buf.copy_to_bytes(address_len);
 
         // 3. Basic validation for message_count presence (u16 LE, 2 bytes)
-        let messages_raw_len = buf.remaining();
-        if messages_raw_len < 2 {
+        if buf.remaining() < 2 {
             return Err(DataPayloadError::IncompleteMessageCount.into());
         }
 
         // 4. The remaining bytes (including message_count + serialized messages)
-        let messages_raw_start = payload.len() - messages_raw_len;
-        let messages_raw = payload.slice(messages_raw_start..);
+        // We take everything that's left in the buffer.
+        let messages_raw = buf.copy_to_bytes(buf.remaining());
 
         Ok(Self {
             session_sequence,
@@ -393,8 +388,8 @@ mod tests {
 
         let messages = [msg.clone()];
         let payload = DataPayload::new(session_seq, address.clone(), &messages);
-        let encoded = payload.encode().unwrap();
-        let parsed = ParsedDataPayload::decode(&encoded).unwrap();
+        let mut encoded = payload.encode().unwrap();
+        let parsed = ParsedDataPayload::decode(&mut encoded).unwrap();
 
         assert_eq!(parsed.session_sequence, session_seq);
         assert_eq!(parsed.address, address);
@@ -431,8 +426,8 @@ mod tests {
             address.clone(),
             &messages,
         );
-        let encoded = payload.encode().unwrap();
-        let parsed = ParsedDataPayload::decode(&encoded).unwrap();
+        let mut encoded = payload.encode().unwrap();
+        let parsed = ParsedDataPayload::decode(&mut encoded).unwrap();
 
         assert_eq!(parsed.session_sequence, session_seq);
         assert_eq!(parsed.address, address);
@@ -455,8 +450,8 @@ mod tests {
         let address = Bytes::from("empty:queue");
 
         let payload = DataPayload::new(session_seq, address.clone(), &[]);
-        let encoded = payload.encode().unwrap();
-        let parsed = ParsedDataPayload::decode(&encoded).unwrap();
+        let mut encoded = payload.encode().unwrap();
+        let parsed = ParsedDataPayload::decode(&mut encoded).unwrap();
 
         assert_eq!(parsed.session_sequence, session_seq);
         assert_eq!(parsed.address, address);
@@ -484,12 +479,12 @@ mod tests {
 
         let messages = [msg];
         let payload = DataPayload::new(session_seq, address, &messages);
-        let encoded = payload.encode().unwrap();
+        let mut encoded = payload.encode().unwrap();
         
         let original_ptr: usize = encoded.as_ptr() as usize;
         let original_len: usize = encoded.len();
 
-        let parsed = ParsedDataPayload::decode(&encoded).unwrap();
+        let parsed = ParsedDataPayload::decode(&mut encoded).unwrap();
 
         let address_ptr: usize = parsed.address.as_ptr() as usize;
         let messages_ptr: usize = parsed.messages_raw.as_ptr() as usize;
@@ -536,9 +531,9 @@ mod tests {
 
     #[test]
     fn test_incomplete_header() {
-        let payload = Bytes::from(vec![0u8; 7]); // At least 8 bytes are needed for session_sequence
+        let mut payload = Bytes::from(vec![0u8; 7]); // At least 8 bytes are needed for session_sequence
 
-        let err = ParsedDataPayload::decode(&payload).unwrap_err();
+        let err = ParsedDataPayload::decode(&mut payload).unwrap_err();
         assert!(matches!(
             err,
             PayloadError::Data(DataPayloadError::IncompleteHeader)
@@ -553,8 +548,7 @@ mod tests {
         buf.put_slice(b"test:"); // address
         // message_count is missing!
 
-        let payload = buf.freeze();
-        let err = ParsedDataPayload::decode(&payload).unwrap_err();
+        let err = ParsedDataPayload::decode(&mut buf).unwrap_err();
         assert!(matches!(
             err,
             PayloadError::Data(DataPayloadError::IncompleteMessageCount)
@@ -568,8 +562,7 @@ mod tests {
         buf.put_u16_le(1000); // Declare 1000 bytes of address
         buf.put_slice(b"short"); // But only put 5
 
-        let payload = buf.freeze();
-        let err = ParsedDataPayload::decode(&payload).unwrap_err();
+        let err = ParsedDataPayload::decode(&mut buf).unwrap_err();
         assert!(matches!(
             err,
             PayloadError::Data(DataPayloadError::IncompleteAddress)
@@ -583,8 +576,7 @@ mod tests {
         buf.put_u16_le((MAX_ADDRESS_LEN + 1) as u16);
         buf.put_slice(&vec![b'a'; MAX_ADDRESS_LEN + 1]);
 
-        let payload = buf.freeze();
-        let err = ParsedDataPayload::decode(&payload).unwrap_err();
+        let err = ParsedDataPayload::decode(&mut buf).unwrap_err();
         assert!(matches!(
             err,
             PayloadError::Data(DataPayloadError::AddressTooLong(_))
@@ -615,8 +607,7 @@ mod tests {
         buf.put_u16_le(10); // Declare 10 messages
         msg.encode(&mut buf); // But only put 1
 
-        let payload = buf.freeze();
-        let parsed = ParsedDataPayload::decode(&payload).unwrap();
+        let parsed = ParsedDataPayload::decode(&mut buf).unwrap();
 
         assert_eq!(parsed.session_sequence, session_seq);
         assert_eq!(parsed.address, address);
@@ -661,8 +652,7 @@ mod tests {
         msg1.encode(&mut buf);
         msg2.encode(&mut buf); // But put 2
 
-        let payload = buf.freeze();
-        let parsed = ParsedDataPayload::decode(&payload).unwrap();
+        let parsed = ParsedDataPayload::decode(&mut buf).unwrap();
 
         let mut msg_buf = parsed.messages_raw.as_ref();
         let declared_count = msg_buf.get_u16_le();

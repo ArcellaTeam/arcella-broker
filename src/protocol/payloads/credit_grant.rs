@@ -145,9 +145,7 @@ impl CreditGrantPayload {
     /// Returns `CreditGrantPayloadError::IncompleteHeader` or
     /// `CreditGrantPayloadError::IncompleteAddress` if the payload
     /// is truncated or malformed.
-    pub fn decode(payload: &Bytes) -> Result<Self, PayloadError> {
-        let mut buf = payload.clone();
-
+    pub fn decode(buf: &mut impl Buf) -> Result<Self, PayloadError> {
         // Minimum size: 8 (seq) + 2 (addr_len) + 0 (addr) + 1 (type) + 4 (amount) = 15
         if buf.remaining() < 8 + 2 {
             return Err(CreditGrantPayloadError::IncompleteHeader.into());
@@ -194,8 +192,8 @@ mod tests {
             50,
         );
 
-        let encoded = original.encode().unwrap();
-        let decoded = CreditGrantPayload::decode(&encoded).unwrap();
+        let mut encoded = original.encode().unwrap();
+        let decoded = CreditGrantPayload::decode(&mut encoded).unwrap();
 
         assert_eq!(original, decoded);
         assert_eq!(decoded.credit_type, CreditGrantPayload::CREDIT_TYPE_HOT);
@@ -211,8 +209,8 @@ mod tests {
             10,
         );
 
-        let encoded = original.encode().unwrap();
-        let decoded = CreditGrantPayload::decode(&encoded).unwrap();
+        let mut encoded = original.encode().unwrap();
+        let decoded = CreditGrantPayload::decode(&mut encoded).unwrap();
 
         assert_eq!(original, decoded);
         assert_eq!(decoded.credit_type, CreditGrantPayload::CREDIT_TYPE_COLD);
@@ -222,8 +220,8 @@ mod tests {
     fn test_encode_decode_empty_address() {
         let original = CreditGrantPayload::hot(1, Bytes::new(), 100);
 
-        let encoded = original.encode().unwrap();
-        let decoded = CreditGrantPayload::decode(&encoded).unwrap();
+        let mut encoded = original.encode().unwrap();
+        let decoded = CreditGrantPayload::decode(&mut encoded).unwrap();
 
         assert_eq!(original, decoded);
         assert!(decoded.address.is_empty());
@@ -243,8 +241,8 @@ mod tests {
 
     #[test]
     fn test_decode_incomplete_header() {
-        let truncated = Bytes::from(vec![0u8; 5]); // Need at least 10 bytes
-        let result = CreditGrantPayload::decode(&truncated);
+        let mut truncated = Bytes::from(vec![0u8; 5]); // Need at least 10 bytes
+        let result = CreditGrantPayload::decode(&mut truncated);
         assert!(matches!(result, Err(PayloadError::CreditGrant(CreditGrantPayloadError::IncompleteHeader))));
     }
 
@@ -255,9 +253,8 @@ mod tests {
         buf.put_u64_le(1);        // session_sequence
         buf.put_u16_le(100);      // address_length = 100
         buf.put_slice(&[0u8; 10]); // but only 10 bytes of address
-        let truncated = buf.freeze();
 
-        let result = CreditGrantPayload::decode(&truncated);
+        let result = CreditGrantPayload::decode(&mut buf);
         assert!(matches!(
             result,
             Err(PayloadError::CreditGrant(CreditGrantPayloadError::IncompleteAddress { .. }))
@@ -276,7 +273,8 @@ mod tests {
         // Zero credits is technically valid (though not useful)
         let payload = CreditGrantPayload::hot(1, Bytes::from("test"), 0);
         let encoded = payload.encode().unwrap();
-        let decoded = CreditGrantPayload::decode(&encoded).unwrap();
+        let mut buf = encoded.as_ref();
+        let decoded = CreditGrantPayload::decode(&mut buf).unwrap();
         assert_eq!(decoded.credit_amount, 0);
     }
 
@@ -284,7 +282,8 @@ mod tests {
     fn test_max_u32_credits() {
         let payload = CreditGrantPayload::hot(1, Bytes::from("test"), u32::MAX);
         let encoded = payload.encode().unwrap();
-        let decoded = CreditGrantPayload::decode(&encoded).unwrap();
+        let mut buf = encoded.as_ref();
+        let decoded = CreditGrantPayload::decode(&mut buf).unwrap();
         assert_eq!(decoded.credit_amount, u32::MAX);
     }
 }

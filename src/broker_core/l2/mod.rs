@@ -9,11 +9,15 @@
 
 mod credit_manager;
 mod credit_pool;
+mod ingress_bridge;
+mod hot_buffer;
 mod session;
 mod unacked_buffer;
 
 pub use credit_manager::CreditManager;
 pub use credit_pool::CreditPool;
+pub use ingress_bridge::{IngressBridge, IngressResult};
+pub use hot_buffer::{HotBuffer, BufferedFrame};
 pub use session::SessionState;
 pub use unacked_buffer::{UnackedBuffer, UnackedBufferError};
 

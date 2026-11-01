@@ -9,20 +9,20 @@
 
 #[cfg(test)]
 mod integration_tests {
-    use bytes::{Bytes, Buf, BufMut};
+    use bytes::{Bytes, Buf};
     use std::sync::Arc;
     
     use super::super::{SessionState, UnackedBuffer};
 
     use crate::protocol::{
-        {Frame, FrameType},
+        {Frame, create_ack_frame},
         payloads::{DataPayload, ParsedDataPayload},
-        test_utils,
+        test_utils::dummy_in_only_message,
     };
 
     fn create_data_frame(sequence: u64, address: Bytes, msg_payload: Bytes) -> Frame {
 
-        let msg = test_utils::dummy_in_only_message(
+        let msg = dummy_in_only_message(
             Bytes::from("test.msg"),
             address.clone(),
             msg_payload,
@@ -31,12 +31,6 @@ mod integration_tests {
         let messages = [msg.clone()];
         let data_payload = DataPayload::new(sequence, address, &messages);
         Frame::data(data_payload.encode().unwrap())
-    }
-
-    fn create_ack_frame(sequence: u64) -> Frame {
-        let mut payload = bytes::BytesMut::with_capacity(8);
-        payload.put_u64_le(sequence);
-        Frame::new(FrameType::Acknowledge as u8, payload.freeze())
     }
 
     #[tokio::test]
@@ -64,7 +58,8 @@ mod integration_tests {
             let payload_bytes = Bytes::from(payload_str);
             let frame = create_data_frame(seq, Bytes::from(address), payload_bytes);
             
-            let parsed = ParsedDataPayload::decode(&frame.payload).unwrap();
+            let mut payload_buf = frame.payload.clone();
+            let parsed = ParsedDataPayload::decode(&mut payload_buf).unwrap();
             
             assert!(session.update_last_received(parsed.session_sequence));
 

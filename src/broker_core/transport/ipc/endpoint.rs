@@ -17,6 +17,8 @@ use crate::protocol::{
     {Frame, FrameType},
     ProtocolError,
     payloads::{PayloadError, CreditGrantPayload, DataPayload},
+    build_error_frame,
+    create_ack_frame,
 };
 use super::transport::IPCTransport;
 use super::super::TransportError;
@@ -129,7 +131,8 @@ where
 
         match frame {
             frame if frame.frame_type == FrameType::CreditGrant as u8 => {
-                let peer_cg = CreditGrantPayload::decode(&frame.payload)
+                let mut payload_buf = frame.payload.clone();
+                let peer_cg = CreditGrantPayload::decode(&mut payload_buf)
                     .map_err(|e| TransportError::Protocol(e.into()))?;
                 
                 tracing::debug!(
@@ -153,11 +156,7 @@ where
                 );
                 
                 // Send Error frame before disconnecting
-                let mut err_payload = BytesMut::with_capacity(2 + 2 + err_msg.len());
-                err_payload.put_u16_le(400u16);
-                err_payload.put_u16_le(err_msg.len() as u16);
-                err_payload.put_slice(err_msg.as_bytes());
-                let err_frame = Frame::new(FrameType::Error as u8, err_payload.freeze());
+                let err_frame = build_error_frame(400u16, &err_msg);
                 let _ = self.send_raw_frame(err_frame).await;
                 
                 Err(ProtocolError::UnexpectedFrame(err_msg.into()).into())
@@ -204,9 +203,7 @@ where
 
     /// Sends an Acknowledge frame (0x03) for the given sequence number.
     pub async fn send_ack(&mut self, sequence: u64) -> Result<(), TransportError> {
-        let mut payload = BytesMut::with_capacity(8);
-        payload.put_u64_le(sequence);
-        let frame = Frame::new(FrameType::Acknowledge as u8, payload.freeze());
+        let frame = create_ack_frame(sequence);
         self.transport.send(frame).await
     }
 

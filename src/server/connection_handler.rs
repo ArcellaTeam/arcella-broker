@@ -8,10 +8,11 @@
 // except according to those terms.
 
 use std::sync::Arc;
-use tokio::net::UnixStream;
+//use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use bytes::{Bytes, BytesMut, Buf, BufMut};
 
-use crate::broker_core::l2::{CreditManager, SessionState, UnackedBuffer};
+use crate::broker_core::l2::{SessionState, IngressBridge, IngressResult, BufferedFrame};
 use crate::broker_core::registry::LocalRegistry;
 use crate::broker_core::security::{
     HandshakeError, 
@@ -30,24 +31,22 @@ use crate::protocol::{
         CreditGrantPayload,
         ParsedDataPayload,
     },
+    build_error_frame,
 };
 
 /// Handles a single IPC connection from accept to disconnect.
-pub async fn handle_connection(
-    stream: UnixStream,
+pub async fn handle_connection<S, B>(
+    stream: S,
+    peer_addr: String,
     session_manager: Arc<SessionManager>,
     handshake_handler: Arc<HandshakeHandler>,
     _local_registry: Arc<LocalRegistry>, // Will be needed in Stage 6 for the Ingress Bridge
-) -> Result<(), TransportError> {
-
-    let peer_addr = stream
-        .peer_addr()
-        .ok()
-        .and_then(|a| a.as_pathname().map(|p| p.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "unix:unnamed".to_string());
-
-    tracing::info!(peer = %peer_addr, "New IPC connection accepted");
-
+    ingress_bridge: Arc<B>,
+) -> Result<(), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    B: IngressBridge,
+{
     // === Phase 1: Handshake ===
     let (mut endpoint, session_ctx) = match perform_handshake(stream, &handshake_handler, &session_manager).await {
         Ok(ctx) => ctx,
@@ -64,7 +63,7 @@ pub async fn handle_connection(
     );
 
     // === Phase 2: Main frame processing loop ===
-    let result = main_loop(&mut endpoint, &session_ctx).await; 
+    let result = main_loop(&mut endpoint, &session_ctx, ingress_bridge.as_ref()).await; 
 
     // === Phase 3: Mandatory cleanup ===
     // Remove the session from the manager on ANY exit from the function
@@ -84,11 +83,14 @@ pub async fn handle_connection(
 ///
 /// Returns `Arc<SessionContext>` on successful authentication.
 /// On any error, the connection must be closed by the caller.
-async fn perform_handshake(
-    stream: UnixStream,
-    handshake_handler: &Arc<HandshakeHandler>,
-    session_manager: &Arc<SessionManager>,
-) -> Result<(IPCEndpoint<UnixStream>, Arc<ServerSessionContext>), TransportError> {
+async fn perform_handshake<S>(
+    stream: S,
+    handshake_handler: &HandshakeHandler,
+    session_manager: &SessionManager,
+) -> Result<(IPCEndpoint<S>, Arc<ServerSessionContext>), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // 1. Create the transport for exchanging control frames.
     let mut transport = IPCTransport::new(stream);
 
@@ -101,16 +103,11 @@ async fn perform_handshake(
             "Unexpected frame during handshake (expected Hello)"
         );
 
-        let error_msg = format!("Expected Hello, got frame type 0x{:02x}", hello_frame.frame_type);
-        let mut err_payload = BytesMut::with_capacity(2 + 2 + error_msg.len());
-        err_payload.put_u16_le(400u16); 
-        err_payload.put_u16_le(error_msg.len() as u16);
-        err_payload.put_slice(error_msg.as_bytes());
-
-        let err_frame = Frame::new(FrameType::Error as u8, err_payload.freeze());
+        let err_msg = format!("Expected Hello, got frame type 0x{:02x}", hello_frame.frame_type);
+        let err_frame = build_error_frame(400u16, &err_msg);
         let _ = transport.send(err_frame).await;
     
-        return Err(HandshakeError::UnexpectedFrame(error_msg).into());
+        return Err(HandshakeError::UnexpectedFrame(err_msg).into());
     }
     let mut payload = hello_frame.payload.clone();
     let hello =  HelloPayload::decode(&mut payload)?;    
@@ -131,22 +128,17 @@ async fn perform_handshake(
     // 4. Receive AuthResponse from the client
     let auth_response_frame = recv_handshake_frame(&mut transport).await?;
     if auth_response_frame.frame_type != FrameType::AuthResponse as u8 {
-        let error_msg = format!("Expected AuthResponse (0x05), got frame type 0x{:02x}", auth_response_frame.frame_type);
+        let err_msg = format!("Expected AuthResponse (0x05), got frame type 0x{:02x}", auth_response_frame.frame_type);
         
         tracing::warn!(
             frame_type = auth_response_frame.frame_type,
             "Unexpected frame during handshake (expected AuthResponse)"
         );
 
-        let mut err_payload = BytesMut::with_capacity(2 + 2 + error_msg.len());
-        err_payload.put_u16_le(400u16);
-        err_payload.put_u16_le(error_msg.len() as u16);
-        err_payload.put_slice(error_msg.as_bytes());
-
-        let err_frame = Frame::new(FrameType::Error as u8, err_payload.freeze());
+        let err_frame = build_error_frame(400u16, &err_msg);
         let _ = transport.send(err_frame).await;
 
-        return Err(HandshakeError::UnexpectedFrame(error_msg).into());
+        return Err(HandshakeError::UnexpectedFrame(err_msg).into());
     }
     let mut auth_response_bytes = auth_response_frame.payload.clone();
     let auth_response = AuthResponsePayload::decode(&mut auth_response_bytes)
@@ -201,9 +193,12 @@ async fn perform_handshake(
 /// Helper function for reading frames during the handshake.
 /// Automatically handles Ping frames (responding with Pong) and returns
 /// the next meaningful frame (Hello, AuthResponse, etc.)
-async fn recv_handshake_frame(
-    transport: &mut IPCTransport<UnixStream>
-) -> Result<Frame, TransportError> {
+async fn recv_handshake_frame<S>(
+    transport: &mut IPCTransport<S>
+) -> Result<Frame, TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     loop {
         let frame = transport.recv().await?
             .ok_or_else(|| TransportError::Io(std::io::Error::new(
@@ -230,10 +225,15 @@ async fn recv_handshake_frame(
 /// - The client drops the connection (`recv()` returns `None`)
 /// - Cancelled via `CancellationToken` (inactivity timeout from `SessionManager`)
 /// - A transport error occurs (corrupted CRC, socket drop, etc.)
-async fn main_loop(
-    endpoint: &mut IPCEndpoint<UnixStream>,
-    session_ctx: &Arc<ServerSessionContext>,
-) -> Result<(), TransportError> {
+async fn main_loop<S, B>(
+    endpoint: &mut IPCEndpoint<S>,
+    session_ctx: &ServerSessionContext,
+    ingress_bridge: &B,
+) -> Result<(), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    B: IngressBridge,
+{
     loop {
         tokio::select! {
             // Forced cancellation from SessionManager (inactivity timeout)
@@ -255,12 +255,48 @@ async fn main_loop(
                         match frame.frame_type {
                             // === CreditGrant frame (0x02) - client granting credits to server ===
                             t if t == FrameType::CreditGrant as u8 => {
-                                // TODO: Stage 5.3 Task 5 - handle client's CreditGrant
-                                // For now, just log
-                                tracing::debug!(
-                                    session_id = session_ctx.session_id(),
-                                    "Received CreditGrant from client (not yet processed)"
-                                );
+                                let mut payload_buf = frame.payload.clone();
+                                match CreditGrantPayload::decode(&mut payload_buf) {
+                                    Ok(cg) => {
+                                        match cg.credit_type {
+                                            CreditGrantPayload::CREDIT_TYPE_HOT => {
+                                                tracing::debug!(
+                                                    session_id = session_ctx.session_id(),
+                                                    credit_amount = cg.credit_amount,
+                                                    address = %String::from_utf8_lossy(&cg.address),
+                                                    "Received hot CreditGrant from client (server-side sending not yet implemented)"
+                                                );
+                                            }
+                                            CreditGrantPayload::CREDIT_TYPE_COLD => {
+                                                tracing::debug!(
+                                                    session_id = session_ctx.session_id(),
+                                                    credit_amount = cg.credit_amount,
+                                                    address = %String::from_utf8_lossy(&cg.address),
+                                                    "Received cold CreditGrant from client (server-side sending not yet implemented)"
+                                                );
+                                            }
+                                            _ => {
+                                                tracing::warn!(
+                                                    session_id = session_ctx.session_id(),
+                                                    credit_type = cg.credit_type,
+                                                    "Unknown credit_type in CreditGrant frame"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            session_id = session_ctx.session_id(),
+                                            error = %e,
+                                            "Failed to decode CreditGrant frame"
+                                        );
+                                        // Optionally send Error frame and close connection
+                                        let err_msg = format!("Invalid CreditGrant: {}", e);
+                                        let err_frame = build_error_frame(400u16, &err_msg);
+                                        let _ = endpoint.send_raw_frame(err_frame).await;
+                                        return Err(TransportError::Protocol(e.into()));
+                                    }
+                                }
                             }
 
                             // === Acknowledge frame (0x03) - client acknowledging server's frames ===
@@ -310,7 +346,8 @@ async fn main_loop(
                                 if let Err(e) = handle_data_frame(
                                     endpoint, 
                                     session_ctx, 
-                                    &frame
+                                    &frame,
+                                    ingress_bridge,
                                 ).await {
                                     tracing::error!(
                                         session_id = session_ctx.session_id(),
@@ -333,11 +370,7 @@ async fn main_loop(
                                     "Unexpected frame type 0x{:02x}", 
                                     frame.frame_type
                                 );
-                                let mut err_payload = BytesMut::with_capacity(2 + 2 + err_msg.len());
-                                err_payload.put_u16_le(400u16);
-                                err_payload.put_u16_le(err_msg.len() as u16);
-                                err_payload.put_slice(err_msg.as_bytes());
-                                let err_frame = Frame::new(FrameType::Error as u8, err_payload.freeze());
+                                let err_frame = build_error_frame(400u16, &err_msg);
                                 let _ = endpoint.send_raw_frame(err_frame).await;
                                 return Err(ProtocolError::UnexpectedFrame(format!("0x{:02x}", frame.frame_type)).into());
                             }
@@ -381,13 +414,19 @@ async fn main_loop(
 ///
 /// `CreditManager` uses atomic CAS operations, so this function is safe to call
 /// concurrently if needed (though currently only one task processes frames per session).
-async fn handle_data_frame(
-    endpoint: &mut IPCEndpoint<UnixStream>,
-    session_ctx: &Arc<ServerSessionContext>,
+pub async fn handle_data_frame<S, B>(
+    endpoint: &mut IPCEndpoint<S>,
+    session_ctx: &ServerSessionContext,
     frame: &Frame,
-) -> Result<(), TransportError> {
+    ingress_bridge: &B,
+) -> Result<(), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    B: IngressBridge,
+{
     // 1. Parse the Data payload (zero-copy)
-    let parsed = ParsedDataPayload::decode(&frame.payload)
+    let mut payload_buf = frame.payload.clone();
+    let parsed = ParsedDataPayload::decode(&mut payload_buf)
         .map_err(|e| TransportError::Protocol(e.into()))?;
 
     let session_sequence = parsed.session_sequence;
@@ -401,8 +440,23 @@ async fn handle_data_frame(
         "Received Data frame"
     );
 
-    // 2. Attempt to consume hot credit
-    if !session_ctx.incoming_credit_manager().consume_hot_credit(){
+    // 2. Duplicate check
+    let is_new_frame = session_ctx.l2_state().update_last_received(session_sequence);
+    if !is_new_frame {
+        tracing::debug!(
+            session_id = session_ctx.session_id(),
+            session_sequence,
+            "Duplicate or out-of-order Data frame received. Sending Ack without processing."
+        );
+        // We MUST ack it so the client can free its UnackedBuffer slot,
+        // but we DO NOT consume a credit and DO NOT pass it to the Ingress Bridge.
+        endpoint.send_ack(session_sequence).await?;
+        return Ok(());
+    }
+
+    // 3. Attempt to consume hot credit
+    let credit_manager = session_ctx.incoming_credit_manager();
+    if !credit_manager.consume_hot_credit(){
         // Protocol violation: client sent Data without available credit
         tracing::warn!(
             session_id = session_ctx.session_id(),
@@ -412,47 +466,88 @@ async fn handle_data_frame(
 
         // Send Drop frame with reason = buffer_overflow (1)
         let _ = endpoint.send_drop(session_sequence, 1).await;
+        tracing::warn!(
+            session_id = session_ctx.session_id(),
+            session_sequence,
+            "Sended Drop"
+        );
 
         // Close the connection
         return Err(ProtocolError::UnexpectedFrame("Client exceeded hot credit limit".into()).into());
     }
 
-    // RAII guard: guaranteed to return the credit on any exit from the function
-    struct CreditGuard<'a> {
-        manager: &'a CreditManager,
-        replenished: bool,
+    // 4. Try to push to hot buffer
+    let buffered_frame = BufferedFrame {
+        session_sequence,
+        address: address.clone(),
+        messages_raw: parsed.messages_raw.clone(),
+    };  
+
+    let hot_buffer = session_ctx.incoming_hot_buffer();
+    if !hot_buffer.try_push(buffered_frame).await {
+        // Hot buffer full — backpressure    
+        credit_manager.replenish_hot_credit(); // Вернуть кредит
+        tracing::warn!(
+            session_id = session_ctx.session_id(),
+            session_sequence,
+            "Hot buffer full"
+        );
+        let _ = endpoint.send_drop(session_sequence, 1).await;
+        return Err(ProtocolError::UnexpectedFrame("Hot buffer full".into()).into());
     }
 
-    impl<'a> Drop for CreditGuard<'a> {
-        fn drop(&mut self) {
-            if !self.replenished {
-                self.manager.replenish_hot_credit();
-            }
+    // 5. Frame accepted into hot buffer
+    // Credit remains consumed (will be replenished by background processor)
+    let hot_buffer_len = session_ctx.incoming_hot_buffer().len().await;
+    tracing::debug!(
+        session_id = session_ctx.session_id(),
+        session_sequence,
+        hot_buffer_len,
+        "Frame pushed to hot buffer, credit remains consumed"
+    );     
+
+   
+    // 6. Process the frame (TODO: Stage 6 - Ingress Bridge)
+    // For now, just log that we would process it
+    let ingress_result = ingress_bridge.process(&address, &parsed.messages_raw, session_ctx).await;
+
+    match ingress_result {
+        IngressResult::Accepted => {
+            credit_manager.replenish_hot_credit();
+            
+            // TODO: get frame from hot buffer
+            let _msg = hot_buffer.pop().await;
+
+            let hot_buffer_len = session_ctx.incoming_hot_buffer().len().await;
+            endpoint.send_ack(session_sequence).await?;
+            tracing::debug!(
+                session_id = session_ctx.session_id(),
+                session_sequence,
+                hot_available = credit_manager.hot_available(),
+                hot_buffer_len,
+                "Data frame processed successfully, credit replenished"
+            );
+            Ok(())
+        }
+        IngressResult::AddressBlocked => {
+            tracing::warn!(
+                session_id = session_ctx.session_id(),
+                session_sequence,
+                "Address blocked, credit remains consumed (TODO: Stage 10 Cold Buffer)"
+            );
+            // TODO: In Stage 10, moving to the Cold Buffer will happen here.
+            // For now, we don't send an Ack and don't return the credit.
+            Ok(())
+        }
+        IngressResult::Rejected(reason) => {
+            tracing::warn!(
+                session_id = session_ctx.session_id(),
+                session_sequence,
+                reason = %reason,
+                "Ingress Bridge rejected frame, credit remains consumed"
+            );
+            let _ = endpoint.send_drop(session_sequence, 3).await; // 3 = processing_error
+            Err(ProtocolError::UnexpectedFrame(reason).into())
         }
     }
-
-    let mut guard = CreditGuard {
-        manager: session_ctx.incoming_credit_manager(),
-        replenished: false,
-    };    
-
-    // 3. Process the frame (TODO: Stage 6 - Ingress Bridge)
-    // For now, just log that we would process it
-    tracing::debug!(
-        session_id = session_ctx.session_id(),
-        session_sequence,
-        "Processing Data frame (TODO: Ingress Bridge)"
-    );
-
-    // 4. Send Acknowledge
-    endpoint.send_ack(session_sequence).await?;
-
-    tracing::debug!(
-        session_id = session_ctx.session_id(),
-        session_sequence,
-        hot_available = session_ctx.incoming_credit_manager().hot_available(),
-        "Acknowledged Data frame and replenished credit"
-    );
-
-    Ok(())
 }
