@@ -39,75 +39,9 @@ mod tests {
         ServerLimits,
     };
 
-    use crate::test_utils::{init_tracing, dummy_in_only_message};
+    use crate::test_utils::{StubIngressBridge, init_tracing, dummy_in_only_message};
     
     use super::super::{config::ServerConfig, BrokerServer};
-    use super::super::connection_handler::handle_data_frame;
-
-
-    // =========================================================================
-    // Test-only IngressBridge Implementation
-    // =========================================================================
-
-    /// Test-only stub implementation of IngressBridge for integration tests.
-    /// This allows tests to control the behavior of frame processing without
-    /// depending on the actual Ingress Bridge implementation.
-    struct StubIngressBridge {
-        /// If set, delays processing by the specified number of milliseconds
-        delay_ms: Option<u64>,
-        /// If set, blocked frames after the specified count
-        blocked_after: Option<usize>,
-        /// Counter for processed frames
-        frame_counter: std::sync::atomic::AtomicUsize,
-    }
-
-
-    impl StubIngressBridge {
-        fn new() -> Self {
-            Self {
-                delay_ms: None,
-                blocked_after: None,
-                frame_counter: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-
-        fn with_delay(mut self, delay_ms: u64) -> Self {
-            self.delay_ms = Some(delay_ms);
-            self
-        }
-
-        fn with_blocked_after(mut self, n: usize) -> Self {
-            self.blocked_after = Some(n);
-            self
-        }
-    } 
-
-    impl IngressBridge for StubIngressBridge {
-        fn process<'a>(
-            &'a self,
-            _address: &Bytes,
-            _messages_raw: &Bytes,
-            _session_ctx: &ServerSessionContext,
-        ) -> impl std::future::Future<Output = IngressResult> + Send + 'a {
-            async move {
-                // Apply delay if configured
-                if let Some(delay) = self.delay_ms {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
-
-                // Check rejection logic if configured
-                if let Some(reject_after) = self.blocked_after {
-                    let frame_num = self.frame_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    if frame_num > reject_after {
-                        return IngressResult::AddressBlocked;
-                    }
-                }
-
-                // Default: accept all frames
-                IngressResult::Accepted
-            }
-        }
-    }       
 
     fn create_data_frame(sequence: u64, address: Bytes, msg_payload: Bytes) -> Frame {
 

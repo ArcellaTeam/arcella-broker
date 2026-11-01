@@ -9,7 +9,7 @@
 
 use bytes::Bytes;
 
-use super::super::security::ServerSessionContext;
+use super::super::security::SessionContext;
 
 /// Result of processing an Ingress Bridge frame
 #[derive(Debug, PartialEq)]
@@ -34,10 +34,12 @@ pub trait IngressBridge: Send + Sync {
     /// * `Accepted` - the frame is accepted; an Ack can be sent and the credit returned
     /// * `AddressBlocked` - the address is blocked; a cold buffer is needed
     /// * `Rejected` - an error; the credit is NOT returned (backpressure)
-    fn process<'a>(
+    fn process<'a, C>(
         &'a self,
         address: &Bytes,
         messages_raw: &Bytes,
-        session_ctx: &ServerSessionContext,
-    ) -> impl Future<Output = IngressResult> + Send + 'a;        
+        session_ctx: &C,
+    ) -> impl Future<Output = IngressResult> + Send + 'a
+    where
+        C: SessionContext + ?Sized;        
 }

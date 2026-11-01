@@ -7,6 +7,7 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use bytes::{Bytes};
 use std::sync::{Arc, OnceLock};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -20,6 +21,11 @@ use crate::{
 };
 
 pub use crate::protocol::test_utils::*;
+
+use crate::broker_core::{
+    l2::{IngressBridge, IngressResult},
+    security::{SessionContext},
+};
 
 /// Create a test client with a local reestr
 pub fn test_client(address: String) -> Result<BrokerClient, BrokerError> {
@@ -45,3 +51,70 @@ pub fn init_tracing(directives: &str) {
             .init();
     });    
 }
+
+// =========================================================================
+// Test-only IngressBridge Implementation
+// =========================================================================
+
+/// Test-only stub implementation of IngressBridge for integration tests.
+/// This allows tests to control the behavior of frame processing without
+/// depending on the actual Ingress Bridge implementation.
+pub struct StubIngressBridge {
+    /// If set, delays processing by the specified number of milliseconds
+    delay_ms: Option<u64>,
+    /// If set, blocked frames after the specified count
+    blocked_after: Option<usize>,
+    /// Counter for processed frames
+    frame_counter: std::sync::atomic::AtomicUsize,
+}
+
+impl StubIngressBridge {
+    pub fn new() -> Self {
+        Self {
+            delay_ms: None,
+            blocked_after: None,
+            frame_counter: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn with_delay(mut self, delay_ms: u64) -> Self {
+        self.delay_ms = Some(delay_ms);
+        self
+    }
+
+    pub fn with_blocked_after(mut self, n: usize) -> Self {
+        self.blocked_after = Some(n);
+        self
+    }
+} 
+
+impl IngressBridge for StubIngressBridge {
+    fn process<'a, C>(
+        &'a self,
+        _address: &Bytes,
+        _messages_raw: &Bytes,
+        _session_ctx: &C,
+    ) -> impl std::future::Future<Output = IngressResult> + Send + 'a
+    where
+        C: SessionContext + ?Sized
+    {
+        async move {
+            // Apply delay if configured
+            if let Some(delay) = self.delay_ms {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+
+            // Check rejection logic if configured
+            if let Some(reject_after) = self.blocked_after {
+                let frame_num = self.frame_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if frame_num > reject_after {
+                    return IngressResult::AddressBlocked;
+                }
+            }
+
+            // Default: accept all frames
+            IngressResult::Accepted
+        }
+    }
+}       
+
