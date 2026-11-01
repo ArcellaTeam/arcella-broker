@@ -199,7 +199,7 @@ mod tests {
     /// - After the client closes the connection, the session is removed from `SessionManager`.
     #[tokio::test]
     async fn test_full_handshake_session_registered() {
-        init_tracing("trace");
+        init_tracing("info");
 
         let temp_dir = tempdir().unwrap();
         let socket_path = temp_dir.path().join("test.sock.1");
@@ -379,7 +379,7 @@ mod tests {
     /// - The buffer size is strictly bounded by the limit (O(1) memory consumption guarantee).
     #[tokio::test]
     async fn test_backpressure_o1_guarantee_client_server() {
-        init_tracing("trace");
+        init_tracing("info");
 
         let temp_dir = tempdir().unwrap();
         let socket_path = temp_dir.path().join("test.sock.5");
@@ -462,7 +462,7 @@ mod tests {
     ///   server sends Drop and closes connection.
     #[tokio::test]
     async fn test_server_credit_enforcement() {
-        init_tracing("trace");
+        init_tracing("info");
 
         let temp_dir = tempdir().unwrap();
         let socket_path = temp_dir.path().join("test.sock.6");
@@ -551,7 +551,7 @@ mod tests {
     /// UnackedBuffer backpressure check. We simulate this by using raw transport.
     #[tokio::test]
     async fn test_server_detects_credit_violation() {
-        init_tracing("trace");
+        init_tracing("info");
 
         let temp_dir = tempdir().unwrap();
         let socket_path = temp_dir.path().join("test.sock.7");
@@ -672,4 +672,148 @@ mod tests {
         server.shutdown();
         let _ = server_handle.await;
     }        
+
+    /// **Test 8:** End-to-End Stress Test & Recovery
+    ///
+    /// Verifies deterministic backpressure and recovery without memory leaks:
+    /// 1. Server is configured with extremely low limits (hot_credit = 5).
+    /// 2. Server intentionally delays processing (simulating slow L3 / blocked queue).
+    /// 3. Client aggressively tries to send 10,000 frames.
+    /// 4. Phase 1 (Backpressure): Client hits O(1) limit, stops allocating, gets backpressure errors.
+    /// 5. Phase 2 (Recovery): Server "unfreezes", starts processing and sending Acks.
+    /// 6. Phase 3 (Resume): Client receives Acks, frees slots, completes all 10,000 sends.
+    /// 7. Final check: No frames left in-flight (all session_sequences acknowledged).
+    #[tokio::test]
+    async fn test_backpressure_stress_and_recovery() {
+        init_tracing("info");
+
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("test.sock.8");
+        
+        let config = ServerConfig {
+            socket_path: socket_path.clone(),
+            limits: ServerLimits {
+                hot_credit: 5,
+                cold_credit: 2,
+                session_ttl_ms: 60_000,
+                ..ServerLimits::default()
+            },
+            session_timeout_ms: 30_000,
+            gc_interval_ms: 1000,
+        };
+
+        // Phase 1 setup: Server processes very slowly (500ms per frame) -> no Acks sent quickly
+        let ingress_bridge = Arc::new(StubIngressBridge::new().with_delay(500));
+        let bridge_clone = Arc::clone(&ingress_bridge);
+        
+        let (server, server_handle) = spawn_test_server_with_bridge(config, ingress_bridge).await;
+        let (endpoint, welcome) = client_handshake(&socket_path).await.unwrap();
+        
+        assert_eq!(welcome.limits.hot_credit, 5);
+        assert_eq!(endpoint.unacked_buffer().capacity(), 5);
+
+        // Wrap endpoint in Arc<Mutex> to share between sender and receiver tasks
+        let endpoint = Arc::new(Mutex::new(endpoint));
+        let address = Bytes::from("test:stress");
+        let msg = dummy_in_only_message(
+            Bytes::from("test.type"),
+            address.clone(),
+            Bytes::from("payload"),
+        );
+
+        let total_messages: u64 = 10_000;
+        let sent_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ack_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        
+        let sent_count_clone = Arc::clone(&sent_count);
+        let ack_count_clone = Arc::clone(&ack_count);
+        let endpoint_sender = Arc::clone(&endpoint);
+        let msg_clone = msg.clone();
+        let address_clone = address.clone();
+
+        // Sender task: aggressively tries to send 10,000 frames
+        let sender_task = tokio::spawn(async move {
+            let mut current_seq = 0;
+            while current_seq < total_messages {
+                let mut ep = endpoint_sender.lock().await;
+                match ep.send_data(address_clone.clone(), &[msg_clone.clone()]).await {
+                    Ok(_seq) => {
+                        current_seq += 1;
+                        sent_count_clone.store(current_seq, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Err(TransportError::UnackedBuffer(_)) 
+                    | Err(TransportError::Protocol(_)) => {
+                        // Backpressure: buffer full or no credits. Release lock and wait.
+                        drop(ep);
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(e) => {
+                        panic!("Unexpected error during send: {:?}", e);
+                    }
+                }
+            }
+        });
+
+        let endpoint_recv = Arc::clone(&endpoint);
+        
+        // Receiver task: reads Acks and frees slots in UnackedBuffer
+        let receiver_task = tokio::spawn(async move {
+            loop {
+                let mut ep = endpoint_recv.lock().await;
+                let recv_result = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    ep.recv()
+                ).await;
+                
+                match recv_result {
+                    Ok(Ok(Some(frame))) => {
+                        if frame.frame_type == FrameType::Acknowledge as u8 {
+                            let mut payload = frame.payload.clone();
+                            let seq = payload.get_u64_le();
+                            ep.acknowledge(seq);
+                            let current_acks = ack_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            if current_acks == total_messages {
+                                break;
+                            }
+                        } else if frame.frame_type == FrameType::Ping as u8 {
+                            // Handle server keep-alive
+                            let mut pong_payload = BytesMut::with_capacity(frame.payload.len());
+                            pong_payload.put_slice(&frame.payload);
+                            let pong_frame = Frame::new(FrameType::Pong as u8, pong_payload.freeze());
+                            let _ = ep.send_raw_frame(pong_frame).await;
+                        }
+                    }
+                    Ok(Ok(None)) => break, // Connection closed
+                    Ok(Err(_)) => break,    // Transport error
+                    Err(_) => continue,     // Timeout
+                }
+            }
+        });
+
+        // Give client time to hit the backpressure limit
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        
+        let sent_so_far = sent_count.load(std::sync::atomic::Ordering::SeqCst);
+        // Client should be blocked by hot_credit limit (5), server is too slow to send Acks
+        assert!(sent_so_far <= 5, "Client should be blocked by hot_credit limit (5), but sent {}", sent_so_far);
+        
+        let in_flight = endpoint.lock().await.in_flight_count();
+        assert_eq!(in_flight, sent_so_far as usize, "All sent frames should be in-flight");
+
+        // Phase 2: Recovery - server "unfreezes"
+        bridge_clone.switch_to_accept();
+
+        // Phase 3: Wait for completion
+        let _ = tokio::join!(sender_task, receiver_task);
+
+        let final_sent = sent_count.load(std::sync::atomic::Ordering::SeqCst);
+        let final_acked = ack_count.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(final_sent, total_messages, "All 10,000 frames must be sent");
+        assert_eq!(final_acked, total_messages, "All 10,000 frames must be acknowledged");
+        assert_eq!(endpoint.lock().await.in_flight_count(), 0, "No frames should be left in-flight (O(1) guarantee)");
+
+        server.shutdown();
+        let _ = server_handle.await;
+    }
 }
