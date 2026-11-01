@@ -7,6 +7,13 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+//! Session management for the L2 protocol server.
+//!
+//! This module provides the [`SessionManager`], which is responsible for the lifecycle
+//! of active L2 sessions. It ensures fast, lock-free lookups during the frame-processing
+//! hot path while safely handling concurrent registrations and background garbage collection
+//! of expired sessions.
+
 use std::collections::HashMap;
 use std::sync::{
     Arc, 
@@ -30,12 +37,24 @@ static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 /// - Registering new sessions after a successful handshake.
 /// - Fast lookup of a session by `session_id` when processing incoming frames.
 /// - Cleaning up expired (timeout) sessions via a background task.
+///
+/// # Thread Safety
+/// This struct is designed to be shared across multiple threads via `Arc<SessionManager>`.
+/// Internal state is protected by an `RwLock`, allowing highly concurrent reads (hot path)
+/// and exclusive, brief writes (registration, removal, and garbage collection).
 pub struct SessionManager {
     sessions: RwLock<HashMap<u64, Arc<ServerSessionContext>>>,
 }
 
 impl SessionManager {
-    /// Creates a new empty session manager.
+    /// Creates a new, empty session manager.
+    ///
+    /// # Initial State
+    /// The manager starts with zero active sessions. It is ready to accept
+    /// registrations immediately after creation.
+    ///
+    /// # Thread Safety
+    /// The returned instance is safe to share across multiple threads via `Arc<SessionManager>`.
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
@@ -43,6 +62,20 @@ impl SessionManager {
     }
 
     /// Registers a new session after a successful handshake.
+    ///
+    /// # Arguments
+    /// * `session_id` - The unique identifier for the session.
+    /// * `session_token` - The cryptographic token used for session resumption/validation.
+    /// * `limits` - The `ServerLimits` negotiated during the handshake.
+    /// * `l2_state` - The underlying L2 protocol state (sequence numbers, credits, etc.).
+    ///
+    /// # Idempotency
+    /// If a session with the given `session_id` already exists, this method returns
+    /// a clone of the existing `Arc<ServerSessionContext>` without overwriting it.
+    /// This prevents race conditions during concurrent handshake completions for the same ID.
+    ///
+    /// # Returns
+    /// An `Arc<ServerSessionContext>` representing the registered session.
     pub fn register_session(
         &self,
         session_id: u64,
@@ -62,14 +95,27 @@ impl SessionManager {
     }
 
     /// Retrieves the session context by ID.
-    /// Returns a clone of the Arc so as not to hold the RwLock
-    /// during frame processing (zero-lock hot path).
+    ///
+    /// # Performance (Zero-Lock Hot Path)
+    /// This method acquires a read lock only for the duration of the `HashMap` lookup.
+    /// It returns a clone of the `Arc`, ensuring that the lock is released immediately.
+    /// The caller can then use the session context for frame processing without holding
+    /// any locks, guaranteeing zero contention on the hot path.
     pub fn get_session(&self, session_id: u64) -> Option<Arc<ServerSessionContext>> {
         let sessions = self.sessions.read().expect("SessionManager RwLock read poisoned");
         sessions.get(&session_id).map(Arc::clone)
     }
 
     /// Removes a session (on connection drop or explicit close).
+    ///
+    /// # When to Call
+    /// This should be invoked when a physical connection is dropped, a handshake fails,
+    /// or an explicit `Close` (0x07) frame is received and processed.
+    ///
+    /// # Side Effects
+    /// Removing the session from the registry does *not* automatically close the
+    /// underlying socket or abort background tasks. The caller is responsible for
+    /// ensuring the socket is dropped or calling `force_close()` on the context.
     pub fn remove_session(&self, session_id: u64) {
         let mut sessions = self.sessions.write().expect("SessionManager RwLock write poisoned");
         sessions.remove(&session_id);
@@ -82,7 +128,7 @@ impl SessionManager {
     ///
     /// # Algorithm
     /// 1. **Scan phase (Read Lock):** Iterates over active sessions.
-    /// Collects the identifiers of those with now - last_activity_ms > timeout_ms.
+    /// Collects the identifiers of those with `now - last_activity_ms > timeout_ms`.
     /// At this stage only `RwLock::read` is held, which does not block
     /// concurrent `get_session` calls in frame-processing tasks.
     /// 2. **Deletion phase (Write Lock):** Briefly acquires `RwLock::write`
@@ -105,7 +151,7 @@ impl SessionManager {
     /// constantly "wake up" a session, preventing the garbage collector from completing
     /// cleanup and potentially causing accumulation of inactive resources.
     ///
-    /// # Return value
+    /// # Returns
     /// The number of sessions actually removed. The value is intended for
     /// export to metrics and logging (e.g., `session_cleanup_removed_total`).
     ///
@@ -140,13 +186,29 @@ impl SessionManager {
         expired_ids.len()
     }        
 
-    /// Returns the current number of active sessions (for metrics).
+    /// Returns the current number of active sessions.
+    ///
+    /// # Performance
+    /// This provides a point-in-time snapshot. It acquires a read lock briefly.
+    /// It is suitable for metrics and telemetry, but should **not** be called
+    /// in the per-frame hot path.
     pub fn active_sessions_count(&self) -> usize {
         self.sessions.read().expect("SessionManager RwLock read poisoned").len()
     }
 
-    /// Spawns a background task that periodically cleans up expired sessions.
-    /// Returns a JoinHandle that can be aborted to stop the GC.
+    /// Spawns a background Tokio task that periodically cleans up expired sessions.
+    ///
+    /// # Arguments
+    /// * `timeout_ms`: The maximum allowed inactivity period for a session before it is considered expired.
+    /// * `interval_ms`: How often the background task wakes up to perform the cleanup scan.
+    ///   *(Recommended: `interval_ms` should be significantly smaller than `timeout_ms`, 
+    ///   e.g., 10% of the timeout value, to ensure timely cleanup without excessive CPU wakeups).*
+    ///
+    /// # Lifecycle & Cancellation Safety
+    /// The task runs indefinitely until the returned `JoinHandle` is explicitly aborted,
+    /// or the Tokio runtime shuts down. The task is cancellation-safe: aborting the handle
+    /// will simply stop future cleanup cycles without leaving the `SessionManager` in an 
+    /// inconsistent state.
     pub fn spawn_cleanup_task(
         self: &Arc<Self>,
         timeout_ms: u64,

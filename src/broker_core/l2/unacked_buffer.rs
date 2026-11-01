@@ -7,6 +7,23 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+//! Lock-based ring buffer for storing unacknowledged L2 frames.
+//!
+//! This module is a key component for implementing the client
+//! backpressure guarantee with O(1) memory consumption (Stage 5.2 of the specification). It ensures
+//! that the client physically cannot allocate memory beyond the `hot_credit` limit, even if
+//! the server "hangs" and does not send acknowledgments (`Acknowledge`).
+//!
+//! # Architectural features
+//!
+//! - Uses a direct index (`sequence % capacity`) to access a slot, which
+//! provides the acknowledge operation in O(1) time without searching.
+//! - Uses `parking_lot::Mutex` to minimize contention. The critical section
+//! is extremely short (access to a single slot), so the locking overhead
+//! is negligible.
+//! - Performs no dynamic allocations (`Vec::with_capacity` is used only during
+//! initialization) on the hot path.
+
 use parking_lot::Mutex;
 use crate::protocol::Frame;
 
@@ -42,6 +59,11 @@ pub struct UnackedBuffer {
 
 impl UnackedBuffer {
     /// Creates a new ring buffer with the given capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * capacity — the maximum number of frames the buffer can hold.
+    /// Must be strictly greater than 0 and is usually equal to the hot_credit value from ServerLimits.
     /// 
     /// # Panics
     /// 
@@ -67,11 +89,22 @@ impl UnackedBuffer {
     }
 
     /// Pushes a frame into the buffer with the given sequence number.
+    ///
+    /// # Arguments
+    ///
+    /// * `sequence` — monotonically increasing frame number within the session.
+    /// * `frame` — the frame itself to store.
     /// 
-    /// # Returns
-    /// 
-    /// - `Ok(())` if the frame was successfully pushed.
-    /// - `Err(PushError::BufferFull)` if the target slot is already occupied.
+    /// # Return value
+    ///
+    /// * `Ok(())` if the frame was successfully placed into a free slot.
+    /// * `Err(UnackedBufferError::SlotOccupied)` if the target slot is already occupied.
+    /// This signals backpressure: the buffer is full, and the sender must
+    /// stop sending until an Acknowledge is received.
+    ///
+    /// # Performance
+    ///
+    /// O(1) in time. Performs no dynamic allocations.
     pub fn push(&self, sequence: u64, frame: Frame) -> Result<(), UnackedBufferError> {
         let idx = (sequence % (self.capacity as u64)) as usize;
         let mut inner = self.inner.lock();
@@ -94,7 +127,7 @@ impl UnackedBuffer {
 
     /// Acknowledges a frame with the given sequence number, removing it from the buffer.
     /// 
-    /// # Returns
+    /// # Return value
     /// 
     /// - `true` if the frame was found and removed.
     /// - `false` if the slot was empty or the sequence number did not match.
@@ -108,6 +141,11 @@ impl UnackedBuffer {
     /// # Returns
     /// - `true` if the frame was found and removed.
     /// - `false` if the slot is empty or the sequence does not match.
+    ///
+    /// # Return value
+    ///
+    /// * true if the frame was found and removed.
+    /// * false if the slot is empty or the sequence number does not match.
     pub fn remove(&self, sequence: u64) -> bool {
         let idx = (sequence % (self.capacity as u64)) as usize;
         let mut inner = self.inner.lock();
@@ -128,7 +166,19 @@ impl UnackedBuffer {
         false
     } 
 
-    /// Returns all unacked frames, sorted by sequence in ascending order.
+    /// Returns all unacknowledged frames sorted by sequence
+    /// number in ascending order.
+    ///
+    /// # Usage
+    ///
+    /// Used primarily during session recovery (the Resume operation),
+    /// when the client needs to resend frames that were sent
+    /// but did not receive acknowledgment from the server before the connection dropped.
+    ///
+    /// # Performance
+    ///
+    /// O(N), where N is the buffer capacity (`capacity`), since the method performs a linear
+    /// pass over the ring buffer to collect and sort the active frames.
     pub fn get_unacked_frames(&self) -> Vec<(u64, Frame)> {
         let inner = self.inner.lock();
         
@@ -157,6 +207,13 @@ impl UnackedBuffer {
         unacked_frames
     }
 
+    /// Returns the smallest sequence number currently stored in the buffer.
+    ///
+    /// # Return value
+    ///
+    /// * `Some(u64)` — the "head" of the unacknowledged frame window. Any number below this
+    /// value has already been acknowledged and removed from the buffer.
+    /// * `None` — if the buffer is completely empty.
     #[inline]
     pub fn base_sequence(&self) -> Option<u64> {
         let inner = self.inner.lock();
@@ -177,20 +234,39 @@ impl UnackedBuffer {
         inner.occupied_count == 0
     }
 
-    /// Returns true if the buffer is at full capacity.
-    /// O(1) operation, no allocations.
+    /// Returns true if the buffer has reached its maximum capacity.
+    ///
+    /// # Performance
+    ///
+    /// O(1) operation, performs no allocations. Used for an instant
+    /// check of whether backpressure needs to be applied before attempting to send.
     #[inline]
     pub fn is_full(&self) -> bool {
         let inner = self.inner.lock();
         inner.occupied_count >= self.capacity
     }    
 
-    /// Returns the capacity of the buffer.
+    /// Returns the maximum capacity of the buffer.
+    ///
+    /// This value is strictly bound to the `hot_credit` limit received from the server
+    /// in the `Welcome` packet, which guarantees O(1) memory consumption per session.
     #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
+    /// Internal helper method for finding the next valid
+    /// `base_sequence` number after removing the current one.
+    ///
+    /// # Arguments
+    ///
+    /// * `inner` — reference to the locked internal buffer state.
+    /// * `after_sequence` — the sequence number that was just removed.
+    ///
+    /// # Return value
+    ///
+    /// * `Some(u64)` — the new minimum sequence number in the buffer.
+    /// * `None` — if the buffer became completely empty after the removal.
     fn find_next_base_sequence_locked(inner: &UnackedBufferInner, after_sequence: u64) -> Option<u64> {
         if inner.occupied_count == 0 {
             return None;

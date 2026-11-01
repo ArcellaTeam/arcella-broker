@@ -7,6 +7,21 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+//! L2 Protocol handshake implementation.
+//!
+//! This module implements the server-side of the L2 protocol handshake sequence:
+//! `Hello` → `Welcome` → `AuthResponse` → `AuthResult`.
+//!
+//! # Current Implementation Status (Stage 5)
+//! This implementation currently supports only the `None` (0x00) authentication algorithm.
+//! Full Challenge-Response authentication (HMAC-SHA256, BLAKE3-HMAC, GOST) will be
+//! implemented in Stage 11 according to the roadmap.
+//!
+//! # Thread Safety
+//! The [`HandshakeHandler`] is designed to be shared across multiple connection handlers
+//! via `Arc<HandshakeHandler>`. All mutable state is protected by atomic operations,
+//! making it safe for concurrent use in an async Tokio runtime.
+
 use bytes::Bytes;
 use getrandom::fill as getrandom_fill;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,26 +36,50 @@ use crate::protocol::{
     },
 };
 
+/// Errors that can occur during the L2 handshake process.
+///
+/// # Error Categories
+/// - **Protocol Errors**: Version mismatches, unexpected frames, unsupported algorithms
+/// - **Authentication Errors**: Invalid credentials, session ID mismatches
+/// - **System Errors**: RNG failures, connection drops, payload decode errors
+///
+/// # Error Handling
+/// All errors in this enum are considered fatal for the handshake. Upon encountering
+/// any of these errors, the connection should be terminated with an appropriate
+/// `Close` (0x07) frame or immediate socket closure.
 #[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
+    /// Authentication failed due to invalid credentials or session mismatch.
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
 
+    /// Client and server protocol versions are incompatible.
     #[error("Protocol version mismatch: expected {expected}, got {got}")]
     ProtocolVersionMismatch { expected: u16, got: u16 },
 
+    /// The connection was closed before the handshake completed.
     #[error("Connection closed during handshake")]
     ConnectionClosed,
 
+    /// The client requested an authentication algorithm not supported by the server.
     #[error("Unsupported authentication algorithm: 0x{0:02x}")]
     UnsupportedAlgorithm(u8),
 
+    /// Failed to decode a handshake payload (malformed or corrupted data).
     #[error("Payload decode error: {0}")]
     PayloadDecode(String),
 
+    /// Received an unexpected frame type during the handshake sequence.
     #[error("Get unexpected frame: {0}")]
     UnexpectedFrame(String),
 
+    /// Cryptographically secure random number generator failed.
+    /// 
+    /// # Severity
+    /// This is a critical system error. If RNG fails, the server cannot generate
+    /// secure session tokens or challenges, making it impossible to establish
+    /// secure sessions. The server should log this error and potentially refuse
+    /// new connections until the issue is resolved.
     #[error("Cryptographic RNG failure")]
     RngFailure(#[from] getrandom::Error),
 }
@@ -51,22 +90,67 @@ pub enum HandshakeError {
 /// - Generating unique `session_id` (monotonic counter).
 /// - Generating cryptographically secure `session_token` and `server_challenge`.
 /// - Advertising `ServerLimits` to the client during the Welcome phase.
+/// - Validating client responses during the authentication sequence.
 ///
 /// # Configuration
 /// The handler can be configured with custom `ServerLimits` to override defaults.
 /// This allows the broker to tune resource boundaries (credits, frame sizes, TTLs)
 /// based on deployment requirements without changing the core logic.
+///
+/// # Thread Safety
+/// This struct is safe to share across multiple threads via `Arc<HandshakeHandler>`.
+/// The `session_counter` field uses atomic operations for lock-free concurrent access.
+/// All other fields are immutable after construction.
+///
+/// # Lifecycle
+/// 1. Create a handler using [`HandshakeHandler::new`] or [`HandshakeHandler::with_limits`].
+/// 2. Share it across connection handlers via `Arc`.
+/// 3. For each incoming connection, call [`HandshakeHandler::process_hello`] and
+///    [`HandshakeHandler::process_auth_response`] in sequence.
+/// 4. The handler maintains no per-connection state; all state is returned in the
+///    response payloads.
 pub struct HandshakeHandler {
     /// Monotonic counter for generating unique session_ids.
-    /// Starts at 1, since 0 may be used as a reserved value.
+    /// 
+    /// # Why Atomic?
+    /// Using `AtomicU64` instead of a `Mutex` allows multiple connection handlers
+    /// to generate session IDs concurrently without blocking, which is critical
+    /// for high-throughput scenarios where many clients connect simultaneously.
+    ///
+    /// # Starting Value
+    /// Starts at 1, since 0 may be used as a reserved value in some contexts
+    /// (e.g., to indicate "no session" or "uninitialized").
     session_counter: AtomicU64,
     
     /// Server limits advertised to clients during the Welcome handshake.
-    /// These limits define the resource boundaries for each client session.
+    /// 
+    /// # Purpose
+    /// These limits define the resource boundaries for each client session:
+    /// - `hot_credit` / `cold_credit`: Flow control parameters
+    /// - `max_frame_size`: Maximum payload size
+    /// - `session_ttl_ms`: Session lifetime
+    /// - And other limits defined in [`ServerLimits`]
+    ///
+    /// # Immutability
+    /// Once set during construction, these limits cannot be changed. This ensures
+    /// that all clients connecting to the same handler receive consistent limits,
+    /// preventing confusion and potential protocol violations.
     limits: ServerLimits,
 }
 
 impl Default for HandshakeHandler {
+    /// Creates a `HandshakeHandler` with default `ServerLimits`.
+    ///
+    /// # Default Values
+    /// The default limits are suitable for development and testing:
+    /// - `hot_credit`: 50
+    /// - `cold_credit`: 10
+    /// - `max_frame_size`: 16 MB
+    /// - `session_ttl_ms`: 1 hour
+    ///
+    /// # Production Use
+    /// For production deployments, prefer [`HandshakeHandler::with_limits`] to
+    /// configure limits according to your deployment requirements.
     fn default() -> Self {
         Self {
             session_counter: AtomicU64::new(1),
@@ -77,14 +161,46 @@ impl Default for HandshakeHandler {
 
 impl HandshakeHandler {
     /// Creates a new `HandshakeHandler` with default `ServerLimits`.
+    ///
+    /// # Equivalent To
+    /// ```rust
+    /// use arcella_broker::protocol::ServerLimits;
+    /// use arcella_broker::broker_core::security::HandshakeHandler;
+    /// 
+    /// HandshakeHandler::with_limits(ServerLimits::default());
+    /// ```
+    ///
+    /// # Use Case
+    /// Suitable for development, testing, and scenarios where default resource
+    /// limits are acceptable. For production deployments, prefer [`Self::with_limits`].
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Creates a new `HandshakeHandler` with custom `ServerLimits`.
     ///
-    /// This is the preferred constructor for production deployments,
-    /// where limits should be configured via the broker's configuration file.
+    /// # Arguments
+    /// * `limits` - The `ServerLimits` to advertise to connecting clients.
+    ///
+    /// # Use Case
+    /// This is the preferred constructor for production deployments, where limits
+    /// should be configured via the broker's configuration file or environment
+    /// variables to match the deployment's resource constraints and performance
+    /// requirements.
+    ///
+    /// # Example
+    /// ```rust
+    /// use arcella_broker::protocol::ServerLimits;
+    /// use arcella_broker::broker_core::security::HandshakeHandler;
+    /// 
+    /// let limits = ServerLimits {
+    ///     hot_credit: 100,
+    ///     cold_credit: 20,
+    ///     max_frame_size: 8 * 1024 * 1024, // 8 MB
+    ///     ..ServerLimits::default()
+    /// };
+    /// let handler = HandshakeHandler::with_limits(limits);
+    /// ```
     pub fn with_limits(limits: ServerLimits) -> Self {
         Self {
             session_counter: AtomicU64::new(1),
@@ -93,18 +209,53 @@ impl HandshakeHandler {
     }
 
     /// Returns a reference to the currently configured `ServerLimits`.
+    ///
+    /// # Use Case
+    /// Useful for logging, metrics, or debugging to inspect the limits that will
+    /// be advertised to connecting clients.
+    ///
+    /// # Performance
+    /// This is a zero-cost operation that simply returns a reference to the
+    /// immutable `limits` field.
     pub fn limits(&self) -> &ServerLimits {
         &self.limits
     }        
 
-    /// Handles an incoming Hello packet and forms a Welcome response.
+    /// Handles an incoming `Hello` packet and forms a `Welcome` response.
     ///
     /// # Algorithm
-    /// 1. Verifies that the requested authentication algorithm is None (0x00).
-    /// 2. Generates a unique `session_id` using an atomic increment.
-    /// 3. Generates a cryptographically secure `session_token` (`[u8; 32]`).
-    /// 4. Generates a `server_challenge` (`[u8; 32]`) for compatibility with the Welcome structure.
-    /// 5. Returns the assembled `WelcomePayload` with the configured `ServerLimits`.
+    /// 1. **Algorithm Validation**: Verifies that the requested authentication algorithm
+    ///    is `None` (0x00). Other algorithms will be supported in Stage 11.
+    /// 2. **Session ID Generation**: Generates a unique `session_id` using an atomic
+    ///    increment of the internal counter.
+    /// 3. **Session Token Generation**: Generates a cryptographically secure 32-byte
+    ///    `session_token` using the system's CSPRNG.
+    /// 4. **Server Challenge Generation**: Generates a 32-byte `server_challenge` for
+    ///    compatibility with the `WelcomePayload` structure (not yet used for HMAC).
+    /// 5. **Response Assembly**: Returns the assembled `WelcomePayload` with the
+    ///    configured `ServerLimits`.
+    ///
+    /// # Arguments
+    /// * `hello` - The `HelloPayload` received from the client.
+    ///
+    /// # Returns
+    /// * `Ok(WelcomePayload)` - The response to send back to the client.
+    /// * `Err(HandshakeError::UnsupportedAlgorithm)` - If the client requested an
+    ///   unsupported authentication algorithm.
+    /// * `Err(HandshakeError::RngFailure)` - If the CSPRNG failed to generate
+    ///   secure random bytes.
+    ///
+    /// # Thread Safety
+    /// This method is safe to call concurrently from multiple threads. The only
+    /// mutable state is the `session_counter`, which uses atomic operations.
+    ///
+    /// # Security Considerations
+    /// - The `session_token` and `server_challenge` are generated using
+    ///   cryptographically secure random number generation.
+    /// - The `session_id` is monotonically increasing and unique per handler instance.
+    /// - Currently, only the `None` (0x00) algorithm is supported, which provides
+    ///   no authentication. This is acceptable only for development/testing or
+    ///   trusted network environments.
     pub fn process_hello(&self, hello: &HelloPayload) -> Result<WelcomePayload, HandshakeError> {
         // TODO:  only the None (0x00) algorithm is supported
         if hello.algorithm != 0x00 {
@@ -134,13 +285,45 @@ impl HandshakeHandler {
         })
     }
 
-    /// Handles an incoming AuthResponse packet and forms an AuthResult response.
+    /// Handles an incoming `AuthResponse` packet and forms an `AuthResult` response.
     ///
     /// # Algorithm
-    /// 1. Validates that the session_id is valid (basic check for now).
-    /// 2. Since algorithm is 0x00, skips cryptographic HMAC verification.
-    /// 3. Returns AuthResult with status = 0 (success).
-    pub fn process_auth_response(
+    /// 1. **Session ID Validation**: Validates that the `session_id` in the response
+    ///    matches the expected value (the one we issued in the `Welcome`).
+    /// 2. **Authentication Verification**: Since algorithm is 0x00 (None), skips
+    ///    cryptographic HMAC verification.
+    /// 3. **Response Assembly**: Returns `AuthResult` with status = 0 (success).
+    ///
+    /// # Arguments
+    /// * `expected_session_id` - The `session_id` that was issued to the client
+    ///   in the `Welcome` packet.
+    /// * `auth_response` - The `AuthResponsePayload` received from the client.
+    ///
+    /// # Returns
+    /// * `Ok(AuthResultPayload)` - The response to send back to the client.
+    ///   Status will be 0 (success) for the `None` algorithm.
+    /// * `Err(HandshakeError::AuthenticationFailed)` - If the `session_id` in the
+    ///   response does not match the expected value.
+    ///
+    /// # Thread Safety
+    /// This method is safe to call concurrently from multiple threads. It performs
+    /// only read operations on immutable data.
+    ///
+    /// # Security Considerations
+    /// - Currently, only the `None` (0x00) algorithm is supported, which provides
+    ///   no authentication beyond session ID validation.
+    /// - In Stage 11, this method will verify the HMAC signature using the
+    ///   `server_challenge` and the shared `client_secret`.
+    /// - The `client_nonce` in the response will be checked for replay attacks.
+    ///
+    /// # Future Implementation (Stage 11)
+    /// The following checks will be added:
+    /// ```text
+    /// 1. Verify HMAC(client_secret, server_challenge || client_nonce) == response
+    /// 2. Check that client_nonce has not been used before (replay protection)
+    /// 3. Validate that the response was received within the challenge TTL
+    /// ```
+     pub fn process_auth_response(
         &self,
         expected_session_id: u64,
         auth_response: &AuthResponsePayload,
