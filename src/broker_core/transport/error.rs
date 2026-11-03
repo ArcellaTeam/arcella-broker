@@ -77,6 +77,9 @@ pub enum TransportError {
     #[error("Handshake error: {0}")]
     Handshake(#[from] HandshakeError),
 
+    #[error("Internal core error: {0}")]
+    Internal(String),
+
     /// A low-level I/O error.
     ///
     /// Characteristic of transport implementations that use IPC (Unix sockets)

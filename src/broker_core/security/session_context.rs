@@ -7,6 +7,19 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+//! Core of L2 protocol session state management.
+//!
+//! This module defines the shared state and polymorphic interface for active
+//! L2 connections. The architecture is designed to be highly concurrent,
+//! lock-free on the frame-processing hot path,
+//! and protected against address spoofing.
+//!
+//! # Key invariants
+//! - L2 state (`l2_state`, buffers, and credit managers) is initialized once
+//! at creation and never changes structurally.
+//! - The last activity time (`last_activity_ms`) is updated atomically via `touch()`.
+//! - Credit pools (`outgoing_credit_pool`) reflect the resources allocated to us by peers.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -60,6 +73,7 @@ pub struct SessionContextInner {
     /// When the peer sends a CreditGrant, this pool is replenished.
     pub outgoing_credit_pool: Arc<CreditPool>,
 
+    /// Buffer for incoming frames currently being processed (hot path).
     incoming_hot_buffer: Arc<HotBuffer>, 
 
     /// Credit manager for incoming frames (shadow counter).
@@ -178,6 +192,21 @@ pub trait SessionContext {
 
     /// Limits negotiated during the handshake.
     fn limits(&self) -> &ServerLimits;
+
+    /// Returns the authenticated source prefix of this session.
+    ///
+    /// # Security (Critically important)
+    /// This value is set once during a successful handshake
+    /// based on the data provided by the client. It must never
+    /// be overwritten or read from an L3 message header.
+    /// Using this method is the primary defense against address spoofing:
+    /// routing permission checks must always use the session's `source_prefix`
+    /// rather than the one from the frame payload.
+    ///
+    /// # Performance
+    /// Returns a `&str` slice. UTF-8 and address format validation is performed
+    /// only once when the session is created, so this method is zero-cost.
+    fn source_prefix(&self) -> &str;
 
     /// Updates the last activity time.
     fn touch(&self);

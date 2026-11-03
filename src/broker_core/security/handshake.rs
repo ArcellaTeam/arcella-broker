@@ -34,6 +34,7 @@ use crate::protocol::{
         AuthResponsePayload,
         AuthResultPayload,
     },
+    ProtocolError,
 };
 
 /// Errors that can occur during the L2 handshake process.
@@ -53,25 +54,25 @@ pub enum HandshakeError {
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
 
-    /// Client and server protocol versions are incompatible.
-    #[error("Protocol version mismatch: expected {expected}, got {got}")]
-    ProtocolVersionMismatch { expected: u16, got: u16 },
-
     /// The connection was closed before the handshake completed.
     #[error("Connection closed during handshake")]
     ConnectionClosed,
 
-    /// The client requested an authentication algorithm not supported by the server.
-    #[error("Unsupported authentication algorithm: 0x{0:02x}")]
-    UnsupportedAlgorithm(u8),
+    /// The source prefix contains invalid UTF-8 characters
+    #[error("Source prefix contains invalid UTF-8: {0}")]
+    InvalidSourcePrefixUtf8(#[from] std::str::Utf8Error),
+
+    /// The source prefix violates the hierarchical addressing rules
+    #[error("Source prefix violates address format rules: {0}")]
+    InvalidSourcePrefixFormat(#[from] ProtocolError),    
 
     /// Failed to decode a handshake payload (malformed or corrupted data).
     #[error("Payload decode error: {0}")]
     PayloadDecode(String),
 
-    /// Received an unexpected frame type during the handshake sequence.
-    #[error("Get unexpected frame: {0}")]
-    UnexpectedFrame(String),
+    /// Client and server protocol versions are incompatible.
+    #[error("Protocol version mismatch: expected {expected}, got {got}")]
+    ProtocolVersionMismatch { expected: u16, got: u16 },
 
     /// Cryptographically secure random number generator failed.
     /// 
@@ -82,6 +83,14 @@ pub enum HandshakeError {
     /// new connections until the issue is resolved.
     #[error("Cryptographic RNG failure")]
     RngFailure(#[from] getrandom::Error),
+
+    /// Received an unexpected frame type during the handshake sequence.
+    #[error("Get unexpected frame: {0}")]
+    UnexpectedFrame(String),
+
+    /// The client requested an authentication algorithm not supported by the server.
+    #[error("Unsupported authentication algorithm: 0x{0:02x}")]
+    UnsupportedAlgorithm(u8),
 }
 
 /// Server-side handshake handler.

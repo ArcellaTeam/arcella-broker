@@ -12,8 +12,14 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::{SessionContext, SessionContextInner};
-use crate::broker_core::l2::{SessionState, UnackedBuffer, CreditManager, CreditPool, HotBuffer};
-use crate::protocol::ServerLimits;
+use crate::broker_core::{
+    l2::{SessionState, UnackedBuffer, CreditManager, CreditPool, HotBuffer},
+    security::HandshakeError,
+};
+use crate::protocol::{
+    ServerLimits,
+    utils::validate_address,
+};
 
 /// Server-side session context.
 ///
@@ -43,7 +49,7 @@ pub struct ServerSessionContext {
 
     /// Source prefix for validating routing permissions.
     /// Extracted from the authenticated session (NOT from the message header!)
-    pub source_prefix: Bytes,
+    pub source_prefix: String,
 
     /// Token for forcibly terminating the connection-handling task.
     /// Triggered by:
@@ -59,6 +65,7 @@ impl ServerSessionContext {
         session_token: [u8; 32],
         limits: ServerLimits,
         l2_state: Arc<SessionState>,
+        source_prefix: String,
     ) -> Self {
         Self {
             inner: SessionContextInner::new(
@@ -68,14 +75,9 @@ impl ServerSessionContext {
                 l2_state,
                 0,
             ),
-            source_prefix: Bytes::new(),
+            source_prefix,
             cancellation_token: CancellationToken::new(),
         }
-    }
-
-    /// Sets the source prefix (called during authentication).
-    pub fn set_source_prefix(&mut self, prefix: Bytes) {
-        self.source_prefix = prefix;
     }
 
     /// Forcibly closes the connection by cancelling the token.
@@ -119,6 +121,10 @@ impl SessionContext for ServerSessionContext {
 
     #[inline]
     fn limits(&self) -> &ServerLimits { &self.inner.limits }
+
+    fn source_prefix(&self) -> &str {
+        &self.source_prefix
+    }
 
     #[inline]
     fn touch(&self) { self.inner.touch() }

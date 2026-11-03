@@ -114,6 +114,10 @@ impl SessionContext for ClientSessionContext {
     #[inline]
     fn limits(&self) -> &ServerLimits { &self.inner.limits }
 
+    fn source_prefix(&self) -> &str {
+        ""
+    }
+
     #[inline]
     fn touch(&self) { self.inner.touch() }
 }

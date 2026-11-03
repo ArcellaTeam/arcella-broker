@@ -10,23 +10,24 @@
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-mod config;
-pub mod listener;
-pub mod connection_handler;
-//pub mod ingress_bridge;
-
-#[cfg(test)]
-mod integration_test;
-
-use config::ServerConfig;
-
+use crate::broker_core::l2::IngressBridge;
+use crate::broker_core::registry::LocalRegistry;
 use crate::broker_core::security::{
     SessionManager,
     HandshakeHandler,
 };
-use crate::broker_core::registry::LocalRegistry;
-use crate::broker_core::l2::IngressBridge;
 
+mod config;
+mod listener;
+mod connection_handler;
+mod ingress_bridge;
+
+use config::ServerConfig;
+pub use listener::run_listener;
+pub use connection_handler::handle_connection;
+
+#[cfg(test)]
+mod integration_test;
 
 /// Main server component of the Arcella Broker
 pub struct BrokerServer<B>

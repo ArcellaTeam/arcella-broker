@@ -82,6 +82,7 @@ impl SessionManager {
         session_token: [u8; 32],
         limits: ServerLimits,
         l2_state: Arc<SessionState>,
+        source_prefix: String,
     ) -> Arc<ServerSessionContext> {
         let mut sessions = self.sessions.write().expect("SessionManager RwLock write poisoned");
         sessions.entry(session_id).or_insert_with(|| {
@@ -89,7 +90,8 @@ impl SessionManager {
                 session_id, 
                 session_token, 
                 limits, 
-                l2_state, 
+                l2_state,
+                source_prefix,
             ))
         }).clone()
     }
@@ -249,7 +251,7 @@ mod tests {
         let mgr = SessionManager::new();
         let l2 = make_test_l2_state();
         
-        let ctx = mgr.register_session(1, [0xAA; 32], ServerLimits::default(), l2);
+        let ctx = mgr.register_session(1, [0xAA; 32], ServerLimits::default(), l2, "".to_string());
         assert_eq!(ctx.session_id(), 1);
         
         let retrieved = mgr.get_session(1).unwrap();

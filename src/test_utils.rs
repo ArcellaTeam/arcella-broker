@@ -7,11 +7,11 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use bytes::{Bytes};
+use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{Ordering};
-use std::sync::{Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tracing_subscriber::{fmt, EnvFilter};
 

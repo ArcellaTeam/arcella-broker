@@ -133,7 +133,7 @@ mod tests {
             protocol_version: L2_PROTOCOL_VERSION,
             client_id: Bytes::from("test-client"),
             algorithm: 0x00,
-            auth_data: Bytes::new(),
+            auth_data: Bytes::from("test"),
             capabilities: 0,
         };
         transport.send(Frame::new(FrameType::Hello as u8, hello.encode())).await?;
@@ -582,9 +582,9 @@ mod tests {
         // === Handshake ===
         let hello = HelloPayload {
             protocol_version: L2_PROTOCOL_VERSION,
-            client_id: Bytes::from("malicious-client"),
+            client_id: Bytes::from("test-client"),
             algorithm: 0x00,
-            auth_data: Bytes::new(),
+            auth_data: Bytes::from("test"),
             capabilities: 0,
         };
         transport.send(Frame::new(FrameType::Hello as u8, hello.encode())).await.unwrap();

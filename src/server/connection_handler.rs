@@ -8,7 +8,6 @@
 // except according to those terms.
 
 use std::sync::Arc;
-//use tokio::net::UnixStream;
 use tokio::io::{AsyncRead, AsyncWrite};
 use bytes::{Bytes, BytesMut, Buf, BufMut};
 
@@ -32,6 +31,7 @@ use crate::protocol::{
         ParsedDataPayload,
     },
     build_error_frame,
+    utils::validate_address,
 };
 
 /// Handles a single IPC connection from accept to disconnect.
@@ -168,13 +168,21 @@ where
 
     // 7. Register the session in SessionManager
     // Create SessionState with initial sequence = 1
+    let prefix_str = std::str::from_utf8(&hello.auth_data)
+        .map_err(|e| HandshakeError::InvalidSourcePrefixUtf8(e))?;
+
+    validate_address(prefix_str)
+        .map_err(|e| HandshakeError::InvalidSourcePrefixFormat(e))?;
+
     let l2_state = Arc::new(SessionState::new(1));
     let session_ctx = session_manager.register_session(
         welcome.session_id,
         welcome.session_token,
         limits,
         Arc::clone(&l2_state),
+        prefix_str.to_string(),
     );
+    
     tracing::debug!(
         session_id = welcome.session_id,
         "Registered new session"

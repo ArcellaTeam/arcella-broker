@@ -148,6 +148,7 @@ mod handshake_tests {
                 welcome.session_token,
                 limits.clone(),
                 Arc::new(SessionState::new(1)),
+                "test".to_string(),
             ));            
 
             let mut endpoint = IPCEndpoint::from_authenticated_transport(transport, &session_ctx).await.expect("Credit synchronization error");
