@@ -42,10 +42,7 @@ use std::{
 use crate::protocol::Message;
 use crate::broker_core::registry::RouteTarget;
 
-use super::super::{
-    Endpoint, 
-    TransportResult,
-};
+use super::super::TransportResult;
 
 /// A cached endpoint for in-process message delivery.
 ///
@@ -81,9 +78,7 @@ impl InMemoryEndpoint {
             target,
         }
     }
-}
 
-impl Endpoint for InMemoryEndpoint {
     /// Sends a message using the cached channel.
     ///
     /// This method does not perform a repeated registry lookup. 
@@ -91,7 +86,7 @@ impl Endpoint for InMemoryEndpoint {
     /// For Group targets: delegates to the group's send logic, which handles 
     /// individual channel failures internally (e.g., skipping dead members in Broadcast).
     #[inline]
-    fn send(
+    pub fn send(
         &self,
         message: Message,
     ) -> impl Future<Output = TransportResult<()>> + Send {
@@ -109,7 +104,7 @@ impl Endpoint for InMemoryEndpoint {
     /// after a component restart), and the old channel is no longer relevant.
     /// 2. Checks the physical state of the channel via is_closed().
     #[inline]
-    fn is_valid(&self) -> bool {
+    pub fn is_valid(&self) -> bool {
         // Check actual status
         self.target.version() == self.cached_version && !self.target.is_closed()
     }

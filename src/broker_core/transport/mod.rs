@@ -42,7 +42,6 @@ mod channel;
 mod endpoint;
 mod error;
 mod in_memory;
-mod transport;
 
 pub use channel::{
     create_channel, 
@@ -52,16 +51,12 @@ pub use channel::{
     RequestSender,
     TryRecvError,
 };
-pub use endpoint::{
-    Endpoint,
-    ResolvedEndpoint,
-};
+pub use endpoint::ResolvedEndpoint;
 pub use error::*;
 pub use in_memory::{
     InMemoryEndpoint, 
     InMemoryTransport,
 };
-pub use transport::Transport;
 
 // ============================================================================
 // IPC Transport (optional, enabled by the "ipc" feature)

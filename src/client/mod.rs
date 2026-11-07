@@ -53,7 +53,6 @@ use crate::{
             create_channel,
             InMemoryTransport, 
             InMemoryEndpoint,
-            Transport,
             TransportError, 
             TransportResult,
         },
@@ -233,7 +232,7 @@ impl BrokerClient {
     /// (`ResolvedEndpoint`). This avoids the expensive lookup in the
     /// `LocalRegistry` (radix trees or wildcard scanning) on every
     /// send, which is critically important for high-load components.
-    pub fn publisher(&self, address: String) -> Publisher<InMemoryTransport, InMemoryEndpoint> {
+    pub fn publisher(&self, address: String) -> Publisher {
         Publisher::new(
             address,
             self.local.clone(),

@@ -39,12 +39,11 @@ use std::{
     future::Future,
 };
 
-use crate::protocol::Message;
+use crate::protocol::{Message, ProtocolError};
 use crate::broker_core::registry::LocalRegistry;
 
 use super::super::{
     ResolvedEndpoint, 
-    Transport, 
     TransportError, 
     TransportResult,
 };
@@ -69,9 +68,7 @@ impl InMemoryTransport {
     pub fn new(registry: Arc<LocalRegistry>) -> Self {
         Self {registry}
     }
-}
 
-impl Transport<InMemoryEndpoint> for InMemoryTransport {
     /// Resolve address for the recipient at the specified address.
     ///
     /// # Arguments
@@ -80,10 +77,10 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
     /// # Returns
     /// `Ok(ResolvedEndpoint)` if the address is successfully resolved, or an error if
     /// the recipient is not found or the channel is closed.
-    fn resolve<'a>(
+    pub fn resolve<'a>(
         &'a self,
         address: &'a str,
-    ) -> impl Future<Output = TransportResult<ResolvedEndpoint<InMemoryEndpoint>>> + Send + 'a {
+    ) -> impl Future<Output = TransportResult<ResolvedEndpoint>> + Send + 'a {
         async move {
             match self.registry.lookup(address) {
                 Some(channel) => {
@@ -94,6 +91,32 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
             }
         }
     }
+
+    /// Send a message to a recipient at the specified address.
+    ///
+    /// The recipient address is automatically extracted from `message.address`,
+    /// eliminating parameter duplication and the risk of desynchronization.
+    /// Used for one-off sends when creating a `Publisher` and caching
+    /// the endpoint is impractical. Performs the full cycle: registry lookup -> send.
+    ///
+    /// # Arguments
+    /// * `message` - the message to be sent.
+    ///
+    /// # Returns
+    /// `Ok(())` if the message is successfully queued in the channel, or an error if
+    /// the recipient is not found or the channel is closed.
+    pub fn send<'a>(
+        &'a self,
+        message: Message,
+    ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
+        async move {
+            let address_str = std::str::from_utf8(&message.address)
+                .map_err(|_| TransportError::Protocol(ProtocolError::InvalidAddressUtf8))?;
+            
+            let endpoint = self.resolve(address_str).await?;
+            self.send_to(&endpoint, message).await
+        }
+    }    
  
     /// Send a message to resolved endpoint
     ///
@@ -108,9 +131,9 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
     /// `Ok(())` if the message is successfully queued in the channel, or an error if
     /// the recipient is not found or the channel is closed.
     #[inline]
-    fn send_to<'a>(
+    pub fn send_to<'a>(
         &'a self,
-        endpoint: &'a ResolvedEndpoint<InMemoryEndpoint>,
+        endpoint: &'a ResolvedEndpoint,
         message: Message,
     ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
         async move {
@@ -118,55 +141,4 @@ impl Transport<InMemoryEndpoint> for InMemoryTransport {
             endpoint.send(message).await
         }
     }    
-
-    /// Sends a request to resolved endpoint and waits for a response with a timeout.
-    ///
-    /// See the documentation for request. The same architectural constraint applies.
-    ///
-    /// Uses `ReplyDispatcher` to register waiting for a response by `message_id`.
-    ///
-    /// # Arguments
-    /// * `endpoint` - the endpoint for resolved address of the recipient.
-    /// * `message` - the request message to be sent.
-    ///
-    /// # Returns
-    /// The response message upon successful execution, or a timeout/connection closed error.
-    fn request_to<'a>(
-        &'a self,
-        _endpoint: &'a ResolvedEndpoint<InMemoryEndpoint>,
-        _message: Message,
-    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a {
-        async move {
-            Err(TransportError::Unsupported)
-        }
-    }   
-
-    /// Method for receiving messages (stub for this implementation).
-    ///
-    /// In the current broker architecture, InMemoryTransport is responsible exclusively
-    /// for sending (egress). Receiving messages (ingress) is managed directly
-    /// by the receiving component via MessageReceiver, which it obtains when
-    /// calling Subscriber::bind. This eliminates channel duplication and ensures
-    /// strict control over the lifetime of the message queue.
-    fn receive<'a>(
-        &'a self,
-    ) -> impl Future<Output = TransportResult<Message>> + Send + 'a {
-        async move {
-            // TODO: Implement if a unified receive interface is needed 
-            // for all transport types. For now, return a connection closed error.
-            Err(TransportError::ConnectionClosed)
-        }
-    }
-
-    /// Closes the transport.
-    ///
-    /// For in-process transport, explicit closing is not required. 
-    /// The lifetime of channels is managed by reference counting (ARC) rules and
-    /// automatic cleanup when Drop is called for Subscriber or BrokerClient,
-    /// which triggers LocalRegistry::unregister.
-    fn close<'a>(
-        &'a self,
-    ) -> impl Future<Output = TransportResult<()>> + Send + 'a {
-        async move { Ok(()) }
-    }
 }
