@@ -7,7 +7,11 @@
     // This file may not be copied, modified, or distributed
     // except according to those terms.
 
+    mod ingress_bridge;
+
     pub mod l2;
+
+    pub mod l3;
 
     /// Local recipient registry for routing messages to local recipients.
     pub mod registry;
@@ -17,3 +21,4 @@
     /// Abstract transport layer for message routing and delivery.
     pub mod transport;
 
+    pub use ingress_bridge::{IngressBridge, IngressResult};

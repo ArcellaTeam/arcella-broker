@@ -22,7 +22,7 @@
 
 use bytes::Bytes;
 
-use super::super::security::SessionContext;
+use super::security::SessionContext;
 
 /// Result of processing an incoming frame by the Ingress Bridge.
 /// 

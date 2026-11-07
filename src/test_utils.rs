@@ -27,7 +27,8 @@ use crate::{
 pub use crate::protocol::test_utils::*;
 
 use crate::broker_core::{
-    l2::{IngressBridge, IngressResult},
+    IngressBridge,
+    IngressResult,
     security::{SessionContext},
 };
 

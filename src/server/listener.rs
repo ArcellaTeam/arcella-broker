@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::broker_core::security::{HandshakeHandler, SessionManager};
 use crate::broker_core::registry::LocalRegistry;
-use crate::broker_core::l2::IngressBridge;
+use crate::broker_core::IngressBridge;
 use crate::config::ServerConfig;
 use super::connection_handler;
 

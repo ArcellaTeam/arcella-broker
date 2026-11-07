@@ -18,7 +18,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::broker_core::{
-        l2::{IngressBridge},
+        IngressBridge,
         registry::LocalRegistry,
         security::{HandshakeHandler, SessionManager, ClientSessionContext},
         transport::{IPCConnector, IPCFramedStream, IPCEndpoint, UdsConnector, TransportError},

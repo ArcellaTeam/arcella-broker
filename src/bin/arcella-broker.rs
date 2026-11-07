@@ -13,11 +13,11 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing_subscriber::{fmt, EnvFilter};
 
+use arcella_broker::broker_core::l3::RegistryIngressBridge;
 use arcella_broker::broker_core::registry::LocalRegistry;
 use arcella_broker::broker_core::security::{HandshakeHandler, SessionManager};
 use arcella_broker::config::ServerConfig;
 use arcella_broker::server::BrokerServer;
-use arcella_broker::server::RegistryIngressBridge;
 
 /// Arcella Microbroker CLI
 #[derive(Parser)]

@@ -11,7 +11,8 @@ use bytes::{Buf, Bytes};
 use std::sync::Arc;
 
 use crate::broker_core::{
-    l2::{IngressBridge, IngressResult},
+    IngressBridge,
+    IngressResult,
     registry::LocalRegistry,
     security::{SessionContext},
 };
