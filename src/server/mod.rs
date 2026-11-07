@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::ServerConfig;
 use crate::broker_core::l2::IngressBridge;
 use crate::broker_core::registry::LocalRegistry;
 use crate::broker_core::security::{
@@ -17,14 +18,13 @@ use crate::broker_core::security::{
     HandshakeHandler,
 };
 
-mod config;
 mod listener;
 mod connection_handler;
 mod ingress_bridge;
 
-use config::ServerConfig;
 pub use listener::run_listener;
 pub use connection_handler::handle_connection;
+pub use ingress_bridge::RegistryIngressBridge;
 
 #[cfg(test)]
 mod integration_test;

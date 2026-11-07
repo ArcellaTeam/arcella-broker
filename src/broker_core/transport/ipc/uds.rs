@@ -76,8 +76,8 @@ impl IPCConnector for UdsConnector {
     /// let connector = UdsConnector::new("/tmp/arcella.sock");
     /// match connector.connect().await {
     ///     Ok(stream) => {
-    ///         // stream is ready for use with IPCTransport
-    ///         let transport = IPCTransport::new(stream);
+    ///         // stream is ready for use with IPCFramedStream
+    ///         let transport = IPCFramedStream::new(stream);
     ///     }
     ///     Err(e) => eprintln!("Connection failed: {}", e),
     /// }

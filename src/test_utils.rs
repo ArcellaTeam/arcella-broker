@@ -206,9 +206,9 @@ impl StubIngressBridge {
 impl IngressBridge for StubIngressBridge {
     fn process<'a, C>(
         &'a self,
-        _address: &Bytes,
-        _messages_raw: &Bytes,
-        _session_ctx: &C,
+        _address: &'a Bytes,
+        _messages_raw: &'a Bytes,
+        _session_ctx: &'a C,
     ) -> impl std::future::Future<Output = IngressResult> + Send + 'a
     where
         C: SessionContext + ?Sized

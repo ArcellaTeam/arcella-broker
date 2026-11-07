@@ -87,9 +87,9 @@ pub trait IngressBridge: Send + Sync {
     /// the subsequent L2 flow control actions (Acknowledge, Cold Pool aggregation, or Drop).
     fn process<'a, C>(
         &'a self,
-        address: &Bytes,
-        messages_raw: &Bytes,
-        session_ctx: &C,
+        address: &'a Bytes,
+        messages_raw: &'a Bytes,
+        session_ctx: &'a C,
     ) -> impl Future<Output = IngressResult> + Send + 'a
     where
         C: SessionContext + ?Sized;        

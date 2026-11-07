@@ -35,7 +35,7 @@ mod handshake_tests {
     };
     use super::super::super::{
         l2::SessionState,
-        transport::{IPCConnector, IPCEndpoint, IPCTransport, UdsConnector},
+        transport::{IPCConnector, IPCEndpoint, IPCFramedStream, UdsConnector},
     };
     use super::super::{
         SessionContext,
@@ -102,7 +102,7 @@ mod handshake_tests {
         let server_handle = tokio::spawn(async move {
             let listener = UnixListener::bind(&socket_path_clone).unwrap();
             let (stream, _) = listener.accept().await.unwrap();
-            let mut transport = IPCTransport::new(stream);
+            let mut transport = IPCFramedStream::new(stream);
             let handshake_handler = HandshakeHandler::with_limits(limits.clone());
 
             // 1. Receive Hello
@@ -217,7 +217,7 @@ mod handshake_tests {
 
         let connector = UdsConnector::new(&socket_path);
         let stream = connector.connect().await.unwrap();
-        let mut transport = IPCTransport::new(stream);
+        let mut transport = IPCFramedStream::new(stream);
         tracing::info!("Connected to server");
 
         // 1. Send Hello

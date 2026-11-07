@@ -20,7 +20,7 @@ use crate::broker_core::security::{
     ServerSessionContext, 
     SessionManager
 };
-use crate::broker_core::transport::{IPCEndpoint, IPCTransport, TransportError};
+use crate::broker_core::transport::{IPCEndpoint, IPCFramedStream, TransportError};
 use crate::protocol::{
     Frame, FrameType,
     ProtocolError,
@@ -92,7 +92,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     // 1. Create the transport for exchanging control frames.
-    let mut transport = IPCTransport::new(stream);
+    let mut transport = IPCFramedStream::new(stream);
 
     // 2. Receive Hello from the client (with Ping support for keep-alive)
     let hello_frame = recv_handshake_frame(&mut transport).await?;
@@ -202,7 +202,7 @@ where
 /// Automatically handles Ping frames (responding with Pong) and returns
 /// the next meaningful frame (Hello, AuthResponse, etc.)
 async fn recv_handshake_frame<S>(
-    transport: &mut IPCTransport<S>
+    transport: &mut IPCFramedStream<S>
 ) -> Result<Frame, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,

@@ -8,16 +8,58 @@
 // except according to those terms.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::broker_core::registry::RoutingPolicy;
+use crate::protocol::ServerLimits;
 
+// ============================================================================
+// Channel Constants
+// ============================================================================
+
+/// Default capacity for client reply channels (InOut mode).
 pub const DEFAULT_REPLY_CHANNEL_CAPACITY: usize = 1024;
+
+/// Default capacity for subscriber message channels.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Absolute maximum capacity for any message channel.
 pub const MAX_CHANNEL_CAPACITY: usize = 65_536;
+
+/// Absolute maximum capacity for reply channels.
 pub const MAX_REPLY_CHANNEL_CAPACITY: usize = 65_536;
+
+// ============================================================================
+// Timing & Routing Constants
+// ============================================================================
+
+/// Default timeout for InOut (Request/Response) operations, in milliseconds (30 seconds).
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+
+/// Default Time-To-Live (TTL) for cascaded routing (sufficient for deep hierarchies).
 pub const DEFAULT_TTL: u8 = 64;
+
+// ============================================================================
+// Server Constants
+// ============================================================================
+
+/// Default path for the Unix Domain Socket (or Named Pipe on Windows).
+pub const DEFAULT_SOCKET_PATH: &str = "/tmp/arcella-broker.sock";
+
+/// Default session inactivity timeout in milliseconds (5 minutes).
+/// If no frames are received within this period, the session is considered
+/// expired and the connection is forcibly closed by the background GC task.
+pub const DEFAULT_SESSION_TIMEOUT_MS: u64 = 300_000;
+
+/// Default interval for the background session garbage collector, in milliseconds (10 seconds).
+/// Recommended to be ~10% of `DEFAULT_SESSION_TIMEOUT_MS` for timely cleanup
+/// without excessive CPU wakeups.
+pub const DEFAULT_GC_INTERVAL_MS: u64 = 10_000;
+
+// ============================================================================
+// Errors
+// ============================================================================
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -31,7 +73,14 @@ pub enum ConfigError {
     ReplyCapacityExceedsLimit(usize),
 }
 
+// ============================================================================
+// Broker Configs
+// ============================================================================
+
 /// Global configuration for the Arcella message broker.
+/// 
+/// Used by both the standalone server (`BrokerServer`) and the in-process 
+/// client/core (`Broker`). Defines fundamental routing and timing behaviors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerConfig {
     /// Default timeout for InOut operations in milliseconds.
@@ -66,10 +115,15 @@ impl BrokerConfig {
     }
 
     /// Returns the timeout as a `std::time::Duration` for convenient use in Tokio.
+    #[must_use]
     pub fn request_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.request_timeout_ms)
     }
 }
+
+// ============================================================================
+// Client Configs
+// ============================================================================
 
 /// Configuration for an individual subscriber (specific channel).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,3 +186,40 @@ impl SubscriberConfig {
         Ok(self)
     }    
 }
+
+// ============================================================================
+// Server Config
+// ============================================================================
+
+/// Server configuration
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Global broker configuration (TTL, timeouts, etc.)
+    pub broker: BrokerConfig,
+
+    /// Path to the Unix Domain Socket (or Named Pipe on Windows)
+    pub socket_path: PathBuf,
+
+    /// Limits sent to clients in `Welcome`.
+    pub limits: ServerLimits,
+
+    /// Session inactivity timeout (ms)
+    pub session_timeout_ms: u64,
+
+    /// Background session GC interval (ms)
+    pub gc_interval_ms: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            broker: BrokerConfig::default(),
+            socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
+            limits: ServerLimits::default(),
+            session_timeout_ms: DEFAULT_SESSION_TIMEOUT_MS,
+            gc_interval_ms: DEFAULT_GC_INTERVAL_MS,
+        }
+    }
+}
+
+

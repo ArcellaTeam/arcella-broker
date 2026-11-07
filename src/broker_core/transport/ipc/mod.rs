@@ -14,7 +14,7 @@ pub mod uds;
 
 pub use connector::IPCConnector;
 pub use endpoint::IPCEndpoint;
-pub use transport::IPCTransport;
+pub use transport::IPCFramedStream;
 pub use uds::UdsConnector;
 
 #[cfg(test)]

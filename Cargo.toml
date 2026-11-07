@@ -30,7 +30,7 @@ iradix = "0.3"
 parking_lot = "0.13"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2.0.21"
-tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.54", features = ["signal", "rt-multi-thread", "macros", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "serde"] }
@@ -39,8 +39,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json",
 tempfile = "3.27"
 
 [features]
-default = ["client", "ipc", "server"]
+default = ["client", "ipc", "server", "bin"]
 client = []
 ipc = ["tokio/net"]
-server = ["client"] 
-bin = [] 
+server = [] 
+bin = ["ipc", "server"] 

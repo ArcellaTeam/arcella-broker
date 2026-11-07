@@ -97,7 +97,8 @@ pub enum RegisterResult {
 
 impl LocalRegistry {
     /// Creates a new, empty `LocalRegistry`.
-    pub(crate) fn new() -> Self {
+    //pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
 
         Self {
             inner: ArcSwap::from(Arc::new(RegistryInner {

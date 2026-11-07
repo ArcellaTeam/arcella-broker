@@ -19,7 +19,7 @@ use crate::protocol::{
 use super::super::TransportError;
 
 // ============================================================================
-// IPCTransport — low-level framed transport
+// IPCFramedStream — low-level framed stream for IPC communication 
 // ============================================================================
 
 /// Low-level IPC transport that wraps a byte stream with `FrameCodec`.
@@ -30,15 +30,15 @@ use super::super::TransportError;
 ///
 /// Does NOT manage session state or acknowledgments — this is the responsibility
 /// of `IPCEndpoint`.
-pub struct IPCTransport<S> {
+pub struct IPCFramedStream<S> {
     framed: Framed<S, FrameCodec>,
 }
 
-impl<S> IPCTransport<S>
+impl<S> IPCFramedStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Creates a new `IPCTransport` wrapping the given byte stream.
+    /// Creates a new `IPCFramedStream` wrapping the given byte stream.
     ///
     /// This is the foundational constructor for the IPC transport layer.
     /// It takes a raw byte stream (e.g., `UnixStream`, `TcpStream`) and wraps it
@@ -68,11 +68,11 @@ where
     ///
     /// # Guarantees
     ///
-    /// - **Ready for use**: The returned `IPCTransport` is fully initialized and
+    /// - **Ready for use**: The returned `IPCFramedStream` is fully initialized and
     ///   ready to send/receive frames immediately. No additional setup is required.
     /// - **Zero-copy decoding**: The internal `FrameCodec` uses `BytesMut::split_to()`
     ///   to extract payloads without copying data, ensuring high throughput.
-    /// - **Atomic writes**: Each call to [`IPCTransport::send`] writes a complete frame
+    /// - **Atomic writes**: Each call to [`IPCFramedStream::send`] writes a complete frame
     ///   as a single unit; frames are never interleaved in the stream.
     ///
     /// # Typical usage
@@ -85,7 +85,7 @@ where
     /// # Example
     ///
     /// ```rust,ignore
-    /// use arcella_broker::broker_core::transport::ipc::{IPCTransport, UdsConnector, IPCConnector};
+    /// use arcella_broker::broker_core::transport::ipc::{IPCFramedStream, UdsConnector, IPCConnector};
     /// use arcella_broker::protocol::{Frame, FrameType};
     /// use bytes::Bytes;
     ///
@@ -93,8 +93,8 @@ where
     /// let connector = UdsConnector::new("/tmp/arcella.sock");
     /// let stream = connector.connect().await?;
     ///
-    /// // 2. Wrap the stream in IPCTransport
-    /// let mut transport = IPCTransport::new(stream);
+    /// // 2. Wrap the stream in IPCFramedStream
+    /// let mut transport = IPCFramedStream::new(stream);
     ///
     /// // 3. Send and receive frames
     /// let frame = Frame::new(FrameType::Data as u8, Bytes::from("hello"));
@@ -108,7 +108,7 @@ where
     /// # See Also
     ///
     /// - [`IPCEndpoint::new`] — Higher-level constructor that adds session management
-    ///   and flow control on top of `IPCTransport`.
+    ///   and flow control on top of `IPCFramedStream`.
     /// - [`FrameCodec`] — The underlying codec responsible for binary encoding/decoding.
     /// - [`IPCConnector`] — The trait for establishing the initial byte stream connection.
     pub fn new(stream: S) -> Self {

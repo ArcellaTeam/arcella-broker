@@ -18,12 +18,12 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::broker_core::{
-        l2::{SessionState, UnackedBuffer, IngressBridge, IngressResult},
+        l2::{IngressBridge},
         registry::LocalRegistry,
-        security::{HandshakeHandler, SessionManager, ClientSessionContext, ServerSessionContext},
-        transport::{IPCConnector, IPCTransport, IPCEndpoint, UdsConnector, TransportError},
+        security::{HandshakeHandler, SessionManager, ClientSessionContext},
+        transport::{IPCConnector, IPCFramedStream, IPCEndpoint, UdsConnector, TransportError},
     };
-
+    use crate::config::ServerConfig;
     use crate::protocol::{
         payloads::{
             HelloPayload,
@@ -41,7 +41,7 @@ mod tests {
 
     use crate::test_utils::{StubIngressBridge, init_tracing, dummy_in_only_message};
     
-    use super::super::{config::ServerConfig, BrokerServer};
+    use super::super::{BrokerServer};
 
     fn create_data_frame(sequence: u64, address: Bytes, msg_payload: Bytes) -> Frame {
 
@@ -68,6 +68,7 @@ mod tests {
             },
             session_timeout_ms: 2000, // 2000ms for the timeout test
             gc_interval_ms: 50,      // GC every 50ms
+            ..Default::default()
         }
     }
 
@@ -125,7 +126,7 @@ mod tests {
         let stream = connector.connect().await?;
 
         // Phase 1: use the bare transport for the handshake
-        let mut transport = IPCTransport::new(stream);
+        let mut transport = IPCFramedStream::new(stream);
         tracing::info!("Connected to server");
 
         // 1. Send Hello
@@ -270,7 +271,7 @@ mod tests {
         let (server, server_handle) = spawn_test_server(config).await;
         let connector = UdsConnector::new(&socket_path);
         let stream = connector.connect().await.unwrap();
-        let mut transport = IPCTransport::new(stream);
+        let mut transport = IPCFramedStream::new(stream);
 
         // Send Data WITHOUT Hello
         let msg = dummy_in_only_message(
@@ -395,6 +396,7 @@ mod tests {
             },
             session_timeout_ms: 5000,
             gc_interval_ms: 1000,
+            ..Default::default()
         };
 
         let (server, server_handle) = spawn_test_server(config).await;
@@ -477,6 +479,7 @@ mod tests {
             },
             session_timeout_ms: 5000,
             gc_interval_ms: 1000,
+            ..Default::default()
         };
 
         let (server, server_handle) = spawn_test_server(config).await;
@@ -566,6 +569,7 @@ mod tests {
             },
             session_timeout_ms: 5000,
             gc_interval_ms: 1000,
+            ..Default::default()
         };
 
         let ingress_bridge = Arc::new(StubIngressBridge::new()
@@ -577,7 +581,7 @@ mod tests {
         // Perform handshake using raw transport (to bypass client-side backpressure)
         let connector = UdsConnector::new(&socket_path);
         let stream = connector.connect().await.unwrap();
-        let mut transport = IPCTransport::new(stream);
+        let mut transport = IPCFramedStream::new(stream);
 
         // === Handshake ===
         let hello = HelloPayload {
@@ -700,6 +704,7 @@ mod tests {
             },
             session_timeout_ms: 30_000,
             gc_interval_ms: 1000,
+            ..Default::default()
         };
 
         // Phase 1 setup: Server processes very slowly (500ms per frame) -> no Acks sent quickly

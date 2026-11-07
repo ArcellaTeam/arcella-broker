@@ -20,7 +20,7 @@ use crate::protocol::{
     build_error_frame,
     create_ack_frame,
 };
-use super::transport::IPCTransport;
+use super::transport::IPCFramedStream;
 use super::super::TransportError;
 use super::super::super::l2::{CreditPool, UnackedBuffer, UnackedBufferError, SessionState};
 use super::super::super::security::SessionContext;
@@ -43,7 +43,7 @@ use super::super::super::security::SessionContext;
 /// However, `send` and `recv` operations require `&mut self` due to the underlying
 /// `Framed` stream.
 pub struct IPCEndpoint<S> {
-    transport: IPCTransport<S>,
+    transport: IPCFramedStream<S>,
     session: Arc<SessionState>,
     unacked_buffer: Arc<UnackedBuffer>,
     outgoing_credit_pool: Arc<CreditPool>, 
@@ -56,7 +56,7 @@ where
     /// Creates an endpoint from an authenticated transport and completes
     /// the initial credit exchange.
     pub async fn from_authenticated_transport<C>(
-        transport: IPCTransport<S>,
+        transport: IPCFramedStream<S>,
         session_ctx: &Arc<C>,
     ) -> Result<Self, TransportError>
     where
@@ -232,7 +232,7 @@ where
     ///    with the mapping `session_sequence -> frame`. If the subsequent network send 
     ///    fails, the frame is immediately removed from the buffer to prevent phantom 
     ///    slots from blocking the `hot_credit` window.
-    /// 4. **Transmission**: Sends the frame over the underlying stream via `IPCTransport::send()`.
+    /// 4. **Transmission**: Sends the frame over the underlying stream via `IPCFramedStream::send()`.
     ///
     /// # Arguments
     ///
@@ -424,7 +424,7 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             let listener = UnixListener::bind(&socket_path_clone).unwrap();
             let (stream, _) = listener.accept().await.unwrap();
-            let transport = IPCTransport::new(stream);
+            let transport = IPCFramedStream::new(stream);
 
             // The server creates the context with 0 outgoing credits (the client hasn't granted any yet)
             let session_ctx = Arc::new(ServerSessionContext::new(
@@ -455,7 +455,7 @@ mod tests {
 
         let connector = crate::broker_core::transport::UdsConnector::new(&socket_path);
         let stream = connector.connect().await.unwrap();
-        let transport = IPCTransport::new(stream);               
+        let transport = IPCFramedStream::new(stream);               
 
         // The client creates the context. Outgoing credits = `limits.hot_credit` (what the server will grant)
         let client_ctx = Arc::new(ClientSessionContext::new(

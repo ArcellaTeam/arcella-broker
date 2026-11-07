@@ -74,6 +74,6 @@ mod ipc;
 pub use ipc::{
     IPCConnector,
     IPCEndpoint,
-    IPCTransport,
+    IPCFramedStream,
     UdsConnector,
 };

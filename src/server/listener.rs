@@ -7,7 +7,7 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-
+use std::fs::remove_file;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::broker_core::security::{HandshakeHandler, SessionManager};
 use crate::broker_core::registry::LocalRegistry;
 use crate::broker_core::l2::IngressBridge;
-use super::config::ServerConfig;
+use crate::config::ServerConfig;
 use super::connection_handler;
 
 /// Starts the accept loop for incoming IPC connections.
@@ -31,8 +31,29 @@ pub async fn run_listener<B>(
 where
     B: IngressBridge + 'static,
 {
-    let listener = UnixListener::bind(&config.socket_path)?;
-    tracing::info!("BrokerServer listening on {:?}", config.socket_path);
+    let socket_path = &config.socket_path;
+
+    if socket_path.exists() {
+        tracing::warn!(
+            ?socket_path, 
+            "Socket file already exists. Attempting to remove it before binding..."
+        );
+        if let Err(e) = remove_file(socket_path) {
+            tracing::error!(
+                ?socket_path, 
+                error = %e, 
+                "Failed to remove existing socket file. Is another broker instance running?"
+            );
+            return Err(anyhow::anyhow!(
+                "Failed to remove existing socket file at {:?}: {}", 
+                socket_path, e
+            ));
+        }
+        tracing::info!(?socket_path, "Existing socket file successfully removed");
+    }
+
+    let listener = UnixListener::bind(socket_path)?;
+    tracing::info!("BrokerServer listening on {:?}", socket_path);
 
     loop {
         tokio::select! {
