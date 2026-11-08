@@ -7,7 +7,7 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::Buf;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
 use futures::{SinkExt, StreamExt};

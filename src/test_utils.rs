@@ -36,9 +36,9 @@ use crate::broker_core::{
 pub fn test_client(address: String) -> Result<BrokerClient, BrokerError> {
     // 1. Initialize config, broker and client
     let broker_config = Broker::default_config();
-    let broker = Arc::new(Broker::new(broker_config));
+    let broker = Arc::new(Broker::as_client(broker_config));
     let client_config = ClientConfig::default();
-    broker.client(client_config, address)
+    broker.create_client(client_config, address)
 }
 
 pub fn init_tracing(directives: &str) {

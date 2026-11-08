@@ -21,7 +21,7 @@ use super::connection_handler;
 /// Starts the accept loop for incoming IPC connections.
 /// Terminates upon receiving a shutdown signal or on a socket error.
 pub async fn run_listener<B>(
-    config: ServerConfig,
+    config: Arc<ServerConfig>,
     session_manager: Arc<SessionManager>,
     handshake_handler: Arc<HandshakeHandler>,
     local_registry: Arc<LocalRegistry>,

@@ -62,9 +62,9 @@ async fn test_high_throughput_in_memory_routing() {
 
     // 1. Initialize config, broker and client
     let broker_config = Broker::default_config();
-    let broker = Arc::new(Broker::new(broker_config));
+    let broker = Arc::new(Broker::as_client(broker_config));
     let client_config = ClientConfig::default();
-    let recv_client = broker.client(client_config.clone(), "load:test".to_string()).unwrap();
+    let recv_client = broker.create_client(client_config.clone(), "load:test".to_string()).unwrap();
 
     let mut subscriber_config = SubscriberConfig::default()
         .with_channel_capacity(4096)
@@ -141,7 +141,7 @@ async fn test_high_throughput_in_memory_routing() {
         sender_task_handles.spawn(async move {
             let sender_addr = format!("arcella:load:test:{}", sender_id);
             tracing::trace!("Test sender: start task on {}", sender_addr);
-            let client = broker.client(client_config.clone(), sender_addr.clone()).unwrap();
+            let client = broker.create_client(client_config.clone(), sender_addr.clone()).unwrap();
 
             // The Publisher is created ONCE per task, which activates and tests its internal cache
             let publisher = client.publisher(addr_str.clone());

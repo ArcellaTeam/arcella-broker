@@ -13,11 +13,8 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use arcella_broker::broker_core::l3::RegistryIngressBridge;
-use arcella_broker::broker_core::registry::LocalRegistry;
-use arcella_broker::broker_core::security::{HandshakeHandler, SessionManager};
-use arcella_broker::config::ServerConfig;
-use arcella_broker::server::BrokerServer;
+use arcella_broker::broker::Broker;
+use arcella_broker::config::{BrokerConfig, ServerConfig};
 
 /// Arcella Microbroker CLI
 #[derive(Parser)]
@@ -56,7 +53,7 @@ enum Commands {
     }    
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse(); 
     
@@ -93,53 +90,39 @@ async fn main() -> anyhow::Result<()> {
                 "Starting Arcella broker server"
             );
 
+            if socket.exists() {
+                std::fs::remove_file(&socket)?;
+            }            
+
             // === Server configuration ===
             let mut limits = arcella_broker::protocol::ServerLimits::default();
             limits.hot_credit = hot_credit;
             limits.cold_credit = cold_credit;
-
-            let config = ServerConfig {
+            let server_config = ServerConfig {
                 socket_path: socket.clone(),
                 limits,
                 ..Default::default()
             };
 
-            // === Creating components ===
-            let registry = Arc::new(LocalRegistry::new());
-            let session_manager = Arc::new(SessionManager::new());
-            let handshake_handler = Arc::new(HandshakeHandler::with_limits(config.limits.clone()));
-            let config_arc = Arc::new(config.clone());
-            let ingress_bridge = Arc::new(RegistryIngressBridge::new(
-                Arc::clone(&registry),
-                config_arc,
-            ));
-
-            let server = BrokerServer::new_with_bridge(
-                config,
-                session_manager,
-                handshake_handler,
-                registry,
-                ingress_bridge,
-            );
-
-            let server = Arc::new(server);
+            // === Create broker as server ===
+            let broker_config = BrokerConfig::default();
+            let broker = Arc::new(Broker::as_server(broker_config, server_config));
+            let broker_clone = Arc::clone(&broker);
 
             // === Graceful shutdown по Ctrl+C ===
-            let server_for_shutdown = Arc::clone(&server);
             tokio::spawn(async move {
                 if let Err(e) = signal::ctrl_c().await {
                     tracing::error!(error = %e, "Failed to listen for Ctrl+C");
                     return;
                 }
                 tracing::info!("Received shutdown signal (Ctrl+C)");
-                server_for_shutdown.shutdown();
+                broker_clone.shutdown();
             });
 
-            // === Starting the server ===
             tracing::info!("Broker server is running. Press Ctrl+C to stop.");
-            server.run().await?;
-            
+            broker.run().await?;
             tracing::info!("Broker server stopped gracefully");
+
             Ok(())
         }
     }

@@ -57,8 +57,8 @@ mod tests {
     }       
 
     /// Creates a `ServerConfig` with short timeouts to speed up tests.
-    fn fast_test_config(socket_path: std::path::PathBuf) -> ServerConfig {
-        ServerConfig {
+    fn fast_test_config(socket_path: std::path::PathBuf) -> Arc<ServerConfig> {
+        let config = ServerConfig {
             socket_path,
             limits: ServerLimits {
                 hot_credit: 5, // Hot limit for testing backpressure
@@ -69,7 +69,8 @@ mod tests {
             session_timeout_ms: 2000, // 2000ms for the timeout test
             gc_interval_ms: 50,      // GC every 50ms
             ..Default::default()
-        }
+        };
+        Arc::new(config)
     }
 
     /// Starts `BrokerServer` in a background tokio task.
@@ -77,7 +78,7 @@ mod tests {
     /// Returns `Arc<BrokerServer> (for calling `shutdown()` and accessing
     /// `session_manager`) and the server task's `JoinHandle`.
     async fn spawn_test_server(
-        config: ServerConfig,
+        config: Arc<ServerConfig>,
     ) -> (Arc<BrokerServer<StubIngressBridge>>, tokio::task::JoinHandle<anyhow::Result<()>>) {
 
         let ingress_bridge = Arc::new(StubIngressBridge::new());
@@ -88,7 +89,7 @@ mod tests {
 
     /// Starts `BrokerServer` with a custom IngressBridge in a background tokio task.
     async fn spawn_test_server_with_bridge<B>(
-        config: ServerConfig,
+        config: Arc<ServerConfig>,
         ingress_bridge: Arc<B>,
     ) -> (Arc<BrokerServer<B>>, tokio::task::JoinHandle<anyhow::Result<()>>)
     where
@@ -399,7 +400,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (server, server_handle) = spawn_test_server(config).await;
+        let (server, server_handle) = spawn_test_server(Arc::new(config)).await;
 
         // 1. The client connects and completes the handshake
         let (mut endpoint, welcome) = client_handshake(&socket_path).await.unwrap();
@@ -482,7 +483,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (server, server_handle) = spawn_test_server(config).await;
+        let (server, server_handle) = spawn_test_server(Arc::new(config)).await;
         let (mut endpoint, welcome) = client_handshake(&socket_path).await.unwrap();
         
         assert_eq!(welcome.limits.hot_credit, 2);
@@ -576,7 +577,7 @@ mod tests {
             .with_blocked_after(2)
         );
 
-        let (server, server_handle) = spawn_test_server_with_bridge(config, ingress_bridge).await;
+        let (server, server_handle) = spawn_test_server_with_bridge(Arc::new(config), ingress_bridge).await;
 
         // Perform handshake using raw transport (to bypass client-side backpressure)
         let connector = UdsConnector::new(&socket_path);
@@ -711,7 +712,7 @@ mod tests {
         let ingress_bridge = Arc::new(StubIngressBridge::new().with_delay(500));
         let bridge_clone = Arc::clone(&ingress_bridge);
         
-        let (server, server_handle) = spawn_test_server_with_bridge(config, ingress_bridge).await;
+        let (server, server_handle) = spawn_test_server_with_bridge(Arc::new(config), ingress_bridge).await;
         let (endpoint, welcome) = client_handshake(&socket_path).await.unwrap();
         
         assert_eq!(welcome.limits.hot_credit, 5);

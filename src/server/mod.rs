@@ -32,7 +32,7 @@ pub struct BrokerServer<B>
 where
     B: IngressBridge + 'static
 {
-    config: ServerConfig,
+    config: Arc<ServerConfig>,
     session_manager: Arc<SessionManager>,
     handshake_handler: Arc<HandshakeHandler>,
     local_registry: Arc<LocalRegistry>,
@@ -45,7 +45,7 @@ where
     B: IngressBridge + 'static,
 {
     pub fn new_with_bridge(
-        config: ServerConfig,
+        config: Arc<ServerConfig>,
         session_manager: Arc<SessionManager>,
         handshake_handler: Arc<HandshakeHandler>,
         local_registry: Arc<LocalRegistry>,
@@ -77,7 +77,7 @@ where
 
         // 2. Start the listener
         let listener_handle = listener::run_listener(
-            self.config.clone(),
+            Arc::clone(&self.config),
             Arc::clone(&self.session_manager),
             Arc::clone(&self.handshake_handler),
             Arc::clone(&self.local_registry),

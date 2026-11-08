@@ -7,10 +7,7 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::{
-    future::Future,
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use crate::protocol::Message;
 

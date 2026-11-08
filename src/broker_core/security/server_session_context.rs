@@ -8,18 +8,17 @@
 // except according to those terms.
 
 use std::sync::Arc;
-use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::{SessionContext, SessionContextInner};
-use crate::broker_core::{
-    l2::{SessionState, UnackedBuffer, CreditManager, CreditPool, HotBuffer},
-    security::HandshakeError,
+use crate::broker_core::l2::{
+    SessionState, 
+    UnackedBuffer, 
+    CreditManager, 
+    CreditPool, 
+    HotBuffer,
 };
-use crate::protocol::{
-    ServerLimits,
-    utils::validate_address,
-};
+use crate::protocol::ServerLimits;
 
 /// Server-side session context.
 ///

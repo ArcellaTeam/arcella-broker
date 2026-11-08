@@ -52,7 +52,6 @@ use crate::{
         transport::{
             create_channel,
             InMemoryTransport, 
-            InMemoryEndpoint,
             TransportError, 
             TransportResult,
         },
