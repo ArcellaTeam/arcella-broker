@@ -39,6 +39,7 @@
 //!    more slowly than they arrive.
 
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     protocol::Message,
@@ -73,6 +74,10 @@ pub struct SubscriptionHandle {
     address: String,
 
     cleanup: CleanupStrategy,
+
+    /// Token bound to this specific subscription.
+    /// Cancelled immediately on drop to wake up any pending `recv()` calls.
+    cancel_token: CancellationToken,
 }
 
 impl SubscriptionHandle {
@@ -81,10 +86,12 @@ impl SubscriptionHandle {
         address: String,
         slot: Arc<SubscriptionSlot>,
         registry: Arc<LocalRegistry>,
+        cancel_token: CancellationToken,
     ) -> Self {
         Self { 
             address, 
             cleanup: CleanupStrategy::Exclusive { slot, registry },
+            cancel_token,
         }
     }
     
@@ -92,10 +99,12 @@ impl SubscriptionHandle {
     pub(crate) fn new_load_balanced(
         address: String,
         group: Arc<LoadBalancedGroup>,
+        cancel_token: CancellationToken,
     ) -> Self {
         Self { 
             address, 
             cleanup: CleanupStrategy::LoadBalanced { group },
+            cancel_token,
         }
     }
 
@@ -160,6 +169,8 @@ pub struct Subscriber {
 
     /// The logical address the subscription is registered for (for logging and debugging).
     address: String,
+
+    cancel: CancellationToken,
 }
 
 impl Subscriber {
@@ -167,10 +178,12 @@ impl Subscriber {
     pub(crate) fn new_push(
         rx: MessageReceiver,
         address: String,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             mode: SubscriberMode::Push(rx),
             address,
+            cancel,
         }
     } 
 
@@ -178,10 +191,12 @@ impl Subscriber {
     pub(crate) fn new_pull(
         req_sender: Arc<RequestSender>,
         address: String,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             mode: SubscriberMode::Pull(req_sender),
             address,
+            cancel,
         }
     }       
 

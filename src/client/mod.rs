@@ -32,6 +32,7 @@
 
 use bytes::Bytes;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 mod publisher;
 mod reply_dispatcher;
@@ -90,6 +91,8 @@ pub struct BrokerClient {
     /// The dispatcher that manages pending replies to requests (InOut).
     /// Guarantees the absence of memory leaks upon abnormal termination of the component.
     reply_dispatcher: Arc<ReplyDispatcher>,
+
+    cancel_token: CancellationToken,
 }
 
 impl BrokerClient {
@@ -106,7 +109,8 @@ impl BrokerClient {
     /// Returns `RegistryError` if the `client_address` is already occupied
     /// by another active component (guaranteeing binding exclusivity).
     pub(crate) fn new(broker: Arc<Broker>, config: ClientConfig, client_address: String) -> Result<Self, RegistryError> {
-        let (sender, receiver) = create_channel(config.reply_channel_capacity);
+        let cancel_token = CancellationToken::new();
+        let (sender, receiver) = create_channel(config.reply_channel_capacity, cancel_token.clone());
         
         let reply_slot = SubscriptionSlot::new(sender);
         let target = RouteTarget::new_exclusive(reply_slot.clone());
@@ -115,13 +119,14 @@ impl BrokerClient {
 
         // The reply channel registration must happen first, so that
         // the component is ready to accept a reply immediately after sending a request.
-        let reply_subscriber = Subscriber::new_push(receiver, client_address.clone());
+        let reply_subscriber = Subscriber::new_push(receiver, client_address.clone(), cancel_token.clone());
         let reply_dispatcher = Arc::new(ReplyDispatcher::new(reply_subscriber));
 
         let reply_handle = SubscriptionHandle::new_exclusive(
             client_address.clone(),
             reply_slot,
             broker.registry.clone(),
+            cancel_token.clone(),
         );
 
         let transport = InMemoryTransport::new(broker.registry.clone());
@@ -133,6 +138,7 @@ impl BrokerClient {
             client_address,
             _reply_handle: reply_handle,
             reply_dispatcher,
+            cancel_token,
         })
     }
 
@@ -158,20 +164,23 @@ impl BrokerClient {
         address: String,
         config: SubscriberConfig,
     ) -> Result<(Subscriber, SubscriptionHandle), RegistryError> {
+        let sub_cancel_token = self.cancel_token.child_token();
+
         match config.routing_policy {
             RoutingPolicy::Exclusive => {        
-                let (sender, receiver) = create_channel(config.channel_capacity);
+                let (sender, receiver) = create_channel(config.channel_capacity, sub_cancel_token.clone());
 
                 let slot = SubscriptionSlot::new(sender);
                 let target = RouteTarget::new_exclusive(slot.clone());
 
                 self.broker.registry.register(address.clone(), target)?;
 
-                let subscriber = Subscriber::new_push(receiver, address.clone());
+                let subscriber = Subscriber::new_push(receiver, address.clone(), sub_cancel_token.clone());
                 let handle = SubscriptionHandle::new_exclusive(
                     address,
                     slot,
                     self.broker.registry.clone(),
+                    sub_cancel_token,
                 );
 
                 Ok((subscriber, handle))
@@ -187,7 +196,7 @@ impl BrokerClient {
                 let result = registry.get_existing_or_register(
                     address.clone(),
                     || {
-                        let (sender, receiver) = create_channel(channel_capacity);
+                        let (sender, receiver) = create_channel(channel_capacity, sub_cancel_token.clone());
                         let slot = SubscriptionSlot::new(sender);
                         Ok(RouteTarget::new_load_balanced(
                             slot,
@@ -212,11 +221,11 @@ impl BrokerClient {
 
                 // Create a unified Subscriber type (in Pull mode).
                 // For the calling code, the API is no different from Exclusive!
-                let subscriber = Subscriber::new_pull(req_sender, address.clone());
+                let subscriber = Subscriber::new_pull(req_sender, address.clone(), sub_cancel_token.clone());
                 
                 // Create a passive handle. It will not call unregister on drop,
                 // since the group's lifecycle is managed by the background task via the RequestSender refcount.
-                let handle = SubscriptionHandle::new_load_balanced(address, group);
+                let handle = SubscriptionHandle::new_load_balanced(address, group, sub_cancel_token);
 
                 Ok((subscriber, handle))
             }
@@ -297,6 +306,12 @@ impl BrokerClient {
         }
     }
 
+}
+
+impl Drop for BrokerClient {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }    
 }
 
 #[cfg(test)]

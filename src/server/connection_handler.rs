@@ -7,9 +7,10 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use bytes::{BytesMut, Buf, BufMut};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use bytes::{Bytes, BytesMut, Buf, BufMut};
+use tokio_util::sync::CancellationToken;
 
 use crate::broker_core::{IngressBridge, IngressResult};
 use crate::broker_core::l2::{SessionState, BufferedFrame};
@@ -21,7 +22,7 @@ use crate::broker_core::security::{
     ServerSessionContext, 
     SessionManager
 };
-use crate::broker_core::transport::{IPCEndpoint, IPCFramedStream, TransportError};
+use crate::broker_core::transport::{IPCEndpoint, IPCFramedStream, TransportError, create_channel};
 use crate::protocol::{
     Frame, FrameType,
     ProtocolError,
@@ -35,13 +36,16 @@ use crate::protocol::{
     utils::validate_address,
 };
 
+use crate::broker_core::registry::{SubscriptionSlot, RouteTarget};
+
+
 /// Handles a single IPC connection from accept to disconnect.
 pub async fn handle_connection<S, B>(
     stream: S,
     peer_addr: String,
     session_manager: Arc<SessionManager>,
     handshake_handler: Arc<HandshakeHandler>,
-    _local_registry: Arc<LocalRegistry>, // Will be needed in Stage 6 for the Ingress Bridge
+    local_registry: Arc<LocalRegistry>, // Will be needed in Stage 6 for the Ingress Bridge
     ingress_bridge: Arc<B>,
 ) -> Result<(), TransportError>
 where
@@ -62,6 +66,15 @@ where
         peer = %peer_addr,
         "Handshake completed, session registered"
     );
+
+    let source_prefix = session_ctx.source_prefix().to_string();
+    let cancel_token = CancellationToken::new();
+
+    let (tx, _rx) = create_channel(10, cancel_token);
+    let slot = SubscriptionSlot::new(tx);
+    let target = RouteTarget::new_exclusive(slot.clone());
+
+    local_registry.register(source_prefix, target)?;
 
     // === Phase 2: Main frame processing loop ===
     let result = main_loop(&mut endpoint, &session_ctx, ingress_bridge.as_ref()).await; 
