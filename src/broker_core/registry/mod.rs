@@ -592,12 +592,6 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use super::super::transport::{create_channel, MessageSender};
-
-    fn create_dummy_sender(cancel_token: CancellationToken) -> MessageSender {
-        let (tx, _rx) = create_channel(10, cancel_token);
-        tx
-    }
 
     mod matches {
         use super::*;
@@ -747,10 +741,9 @@ mod tests {
             let address = "arcella:core:users".to_string();
 
             let cancel_token = CancellationToken::new();
-            let sender = create_dummy_sender(cancel_token);
 
             // 1. Registration
-            let slot = SubscriptionSlot::new(sender);
+            let slot = SubscriptionSlot::new(10, cancel_token);
             let target = RouteTarget::new_exclusive(slot.clone());
             
             assert!(registry.register(address.clone(), target).is_ok());
@@ -783,23 +776,23 @@ mod tests {
             let cancel_token = CancellationToken::new();
 
             // Register the exact address
-            let slot = SubscriptionSlot::new(create_dummy_sender(cancel_token.child_token()));
+            let slot = SubscriptionSlot::new(10, cancel_token.clone());
             let target = RouteTarget::new_exclusive(slot.clone());
             registry.register(exact_addr.clone(), target).unwrap();
 
             // Attempting to register an overlapping wildcard must fail
-            let slot = SubscriptionSlot::new(create_dummy_sender(cancel_token.child_token()));
+            let slot = SubscriptionSlot::new(10, cancel_token.clone());
             let target = RouteTarget::new_exclusive(slot.clone());
             let err = registry.register(wildcard_addr.clone(), target).unwrap_err();
             assert!(matches!(err, RegistryError::WildcardConflict(_, _)));
 
             // And vice versa: first wildcard, then exact address
             let registry2 = LocalRegistry::new();
-            let slot = SubscriptionSlot::new(create_dummy_sender(cancel_token.child_token()));
+            let slot = SubscriptionSlot::new(10, cancel_token.clone());
             let target = RouteTarget::new_exclusive(slot.clone());
             registry2.register(wildcard_addr.clone(), target).unwrap();
             
-            let slot = SubscriptionSlot::new(create_dummy_sender(cancel_token.child_token()));
+            let slot = SubscriptionSlot::new(10, cancel_token.clone());
             let target = RouteTarget::new_exclusive(slot.clone());
             let err2 = registry2.register(exact_addr.clone(), target).unwrap_err();
             assert!(matches!(err2, RegistryError::ConflictsWithWildcard(_, _)));
@@ -812,10 +805,10 @@ mod tests {
             let wildcard_addr = "arcella:core:*".to_string();
             let cancel_token = CancellationToken::new();
 
-            let slot = SubscriptionSlot::new(create_dummy_sender(cancel_token.child_token()));
+            let slot = SubscriptionSlot::new(10, cancel_token.clone());
             let target1 = RouteTarget::new_exclusive(slot.clone());
             
-            let slot = SubscriptionSlot::new(create_dummy_sender(cancel_token.child_token()));
+            let slot = SubscriptionSlot::new(10, cancel_token.clone());
             let target2 = RouteTarget::new_exclusive(slot.clone());
 
             // 1. Register the wildcard first
@@ -852,7 +845,8 @@ mod tests {
             // 1. First call: the address is free, the factory must be invoked
             let result1 = registry.get_existing_or_register(address.clone(), || {
                 factory_call_count += 1;
-                Ok(RouteTarget::new_exclusive(SubscriptionSlot::new(create_dummy_sender(cancel_token.child_token()))))
+                let slot = SubscriptionSlot::new(10, cancel_token.clone());
+                Ok(RouteTarget::new_exclusive(slot))
             }).unwrap();
 
             assert!(matches!(result1, RegisterResult::Registered(_)));
@@ -861,7 +855,8 @@ mod tests {
             // 2. Second call: the address is taken, the factory must NOT be invoked, Existing is returned
             let result2 = registry.get_existing_or_register(address.clone(), || {
                 factory_call_count += 1; // This must not execute
-                Ok(RouteTarget::new_exclusive(SubscriptionSlot::new(create_dummy_sender(cancel_token.child_token()))))
+                let slot = SubscriptionSlot::new(10, cancel_token.clone());
+                Ok(RouteTarget::new_exclusive(slot))
             }).unwrap();
 
             assert!(matches!(result2, RegisterResult::AlreadyExists(_)));
@@ -874,10 +869,10 @@ mod tests {
             let address = "arcella:test".to_string();
             let cancel_token = CancellationToken::new();
             
-            let slot1 = SubscriptionSlot::new(create_dummy_sender(cancel_token.child_token()));
+            let slot1 = SubscriptionSlot::new(10, cancel_token.clone());
             let target1 = RouteTarget::new_exclusive(slot1.clone());
             
-            let slot2 = SubscriptionSlot::new(create_dummy_sender(cancel_token.child_token()));
+            let slot2 = SubscriptionSlot::new(10, cancel_token.clone());
 
             registry.register(address.clone(), target1.clone()).unwrap();
 
@@ -910,12 +905,13 @@ mod tests {
                 let registry_clone = registry.clone();
                 let addr = address.clone();
                 let calls = factory_calls.clone();
-                let child_cancel_token = cancel_token.child_token();
+                let child_cancel_token = cancel_token.clone();
                 
                 handles.push(thread::spawn(move || {
                     registry_clone.get_existing_or_register(addr, || {
                         calls.fetch_add(1, Ordering::SeqCst);
-                        Ok(RouteTarget::new_exclusive(SubscriptionSlot::new(create_dummy_sender(child_cancel_token))))
+                        let slot  =SubscriptionSlot::new(10, child_cancel_token.clone());
+                        Ok(RouteTarget::new_exclusive(slot))
                     })
                 }));
             }

@@ -50,6 +50,7 @@ pub use channel::{
     MessageReceiver, 
     RequestSender,
     TryRecvError,
+    TryRequestError,
 };
 pub use endpoint::ResolvedEndpoint;
 pub use error::*;

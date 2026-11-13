@@ -57,13 +57,12 @@ impl LoadBalancedGroup {
     /// Creates a new group and starts a background dispatcher
     pub fn new(
         slot: Arc<SubscriptionSlot>,
-        mut main_receiver: MessageReceiver,
         req_channel_capacity: usize,
         registry: Weak<LocalRegistry>,
         address: String,
     ) -> Arc<Self> {
 
-        let group_token = main_receiver.cancel_token().child_token();
+        let group_token = slot.cancel_token.child_token();
         let (req_tx, mut req_rx) = create_request_channel(
             req_channel_capacity,
             group_token.clone()
@@ -82,6 +81,7 @@ impl LoadBalancedGroup {
         let slot_for_drop: Arc<SubscriptionSlot> = slot.clone();
         let registry_for_task = registry;
         let address_for_task = address;
+        let main_receiver_arc = slot.receiver();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -90,12 +90,13 @@ impl LoadBalancedGroup {
                     Some(tx) => tx,
                     None => {
                         tracing::debug!("LoadBalancedGroup dispatcher: no more consumers, shutting down");
-                        break // Все RequestSender'ы уничтожены, группа закрывается
+                        break // All RequestSenders have been destroyed, the group is closing
                     }
                 };
 
                 // 2. Take the next message from the shared queue
-                let mut current_msg = match main_receiver.recv().await {
+                let mut receiver = main_receiver_arc.lock().await;
+                let mut current_msg = match receiver.recv().await {
                     Some(m) => m,
                     None => {
                         tracing::debug!("LoadBalancedGroup dispatcher: main queue closed, shutting down");

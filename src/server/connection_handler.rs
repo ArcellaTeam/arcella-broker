@@ -70,8 +70,7 @@ where
     let source_prefix = session_ctx.source_prefix().to_string();
     let cancel_token = CancellationToken::new();
 
-    let (tx, _rx) = create_channel(10, cancel_token);
-    let slot = SubscriptionSlot::new(tx);
+    let slot = SubscriptionSlot::new(10, cancel_token); // TODO: need to remove magic
     let target = RouteTarget::new_exclusive(slot.clone());
 
     local_registry.register(source_prefix, target)?;

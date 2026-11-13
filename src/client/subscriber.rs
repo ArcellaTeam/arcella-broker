@@ -39,6 +39,7 @@
 //!    more slowly than they arrive.
 
 use std::sync::Arc;
+use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -52,7 +53,8 @@ use crate::{
         transport::{
             MessageReceiver, 
             RequestSender,
-            TryRecvError
+            TryRecvError,
+            TryRequestError,
         },
     },
 };
@@ -144,7 +146,7 @@ impl Drop for SubscriptionHandle {
 
 enum SubscriberMode {
     /// Push mode: messages arrive in MessageReceiver (Exclusive, Broadcast)
-    Push(MessageReceiver),
+    Push(Arc<Mutex<MessageReceiver>>),
     /// Pull mode: messages are requested via RequestSender (LoadBalanced)
     Pull(Arc<RequestSender>),
 }
@@ -176,7 +178,7 @@ pub struct Subscriber {
 impl Subscriber {
     /// Creates a Push subscriber (for Exclusive and Broadcast)
     pub(crate) fn new_push(
-        rx: MessageReceiver,
+        rx: Arc<Mutex<MessageReceiver>>,
         address: String,
         cancel: CancellationToken,
     ) -> Self {
@@ -209,12 +211,48 @@ impl Subscriber {
     /// to the `MessageSender`, but the method is implemented for completeness of the `tokio::mpsc` API.
     pub async fn recv(&mut self) -> Option<Message> {
         match &mut self.mode {
-            SubscriberMode::Push(rx) => rx.recv().await,
+            SubscriberMode::Push(receiver) => {
+                // 1. Fast path: try to acquire lock and read synchronously
+                let mut rx =  match receiver.try_lock() {
+                    Ok(guard) => guard,
+                    _ => {
+                        receiver.lock().await    
+                    }
+                };
+
+                // 2. Fast path: check if message is already available
+                match rx.try_recv() {
+                    Ok(msg) => return Some(msg),
+                    Err(TryRecvError::Disconnected) => return None,
+                    Err(TryRecvError::Empty) => {}
+                };
+
+                // 3. Slow path: wait for message
+                rx.recv().await
+            }
             SubscriberMode::Pull(req_sender) => {
-                match req_sender.request().await {
-                    Ok(reply_rx) => reply_rx.await.ok(),
-                    Err(_) => None,
-                }
+                // 1. Fast path: try to send request token synchronously
+                let mut reply_rx =  match req_sender.try_request() {
+                    Ok(rx) => rx,
+                    Err(TryRequestError::Disconnected) => return None,
+                    Err(TryRequestError::Full) => {
+                        // Queue is full, fallback to async wait for a slot
+                        match req_sender.request().await {
+                            Ok(rx) => rx,
+                            Err(_) => return None,
+                        }
+                    }
+                };
+
+                // 2. Fast path: check if response is already available (rare but possible)
+                match reply_rx.try_recv() {
+                    Ok(msg) => return Some(msg),
+                    Err(oneshot::error::TryRecvError::Closed) => return None,
+                    Err(oneshot::error::TryRecvError::Empty) => {}
+                };
+
+                // 3. Slow path: wait for the actual response
+                reply_rx.await.ok()
             }
         }
     }
@@ -228,10 +266,32 @@ impl Subscriber {
     /// event or request. Use this method only in polling
     /// loops or when implementing your own non-blocking event handlers.
     #[must_use = "The result must be handled, otherwise the message will be dropped"]
-    pub fn try_recv(&mut self) -> Result<Message, TryRecvError> {
+    pub async fn try_recv(&mut self) -> Result<Message, TryRecvError> {
         match &mut self.mode {
-            SubscriberMode::Push(rx) => rx.try_recv(),
-            SubscriberMode::Pull(_) => Err(TryRecvError::Empty),
+            SubscriberMode::Push(receiver) => {
+                // Try lock to avoid blocking the async task
+                if let Ok(mut rx) = receiver.try_lock() {
+                    return rx.try_recv();
+                }
+
+                // If lock is contended, we have to await it, then try_recv
+                let mut rx = receiver.lock().await;
+                rx.try_recv()
+            },
+            SubscriberMode::Pull(req_sender) => {
+                // Fully synchronous check for LoadBalanced mode
+                let mut reply_rx =  match req_sender.try_request() {
+                    Ok(rx) => rx,
+                    Err(TryRequestError::Disconnected) => return Err(TryRecvError::Disconnected),
+                    Err(TryRequestError::Full) => return Err(TryRecvError::Empty),
+                };
+
+                match reply_rx.try_recv() {
+                    Ok(msg) => Ok(msg),
+                    Err(oneshot::error::TryRecvError::Empty) => Err(TryRecvError::Empty),
+                    Err(oneshot::error::TryRecvError::Closed) => Err(TryRecvError::Disconnected),
+                }
+            },
         }
     }  
 

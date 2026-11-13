@@ -110,16 +110,25 @@ impl BrokerClient {
     /// by another active component (guaranteeing binding exclusivity).
     pub(crate) fn new(broker: Arc<Broker>, config: ClientConfig, client_address: String) -> Result<Self, RegistryError> {
         let cancel_token = CancellationToken::new();
-        let (sender, receiver) = create_channel(config.reply_channel_capacity, cancel_token.clone());
         
-        let reply_slot = SubscriptionSlot::new(sender);
-        let target = RouteTarget::new_exclusive(reply_slot.clone());
+        // 1. Create the slot, which internally creates the channel (Sender + Receiver)
+        let reply_slot = SubscriptionSlot::new(
+            config.reply_channel_capacity, 
+            cancel_token.clone()
+        );
 
+        // 2. Create the RouteTarget and register it in the registry
+        let target = RouteTarget::new_exclusive(reply_slot.clone());
         broker.registry.register(client_address.clone(), target)?;
 
-        // The reply channel registration must happen first, so that
-        // the component is ready to accept a reply immediately after sending a request.
-        let reply_subscriber = Subscriber::new_push(receiver, client_address.clone(), cancel_token.clone());
+        // 3. Extracting the receiver from the slot for the ReplyDispatcher
+        let reply_receiver = reply_slot.receiver();        
+
+        // 4. Create the subscriber and dispatcher to handle responses
+        let reply_subscriber = Subscriber::new_push(
+            reply_receiver, client_address.clone(), 
+            cancel_token.clone()
+        );
         let reply_dispatcher = Arc::new(ReplyDispatcher::new(reply_subscriber));
 
         let reply_handle = SubscriptionHandle::new_exclusive(
@@ -167,15 +176,15 @@ impl BrokerClient {
         let sub_cancel_token = self.cancel_token.child_token();
 
         match config.routing_policy {
-            RoutingPolicy::Exclusive => {        
-                let (sender, receiver) = create_channel(config.channel_capacity, sub_cancel_token.clone());
-
-                let slot = SubscriptionSlot::new(sender);
+            RoutingPolicy::Exclusive => { 
+                let slot = SubscriptionSlot::new(config.channel_capacity, sub_cancel_token.clone());
+                
                 let target = RouteTarget::new_exclusive(slot.clone());
-
                 self.broker.registry.register(address.clone(), target)?;
 
+                let receiver = slot.receiver();
                 let subscriber = Subscriber::new_push(receiver, address.clone(), sub_cancel_token.clone());
+
                 let handle = SubscriptionHandle::new_exclusive(
                     address,
                     slot,
@@ -188,19 +197,16 @@ impl BrokerClient {
             RoutingPolicy::LoadBalanced => {
                 let registry = self.broker.registry.clone();
                 let address_for_factory = address.clone();
-                let channel_capacity = config.channel_capacity;
-                let req_capacity = 1000;
+                let req_capacity = 1000; // TODO: need to remove magic
 
                 // ATOMIC operation: check and register under a single mutex.
                 // The factory is called ONLY if the address is free, eliminating races and task leaks.
                 let result = registry.get_existing_or_register(
                     address.clone(),
                     || {
-                        let (sender, receiver) = create_channel(channel_capacity, sub_cancel_token.clone());
-                        let slot = SubscriptionSlot::new(sender);
+                        let slot = SubscriptionSlot::new(config.channel_capacity, sub_cancel_token.clone());
                         Ok(RouteTarget::new_load_balanced(
                             slot,
-                            receiver,
                             req_capacity,
                             Arc::downgrade(&registry),
                             address_for_factory.clone(),
@@ -453,9 +459,9 @@ mod tests {
         assert_eq!(msg7.payload, Bytes::from("job1:done"));
 
         // 5. Verification: channels are empty (no more messages)
-        assert!(subscribers[0].try_recv().is_err(), "users channel should be empty");
-        assert!(subscribers[1].try_recv().is_err(), "api channel should be empty");
-        assert!(subscribers[2].try_recv().is_err(), "processor channel should be empty");
+        assert!(subscribers[0].try_recv().await.is_err(), "users channel should be empty");
+        assert!(subscribers[1].try_recv().await.is_err(), "api channel should be empty");
+        assert!(subscribers[2].try_recv().await.is_err(), "processor channel should be empty");
 
         drop(handles);
     }
@@ -553,7 +559,7 @@ async fn test_subscription_cleanup_and_re_registration() {
         let result = client.send(msg).await;
         
         assert!(!result.is_err());
-        assert!(!sub3.try_recv().is_err(), "sub3 received the message");
+        assert!(!sub3.try_recv().await.is_err(), "sub3 received the message");
     }
 
 }

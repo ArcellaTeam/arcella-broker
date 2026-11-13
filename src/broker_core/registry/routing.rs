@@ -49,14 +49,12 @@ impl RouteTarget {
     /// Creates a routing target for a LoadBalanced group.
     pub fn new_load_balanced(
         slot: Arc<SubscriptionSlot>,
-        main_receiver: MessageReceiver,
         req_channel_capacity: usize,
         registry: Weak<LocalRegistry>,
         address: String,
     ) -> Arc<Self> {
         Arc::new(Self::LoadBalanced(LoadBalancedGroup::new(
             slot,
-            main_receiver,
             req_channel_capacity,
             registry,
             address,
