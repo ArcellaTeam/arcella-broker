@@ -60,45 +60,286 @@ pub enum FrameHeaderError {
     PayloadTooLarge(u32),
 }
 
-/// L2 protocol frame types.
-/// Using #[repr(u8)] guarantees that the enum occupies exactly 1 byte
+/// Typed discriminator of an L2 frame — the `type: u8` field, i.e. the **first byte**
+/// of the frame header.
+///
+/// # Wire format
+///
+/// ```text
+/// ┌──────────┬──────────┬──────────────────┬──────────┐
+/// │ type:u8  │ len:u24  │ payload: [u8; N] │ CRC32C   │
+/// │ (1 byte) │ (3 bytes)│ (0..16 MB)       │ (4 bytes)│
+/// └──────────┴──────────┴──────────────────┴──────────┘
+///      ▲
+///      └── this enum
+/// ```
+///
+/// All multi-byte values are Little-Endian. `len` covers the payload only.
+/// See [`FrameHeader`] for header (de)serialization and
+/// [`FrameCodec`](super::codec::FrameCodec) for the stream FSM parser.
+///
+/// # Design: why `Frame::frame_type` is `u8`, not `FrameType`
+///
+/// [`Frame`] deliberately stores the raw byte instead of this enum. `FrameType` is
+/// an **opt-in view** obtained via [`Frame::typed_frame_type`] or [`FrameType::from_u8`],
+/// both returning `Option<Self>`:
+///
+/// - **Forward compatibility**: a peer running a newer protocol version may send
+///   frame types this build does not know. Such frames parse successfully and are
+///   ignored (or logged) by the dispatcher instead of killing the connection.
+/// - **Zero-cost hot path**: no discriminant validation is performed per frame.
+///
+/// **Important**: [`FrameCodec`](super::codec::FrameCodec) validates only `length`
+/// and CRC32C — it does **not** validate `type`. Type-level validation (direction,
+/// connection phase) is the responsibility of the dispatcher
+/// (`server::connection_handler`, `IPCEndpoint`).
+///
+/// # Complete frame registry
+///
+/// | Code | Variant | Direction | Payload | Phase |
+/// |------|---------|-----------|---------|-------|
+/// | `0x00` | [`Hello`](Self::Hello) | C -> S | [`HelloPayload`](super::payloads::HelloPayload) | pre-auth |
+/// | `0x01` | [`Welcome`](Self::Welcome) | S -> C | [`WelcomePayload`](super::payloads::WelcomePayload) | pre-auth |
+/// | `0x02` | [`CreditGrant`](Self::CreditGrant) | both | [`CreditGrantPayload`](super::payloads::CreditGrantPayload) | active |
+/// | `0x03` | [`Acknowledge`](Self::Acknowledge) | both | `u64` sequence | active |
+/// | `0x04` | [`Drop`](Self::Drop) | both | `u64` sequence + `u8` reason | active |
+/// | `0x05` | [`AuthResponse`](Self::AuthResponse) | C -> S | [`AuthResponsePayload`](super::payloads::AuthResponsePayload) | pre-auth |
+/// | `0x06` | [`AuthResult`](Self::AuthResult) | S -> C | [`AuthResultPayload`](super::payloads::AuthResultPayload) | pre-auth |
+/// | `0x07` | [`Close`](Self::Close) | both | `u8` reason + `u16` len + msg | any |
+/// | `0x08` | [`Resume`](Self::Resume) | C -> S | see L2 spec §7.9 | reconnect |
+/// | `0x09` | [`Resumed`](Self::Resumed) | S -> C | see L2 spec §7.10 | reconnect |
+/// | `0x10` | [`Ping`](Self::Ping) | both | `u64` ts + `[u8; 8]` opaque | **any** |
+/// | `0x11` | [`Pong`](Self::Pong) | both | `u64` ts + `u64` ts + `[u8; 8]` | **any** |
+/// | `0x20` | [`Subscribe`](Self::Subscribe) | C -> S | `SubscribePayload` | active |
+/// | `0x21` | [`Unsubscribe`](Self::Unsubscribe) | C -> S | `UnsubscribePayload` | active |
+/// | `0x22` | [`SubscribeAck`](Self::SubscribeAck) | S -> C | `SubscribeAckPayload` | active |
+/// | `0xfe` | [`Data`](Self::Data) | both | [`DataPayload`](super::payloads::DataPayload) | active |
+/// | `0xff` | [`Error`](Self::Error) | both | `u16` code + `u16` len + msg | any |
+///
+/// `C -> S` = client -> server, `S -> C` = server -> client, `both` = bidirectional
+/// (every L2 endpoint is simultaneously frame sender and frame receiver).
+///
+/// # Code space allocation
+///
+/// | Range | Purpose |
+/// |-------|---------|
+/// | `0x00..=0x11` | Session control: handshake, flow control, liveness, recovery |
+/// | `0x0a..=0x0f` | *Reserved* — future session control |
+/// | `0x12..=0x1f` | *Reserved* — future session control |
+/// | `0x20..=0x2f` | Subscription management (address registration / egress) |
+/// | `0x23..=0xfd` | *Reserved* — future extensions |
+/// | `0xfe` | `Data` — the only carrier of L3 messages |
+/// | `0xff` | `Error` — fatal protocol error |
+///
+/// `Data` and `Error` are pinned to the top of the range so that the entire
+/// low range can grow without touching the hot-path discriminator.
+///
+/// # Sequence number & acknowledgment semantics
+///
+/// **This is the most important invariant to preserve when adding frame types.**
+///
+/// | Frame | Consumes `session_sequence` | Stored in `UnackedBuffer` | Peer must reply |
+/// |-------|:---------------------------:|:-------------------------:|-----------------|
+/// | [`Data`](Self::Data) | **yes** | **yes** | `Acknowledge` or `Drop` |
+/// | [`CreditGrant`](Self::CreditGrant) | **yes** | no | — |
+/// | all others | no | no | — |
+///
+/// Consequences:
+///
+/// 1. **`Data` sequence numbers are not contiguous.** `CreditGrant` consumes numbers
+///    from the same monotonic counter, so a receiver may legitimately observe
+///    `Data(seq=1), Data(seq=3), Data(seq=7)`. Duplicate detection via
+///    `SessionState::update_last_received` therefore accepts *any strictly greater*
+///    sequence — it must **not** require `last + 1`.
+/// 2. **Only `Data` occupies the credit window.** `UnackedBuffer.len() <= hot_credit`
+///    is the O(1) memory guarantee; adding another buffered frame type would break it.
+/// 3. **`Acknowledge`/`Drop` carry the *peer's* sequence**, not their own. They are
+///    built by [`create_ack_frame`] / `IPCEndpoint::send_drop` and never allocate
+///    a sequence number.
+///
+/// # Connection phase constraints
+///
+/// The server enforces a strict state machine; violations produce
+/// [`Error`](Self::Error) with `auth_failed` followed by immediate disconnect.
+///
+/// | Phase | Accepted from client |
+/// |-------|----------------------|
+/// | Awaiting `Hello` | `Hello`, `Ping` |
+/// | Awaiting `AuthResponse` | `AuthResponse`, `Ping` |
+/// | Credit exchange | `CreditGrant`, `Ping` |
+/// | Active | `Data`, `CreditGrant`, `Acknowledge`, `Drop`, `Subscribe`, `Unsubscribe`, `Close`, `Ping` |
+/// | Reconnecting | `Resume`, `Ping` |
+///
+/// [`Ping`](Self::Ping) is accepted in **every** phase, including before `Hello`,
+/// and is answered with [`Pong`](Self::Pong) by `recv_handshake_frame`. This keeps
+/// keep-alive working during a slow or stalled handshake.
+///
+/// Direction violations (e.g. a server receiving [`Welcome`](Self::Welcome) or
+/// [`SubscribeAck`](Self::SubscribeAck)) are protocol errors, not ignorable frames.
+///
+/// # Unknown frame types
+///
+/// [`from_u8`](Self::from_u8) returns `None`. Recommended handling:
+///
+/// - **Active phase, unknown code** -> log at `debug` and skip (forward compatibility).
+/// - **Pre-auth phase, unknown code** -> reject: the peer has not been authenticated yet.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
-    /// Client � Server: initiate connection with auth algorithm selection
-    Hello        = 0x00,
-    /// Server � Client: confirm connection with server challenge
-    Welcome      = 0x01,
-    /// Bidirectional: grant credit for an address
-    CreditGrant  = 0x02,
-    /// Bidirectional: acknowledge successful frame processing
-    Acknowledge  = 0x03,
-    /// Bidirectional: notify about dropped frame
-    Drop         = 0x04,
-    /// Client � Server: authentication response (HMAC)
+    /// `0x00` — **Client -> Server.** Opens a connection and selects the authentication
+    /// algorithm. Carries `client_id`, which becomes the session's authenticated
+    /// `source_prefix` after [`AuthResult`](Self::AuthResult) succeeds.
+    ///
+    /// Must be the first non-`Ping` frame on a fresh connection.
+    /// Payload: [`HelloPayload`](super::payloads::HelloPayload).
+    Hello = 0x00,
+
+    /// `0x01` — **Server -> Client.** Accepts the connection: issues `session_id`,
+    /// `session_token`, `server_challenge` and the negotiated [`ServerLimits`](super::ServerLimits).
+    ///
+    /// The client sizes its `UnackedBuffer` from `limits.hot_credit` carried here.
+    /// Payload: [`WelcomePayload`](super::payloads::WelcomePayload).
+    Welcome = 0x01,
+
+    /// `0x02` — **Bidirectional.** Grants flow-control credit for an address
+    /// (`hot` or `cold`). Sent by both sides immediately after authentication and
+    /// again whenever credit is returned.
+    ///
+    /// **Consumes a `session_sequence` but is never acknowledged or buffered.**
+    /// Payload: [`CreditGrantPayload`](super::payloads::CreditGrantPayload).
+    CreditGrant = 0x02,
+
+    /// `0x03` — **Bidirectional.** Confirms that a `Data` frame was fully processed
+    /// (delivered to L3 or durably queued). Releases the peer's `UnackedBuffer` slot
+    /// and returns one hot credit.
+    ///
+    /// Payload: `session_sequence: u64 LE` of the **acknowledged `Data` frame**.
+    /// Built by [`create_ack_frame`].
+    Acknowledge = 0x03,
+
+    /// `0x04` — **Bidirectional.** Reports that a `Data` frame was discarded.
+    /// Releases the peer's buffer slot exactly like `Acknowledge`, but additionally
+    /// starts `drop_cooldown_ms` for the affected address.
+    ///
+    /// Payload: `session_sequence: u64 LE` + `reason: u8`
+    /// (`0` = ttl_expired, `1` = buffer_overflow, `2` = address_removed).
+    Drop = 0x04,
+
+    /// `0x05` — **Client -> Server.** Challenge-response proof of secret possession:
+    /// `HMAC(client_secret, server_challenge || client_nonce)`.
+    ///
+    /// Payload: [`AuthResponsePayload`](super::payloads::AuthResponsePayload).
     AuthResponse = 0x05,
-    /// Server � Client: authentication result
-    AuthResult   = 0x06,
-    /// Bidirectional: close connection
-    Close        = 0x07,
-    /// Client � Server: request session resumption
-    Resume       = 0x08,
-    /// Server � Client: confirm session resumption
-    Resumed      = 0x09,
-    /// Bidirectional: connectivity check
-    Ping         = 0x10,
-    /// Bidirectional: response to Ping
-    Pong         = 0x11,
-    /// Bidirectional: L3 payload carrier
-    Data         = 0xfe,
-    /// Bidirectional: error notification
-    Error        = 0xff,
+
+    /// `0x06` — **Server -> Client.** Authentication verdict. `status = 0` authorizes
+    /// the credit exchange and `Data` traffic; any other status closes the connection.
+    ///
+    /// Payload: [`AuthResultPayload`](super::payloads::AuthResultPayload).
+    AuthResult = 0x06,
+
+    /// `0x07` — **Bidirectional.** Graceful shutdown of the session.
+    ///
+    /// Payload: `reason: u8` (`0` = normal, `1` = error, `2` = timeout, `3` = auth_failed)
+    /// + `error_message_length: u16 LE` + UTF-8 message.
+    ///
+    /// Distinct from a bare socket close: it lets the peer detach subscriptions
+    /// deterministically instead of relying on EOF detection.
+    Close = 0x07,
+
+    /// `0x08` — **Client -> Server.** Requests session resumption after a transport
+    /// break, presenting `session_token` and the last known sequence numbers.
+    ///
+    /// *Not yet implemented (roadmap Stage 11).* Payload: L2 spec §7.9.
+    Resume = 0x08,
+
+    /// `0x09` — **Server -> Client.** Resumption verdict plus a fresh challenge and
+    /// the server's sequence watermarks.
+    ///
+    /// `status = 3 (state_lost_reset)` obliges the client to notify L3 of a **full**
+    /// session loss rather than attempting incremental replay.
+    ///
+    /// *Not yet implemented (roadmap Stage 11).* Payload: L2 spec §7.10.
+    Resumed = 0x09,
+
+    /// `0x10` — **Bidirectional.** Liveness probe.
+    ///
+    /// Accepted in **every** connection phase, including before `Hello`; always
+    /// answered with [`Pong`](Self::Pong). Never consumes a sequence number.
+    ///
+    /// Payload: `timestamp: u64 LE` + `opaque_data: [u8; 8]`.
+    Ping = 0x10,
+
+    /// `0x11` — **Bidirectional.** Reply to [`Ping`](Self::Ping), echoing the original
+    /// timestamp and opaque data so the prober can compute RTT without local state.
+    ///
+    /// Payload: `original_timestamp: u64` + `response_timestamp: u64` + `opaque_data: [u8; 8]`.
+    Pong = 0x11,
+
+    /// `0x20` — **Client -> Server.** Registers a logical address (or wildcard pattern)
+    /// in the broker's `LocalRegistry` and attaches an egress pump to this session.
+    ///
+    /// The broker creates the `MessageSender` at registration time; the queue lives
+    /// inside the `SubscriptionSlot` and survives disconnects until the ownership
+    /// timeout expires. Authorization uses the session's `source_prefix`, never a
+    /// field from the payload.
+    ///
+    /// Answered with [`SubscribeAck`](Self::SubscribeAck).
+    Subscribe = 0x20,
+
+    /// `0x21` — **Client -> Server.** Explicitly destroys a client-owned address:
+    /// detaches the pump, unregisters the route and drains any queued messages to
+    /// the configured dead-letter queue.
+    ///
+    /// Idempotent. Rejected for broker-owned (predefined) addresses.
+    /// Answered with [`SubscribeAck`](Self::SubscribeAck).
+    Unsubscribe = 0x21,
+
+    /// `0x22` — **Server -> Client.** Result of [`Subscribe`](Self::Subscribe) **or**
+    /// [`Unsubscribe`](Self::Unsubscribe), correlated by `request_id`.
+    ///
+    /// `status`: `0` = success, `1` = address_occupied, `2` = policy_mismatch,
+    /// `3` = access_denied, `4` = invalid_address, `5` = internal.
+    SubscribeAck = 0x22,
+
+    /// `0xfe` — **Bidirectional.** The only carrier of L3 messages.
+    ///
+    /// L2 extracts `address` for credit accounting and hands `messages_raw` to the
+    /// Ingress Bridge **without parsing L3 internals**. One frame may coalesce
+    /// several messages for the *same* address.
+    ///
+    /// **Consumes a `session_sequence`, occupies an `UnackedBuffer` slot, and must be
+    /// acknowledged** with [`Acknowledge`](Self::Acknowledge) or [`Drop`](Self::Drop).
+    ///
+    /// Payload: [`DataPayload`](super::payloads::DataPayload) (send side) /
+    /// [`ParsedDataPayload`](super::payloads::ParsedDataPayload) (receive side).
+    Data = 0xfe,
+
+    /// `0xff` — **Bidirectional.** Fatal protocol error (bad frame for the current
+    /// phase, malformed payload, unsupported algorithm).
+    ///
+    /// The sender closes the connection immediately after emitting it; the receiver
+    /// must treat it as terminal, not as a recoverable per-frame rejection.
+    ///
+    /// Payload: `error_code: u16 LE` + `message_length: u16 LE` + UTF-8 message.
+    /// Built by [`build_error_frame`].
+    Error = 0xff,
 }
 
 impl FrameType {
-    /// Attempts to convert a raw byte into a known frame type.
-    /// Returns None for unknown/reserved types,
-    /// which allows the parser to decide how to handle future protocol extensions.
+    /// Maps a raw wire discriminant to its typed variant.
+    ///
+    /// Returns `None` for reserved or not-yet-known codes (`0x0a..=0x0f`,
+    /// `0x12..=0x1f`, `0x23..=0xfd`, …). This is **not an error**: it is the
+    /// forward-compatibility hook that lets an older build coexist with a newer peer.
+    ///
+    /// The caller decides the policy:
+    /// - unknown code in the **active** phase → log and skip;
+    /// - unknown code **before authentication** → reject with [`FrameType::Error`].
+    ///
+    /// # Complexity
+    ///
+    /// O(1). The match compiles to a jump table; no allocation, no validation of
+    /// the accompanying payload.
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0x00 => Some(Self::Hello),
@@ -113,6 +354,9 @@ impl FrameType {
             0x09 => Some(Self::Resumed),
             0x10 => Some(Self::Ping),
             0x11 => Some(Self::Pong),
+            0x20 => Some(Self::Subscribe),
+            0x21 => Some(Self::Unsubscribe),
+            0x22 => Some(Self::SubscribeAck),
             0xfe => Some(Self::Data),
             0xff => Some(Self::Error),
             _ => None,

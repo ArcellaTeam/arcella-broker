@@ -14,6 +14,9 @@ mod welcome;
 mod credit_grant;
 mod auth_response;
 mod auth_result;
+mod subscribe;
+mod subscribe_ask;
+mod unsubscribe;
 mod data;
 
 pub use hello::*;
@@ -21,6 +24,9 @@ pub use welcome::*;
 pub use credit_grant::*;
 pub use auth_response::*;
 pub use auth_result::*;
+pub use subscribe::*;
+pub use subscribe_ask::*;
+pub use unsubscribe::*;
 pub use data::*;
 
 /// Current L2 protocol version
@@ -74,6 +80,9 @@ pub enum PayloadError {
     /// or malformed error message.
     #[error("AuthResult payload (0x06): {0}")]
     AuthResult(#[from] AuthResultPayloadError),
+
+    #[error("Subscribe payload (0x06): {0}")]
+    Subscribe(#[from] SubscribePayloadError), 
 
     /// Error parsing/encoding a Data payload (0xfe).
     ///
