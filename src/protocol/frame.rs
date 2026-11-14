@@ -110,9 +110,9 @@ pub enum FrameHeaderError {
 /// | `0x09` | [`Resumed`](Self::Resumed) | S -> C | see L2 spec §7.10 | reconnect |
 /// | `0x10` | [`Ping`](Self::Ping) | both | `u64` ts + `[u8; 8]` opaque | **any** |
 /// | `0x11` | [`Pong`](Self::Pong) | both | `u64` ts + `u64` ts + `[u8; 8]` | **any** |
-/// | `0x20` | [`Subscribe`](Self::Subscribe) | C -> S | `SubscribePayload` | active |
-/// | `0x21` | [`Unsubscribe`](Self::Unsubscribe) | C -> S | `UnsubscribePayload` | active |
-/// | `0x22` | [`SubscribeAck`](Self::SubscribeAck) | S -> C | `SubscribeAckPayload` | active |
+/// | `0x20` | [`Subscribe`](Self::Subscribe) | C -> S | [`SubscribePayload`](super::payloads::SubscribePayload) | active |
+/// | `0x21` | [`Unsubscribe`](Self::Unsubscribe) | C -> S | [`UnsubscribePayload`](super::payloads::UnsubscribePayload) | active |
+/// | `0x22` | [`SubscribeAck`](Self::SubscribeAck) | S -> C | [`SubscribeAckPayload`](super::payloads::SubscribeAckPayload) | active |
 /// | `0xfe` | [`Data`](Self::Data) | both | [`DataPayload`](super::payloads::DataPayload) | active |
 /// | `0xff` | [`Error`](Self::Error) | both | `u16` code + `u16` len + msg | any |
 ///
@@ -126,7 +126,7 @@ pub enum FrameHeaderError {
 /// | `0x00..=0x11` | Session control: handshake, flow control, liveness, recovery |
 /// | `0x0a..=0x0f` | *Reserved* — future session control |
 /// | `0x12..=0x1f` | *Reserved* — future session control |
-/// | `0x20..=0x2f` | Subscription management (address registration / egress) |
+/// | `0x20..=0x22` | Subscription management (address registration / egress) |
 /// | `0x23..=0xfd` | *Reserved* — future extensions |
 /// | `0xfe` | `Data` — the only carrier of L3 messages |
 /// | `0xff` | `Error` — fatal protocol error |
@@ -141,7 +141,14 @@ pub enum FrameHeaderError {
 /// | Frame | Consumes `session_sequence` | Stored in `UnackedBuffer` | Peer must reply |
 /// |-------|:---------------------------:|:-------------------------:|-----------------|
 /// | [`Data`](Self::Data) | **yes** | **yes** | `Acknowledge` or `Drop` |
-/// | [`CreditGrant`](Self::CreditGrant) | **yes** | no | — |
+/// | [`CreditGrant`](Self::CreditGrant) | **yes** | no | — | — |
+/// | [`Ping`](Self::Ping) | no | no | `opaque_data` | `Pong` |
+/// | [`Subscribe`](Self::Subscribe) | no | no | `request_id` | `SubscribeAck` |
+/// | [`Unsubscribe`](Self::Unsubscribe) | **yes** | no | `request_id` | `SubscribeAck` |
+/// | [`Acknowledge`](Self::Acknowledge)  | no | no | peer's id | — |
+/// | [`Drop`](Self::Drop)  | no | no | peer's id | — |
+/// | [`Pong`](Self::Pong)  | no | no | peer's id | — |
+/// | [`SubscribeAck`](Self::SubscribeAck)  | no | no | peer's id | — |
 /// | all others | no | no | — |
 ///
 /// Consequences:
@@ -156,7 +163,13 @@ pub enum FrameHeaderError {
 /// 3. **`Acknowledge`/`Drop` carry the *peer's* sequence**, not their own. They are
 ///    built by [`create_ack_frame`] / `IPCEndpoint::send_drop` and never allocate
 ///    a sequence number.
-///
+/// 4. **Two independent correlation spaces exist.** `session_sequence` is a
+///    per-direction monotonic counter owned by L2 flow control. `request_id` is
+///    allocated by the client purely to match `Subscribe`/`Unsubscribe` with
+///    `SubscribeAck`; it is opaque to the server, need not be monotonic, and is
+///    never mixed into `SessionState`. A `SubscribeAck` must never be interpreted
+///    as acknowledging a `Data` frame.
+/// 
 /// # Connection phase constraints
 ///
 /// The server enforces a strict state machine; violations produce
@@ -167,9 +180,11 @@ pub enum FrameHeaderError {
 /// | Awaiting `Hello` | `Hello`, `Ping` |
 /// | Awaiting `AuthResponse` | `AuthResponse`, `Ping` |
 /// | Credit exchange | `CreditGrant`, `Ping` |
-/// | Active | `Data`, `CreditGrant`, `Acknowledge`, `Drop`, `Subscribe`, `Unsubscribe`, `Close`, `Ping` |
+/// | Active | `Data`, `CreditGrant`, `Acknowledge`, `Drop`, `Subscribe`, `Unsubscribe`, `Close`, `Ping`, `Pong` |
 /// | Reconnecting | `Resume`, `Ping` |
 ///
+/// [`Error`](Self::Error) is accepted in **every** phase and is always terminal.
+/// 
 /// [`Ping`](Self::Ping) is accepted in **every** phase, including before `Hello`,
 /// and is answered with [`Pong`](Self::Pong) by `recv_handshake_frame`. This keeps
 /// keep-alive working during a slow or stalled handshake.
@@ -278,27 +293,60 @@ pub enum FrameType {
     /// `0x20` — **Client -> Server.** Registers a logical address (or wildcard pattern)
     /// in the broker's `LocalRegistry` and attaches an egress pump to this session.
     ///
+    /// Payload: `request_id: u64 LE` + `routing_policy: u8` + `capacity: u32 LE`
+    /// + `address_length: u16 LE` + UTF-8 address.
+    ///
+    /// `routing_policy`: `0` = Exclusive, `1` = LoadBalanced. A LoadBalanced request
+    /// for an already registered group **joins** it; an Exclusive request for an
+    /// occupied address fails with `address_occupied`.
+    ///
+    /// `capacity` is a **request, not a command**: `0` means "use the server default",
+    /// any other value is clamped to the server's configured bounds and to the
+    /// remaining per-session queue budget. The granted value is reported back in
+    /// [`SubscribeAck`](Self::SubscribeAck).
+    ///
     /// The broker creates the `MessageSender` at registration time; the queue lives
     /// inside the `SubscriptionSlot` and survives disconnects until the ownership
     /// timeout expires. Authorization uses the session's `source_prefix`, never a
     /// field from the payload.
     ///
+    /// Bounded by `ServerLimits::max_addresses_per_session`.
+    /// Consumes neither a `session_sequence` nor a hot credit.
+    ///
     /// Answered with [`SubscribeAck`](Self::SubscribeAck).
     Subscribe = 0x20,
 
     /// `0x21` — **Client -> Server.** Explicitly destroys a client-owned address:
-    /// detaches the pump, unregisters the route and drains any queued messages to
-    /// the configured dead-letter queue.
+    /// detaches the egress pump and unregisters the route.
     ///
-    /// Idempotent. Rejected for broker-owned (predefined) addresses.
-    /// Answered with [`SubscribeAck`](Self::SubscribeAck).
+    /// Payload: `request_id: u64 LE` + `address_length: u16 LE` + UTF-8 address.
+    ///
+    /// Idempotent: unsubscribing an unknown address returns `success`.
+    /// Rejected with `access_denied` for addresses owned by another session.
+    ///
+    /// *Not yet implemented:* draining queued messages into a dead-letter queue,
+    /// and rejection of broker-owned (predefined) addresses.
+    ///
+    /// Answered with [`SubscribeAck`](Self::SubscribeAck) with `queue_capacity = 0`.
     Unsubscribe = 0x21,
 
     /// `0x22` — **Server -> Client.** Result of [`Subscribe`](Self::Subscribe) **or**
     /// [`Unsubscribe`](Self::Unsubscribe), correlated by `request_id`.
     ///
+    /// Payload: `request_id: u64 LE` + `status: u8` + `queue_capacity: u32 LE`
+    /// + `error_message_length: u16 LE` + UTF-8 message. Fixed part: **15 bytes**.
+    ///
     /// `status`: `0` = success, `1` = address_occupied, `2` = policy_mismatch,
     /// `3` = access_denied, `4` = invalid_address, `5` = internal.
+    ///
+    /// `queue_capacity` is the **granted** capacity, which may differ from the
+    /// requested one: the server clamps it to its own bounds and to the remaining
+    /// per-session budget. When joining an existing LoadBalanced group the capacity
+    /// of *that* group is returned, because `mpsc` capacity is fixed at creation
+    /// time and cannot be resized. Always `0` for `Unsubscribe` and for any failure.
+    ///
+    /// Clamping is **not** an error: `status` stays `success`. The client must use
+    /// this value, not its own request, for local accounting and watermarks.
     SubscribeAck = 0x22,
 
     /// `0xfe` — **Bidirectional.** The only carrier of L3 messages.
@@ -394,6 +442,8 @@ impl FrameHeader {
         let frame_type = bytes[0];
         // Read 3 bytes of length in Little-Endian order.
         // Bytes: [length_0, length_1, length_2, 0x00]
+        // The 4th byte is forced to 0x00, therefore `length` is bounded by
+        // u24::MAX == FRAME_MAX_PAYLOAD_LENGTH and cannot exceed it
         let length_bytes = [bytes[1], bytes[2], bytes[3], 0x00];
         let length = u32::from_le_bytes(length_bytes);
 
