@@ -126,7 +126,7 @@ pub enum FrameHeaderError {
 /// | `0x00..=0x11` | Session control: handshake, flow control, liveness, recovery |
 /// | `0x0a..=0x0f` | *Reserved* — future session control |
 /// | `0x12..=0x1f` | *Reserved* — future session control |
-/// | `0x20..=0x22` | Subscription management (address registration / egress) |
+/// | `0x20..=0x22` | Consumer subscription: attach/detach to existing addresses (data plane) |
 /// | `0x23..=0xfd` | *Reserved* — future extensions |
 /// | `0xfe` | `Data` — the only carrier of L3 messages |
 /// | `0xff` | `Error` — fatal protocol error |
@@ -134,22 +134,32 @@ pub enum FrameHeaderError {
 /// `Data` and `Error` are pinned to the top of the range so that the entire
 /// low range can grow without touching the hot-path discriminator.
 ///
+/// # Control plane / data plane boundary
+///
+/// The subscription family (`0x20`–`0x22`) is **data plane only**: it attaches
+/// or detaches a session as a *consumer* of an address that already exists.
+/// Addresses — together with their routing policy and queue capacity — are
+/// created, configured and deleted exclusively through the broker control
+/// plane (`BrokerControl`), never through these frames. Consequently
+/// `Subscribe` carries no policy/capacity fields, and `Unsubscribe` never
+/// deletes an address or its queue.
+///
 /// # Sequence number & acknowledgment semantics
 ///
 /// **This is the most important invariant to preserve when adding frame types.**
 ///
-/// | Frame | Consumes `session_sequence` | Stored in `UnackedBuffer` | Peer must reply |
-/// |-------|:---------------------------:|:-------------------------:|-----------------|
-/// | [`Data`](Self::Data) | **yes** | **yes** | `Acknowledge` or `Drop` |
-/// | [`CreditGrant`](Self::CreditGrant) | **yes** | no | — | — |
+/// | Frame | Consumes `session_sequence` | Stored in `UnackedBuffer` | Correlation id | Peer must reply |
+/// |-------|:---------------------------:|:-------------------------:|----------------|-----------------|
+/// | [`Data`](Self::Data) | **yes** | **yes** | own `session_sequence` | `Acknowledge` or `Drop` |
+/// | [`CreditGrant`](Self::CreditGrant) | **yes** | no | own `session_sequence` | — |
+/// | [`Acknowledge`](Self::Acknowledge) | no | no | peer's `session_sequence` | — |
+/// | [`Drop`](Self::Drop) | no | no | peer's `session_sequence` | — |
 /// | [`Ping`](Self::Ping) | no | no | `opaque_data` | `Pong` |
+/// | [`Pong`](Self::Pong) | no | no | echoed `opaque_data` | — |
 /// | [`Subscribe`](Self::Subscribe) | no | no | `request_id` | `SubscribeAck` |
-/// | [`Unsubscribe`](Self::Unsubscribe) | **yes** | no | `request_id` | `SubscribeAck` |
-/// | [`Acknowledge`](Self::Acknowledge)  | no | no | peer's id | — |
-/// | [`Drop`](Self::Drop)  | no | no | peer's id | — |
-/// | [`Pong`](Self::Pong)  | no | no | peer's id | — |
-/// | [`SubscribeAck`](Self::SubscribeAck)  | no | no | peer's id | — |
-/// | all others | no | no | — |
+/// | [`Unsubscribe`](Self::Unsubscribe) | no | no | `request_id` | `SubscribeAck` |
+/// | [`SubscribeAck`](Self::SubscribeAck) | no | no | echoed `request_id` | — |
+/// | all others | no | no | — | — |
 ///
 /// Consequences:
 ///
@@ -257,8 +267,8 @@ pub enum FrameType {
     /// Payload: `reason: u8` (`0` = normal, `1` = error, `2` = timeout, `3` = auth_failed)
     /// + `error_message_length: u16 LE` + UTF-8 message.
     ///
-    /// Distinct from a bare socket close: it lets the peer detach subscriptions
-    /// deterministically instead of relying on EOF detection.
+    /// Distinct from a bare socket close: it lets the peer detach consumer
+    /// bindings deterministically instead of relying on EOF detection.
     Close = 0x07,
 
     /// `0x08` — **Client -> Server.** Requests session resumption after a transport
@@ -290,63 +300,67 @@ pub enum FrameType {
     /// Payload: `original_timestamp: u64` + `response_timestamp: u64` + `opaque_data: [u8; 8]`.
     Pong = 0x11,
 
-    /// `0x20` — **Client -> Server.** Registers a logical address (or wildcard pattern)
-    /// in the broker's `LocalRegistry` and attaches an egress pump to this session.
+    /// `0x20` — **Client -> Server.** Attaches this session as a **consumer** of an
+    /// already registered address (exact name or wildcard pattern) and starts an
+    /// egress pump towards the session. It does **not** create an address: address
+    /// lifecycle belongs to the control plane (`BrokerControl`).
     ///
-    /// Payload: `request_id: u64 LE` + `routing_policy: u8` + `capacity: u32 LE`
-    /// + `address_length: u16 LE` + UTF-8 address.
+    /// Payload: `request_id: u64 LE` + `address_length: u16 LE` + UTF-8 address.
+    /// Fixed part: **10 bytes**. No policy or capacity fields — both are properties
+    /// of the address, fixed at creation time.
     ///
-    /// `routing_policy`: `0` = Exclusive, `1` = LoadBalanced. A LoadBalanced request
-    /// for an already registered group **joins** it; an Exclusive request for an
-    /// occupied address fails with `address_occupied`.
+    /// Semantics per address policy:
+    /// - **Exclusive**: succeeds only if no other session is attached; otherwise
+    ///   `exclusive_occupied`.
+    /// - **LoadBalanced**: joins the existing consumer group.
+    /// - **Broadcast**: reserved for a future stage (`policy_unsupported` today).
     ///
-    /// `capacity` is a **request, not a command**: `0` means "use the server default",
-    /// any other value is clamped to the server's configured bounds and to the
-    /// remaining per-session queue budget. The granted value is reported back in
-    /// [`SubscribeAck`](Self::SubscribeAck).
+    /// Authorization uses the session's `source_prefix`, never a field from the
+    /// payload. The number of simultaneous consumer bindings per session is
+    /// bounded by `ServerLimits::max_addresses_per_session`.
     ///
-    /// The broker creates the `MessageSender` at registration time; the queue lives
-    /// inside the `SubscriptionSlot` and survives disconnects until the ownership
-    /// timeout expires. Authorization uses the session's `source_prefix`, never a
-    /// field from the payload.
+    /// The address queue lives inside its `SubscriptionSlot` and is unaffected by
+    /// attach/detach: while no consumer is attached, messages accumulate up to the
+    /// queue capacity and then apply backpressure to senders.
     ///
-    /// Bounded by `ServerLimits::max_addresses_per_session`.
     /// Consumes neither a `session_sequence` nor a hot credit.
     ///
     /// Answered with [`SubscribeAck`](Self::SubscribeAck).
     Subscribe = 0x20,
 
-    /// `0x21` — **Client -> Server.** Explicitly destroys a client-owned address:
-    /// detaches the egress pump and unregisters the route.
+     /// `0x21` — **Client -> Server.** Detaches this session's consumer binding from
+    /// the given address and stops its egress pump. The address and its queue are
+    /// **not** affected: queued messages remain and will be delivered to the next
+    /// attached consumer. Deleting an address is a control-plane operation only.
     ///
     /// Payload: `request_id: u64 LE` + `address_length: u16 LE` + UTF-8 address.
+    /// Fixed part: **10 bytes**.
     ///
-    /// Idempotent: unsubscribing an unknown address returns `success`.
-    /// Rejected with `access_denied` for addresses owned by another session.
+    /// If this session has no binding for the address, the server replies with
+    /// `not_subscribed`. Bindings of other sessions are never touched.
     ///
-    /// *Not yet implemented:* draining queued messages into a dead-letter queue,
-    /// and rejection of broker-owned (predefined) addresses.
-    ///
+    /// Consumes neither a `session_sequence` nor a hot credit.
     /// Answered with [`SubscribeAck`](Self::SubscribeAck) with `queue_capacity = 0`.
     Unsubscribe = 0x21,
 
     /// `0x22` — **Server -> Client.** Result of [`Subscribe`](Self::Subscribe) **or**
     /// [`Unsubscribe`](Self::Unsubscribe), correlated by `request_id`.
     ///
-    /// Payload: `request_id: u64 LE` + `status: u8` + `queue_capacity: u32 LE`
-    /// + `error_message_length: u16 LE` + UTF-8 message. Fixed part: **15 bytes**.
+    /// Payload: `request_id: u64 LE` + `status: u8` + `routing_policy: u8`
+    /// + `queue_capacity: u32 LE` + `error_message_length: u16 LE` + UTF-8 message.
+    /// Fixed part: **16 bytes**.
     ///
-    /// `status`: `0` = success, `1` = address_occupied, `2` = policy_mismatch,
-    /// `3` = access_denied, `4` = invalid_address, `5` = internal.
+    /// `status`: `0` = success, `1` = address_not_found, `2` = exclusive_occupied,
+    /// `3` = already_subscribed, `4` = permission_denied, `5` = policy_unsupported,
+    /// `6` = internal_error, `7` = not_subscribed, `8` = binding_limit.
     ///
-    /// `queue_capacity` is the **granted** capacity, which may differ from the
-    /// requested one: the server clamps it to its own bounds and to the remaining
-    /// per-session budget. When joining an existing LoadBalanced group the capacity
-    /// of *that* group is returned, because `mpsc` capacity is fixed at creation
-    /// time and cannot be resized. Always `0` for `Unsubscribe` and for any failure.
+    /// `routing_policy` (informational): `0` = Exclusive, `1` = LoadBalanced,
+    /// `2` = Broadcast (reserved), `0xFF` = none (failure or Unsubscribe).
     ///
-    /// Clamping is **not** an error: `status` stays `success`. The client must use
-    /// this value, not its own request, for local accounting and watermarks.
+    /// `queue_capacity` is the **actual** capacity of the address queue, reported
+    /// for client-side metrics and watermarks; there is no negotiation because the
+    /// client cannot request a capacity. Always `0` for `Unsubscribe` and for any
+    /// failure.
     SubscribeAck = 0x22,
 
     /// `0xfe` — **Bidirectional.** The only carrier of L3 messages.
