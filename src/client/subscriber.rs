@@ -39,22 +39,14 @@
 //!    more slowly than they arrive.
 
 use std::sync::Arc;
-use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    protocol::Message,
     broker_core::{
         registry::{
             LocalRegistry, 
             LoadBalancedGroup,
             SubscriptionSlot
-        },
-        transport::{
-            MessageReceiver, 
-            RequestSender,
-            TryRecvError,
-            TryRequestError,
         },
     },
 };
@@ -141,165 +133,5 @@ impl Drop for SubscriptionHandle {
                 group.remove_consumer();
             }
         }
-    }
-}
-
-enum SubscriberMode {
-    /// Push mode: messages arrive in MessageReceiver (Exclusive, Broadcast)
-    Push(Arc<Mutex<MessageReceiver>>),
-    /// Pull mode: messages are requested via RequestSender (LoadBalanced)
-    Pull(Arc<RequestSender>),
-}
-
-/// An active subscription to messages at a specific logical address.
-///
-/// This struct owns the receiving end of the channel (`MessageReceiver`).
-/// As long as a `Subscriber` instance exists, the address is considered occupied in `LocalRegistry`,
-/// and the broker will route incoming messages into this channel.
-///
-/// # Important note on ownership
-/// `Subscriber` is intentionally lightweight — it holds only the `MessageReceiver` 
-/// and the address string. It does NOT hold a reference to `LocalRegistry` 
-/// and does NOT implement automatic cleanup.
-///
-/// Lifecycle management (unregistration) is the responsibility of 
-/// `SubscriptionHandle`, which is returned alongside `Subscriber` from 
-/// `BrokerClient::subscribe()`.
-pub struct Subscriber {
-    /// The receiving end of the asynchronous channel, protected against overflow.																  
-    mode: SubscriberMode,
-
-    /// The logical address the subscription is registered for (for logging and debugging).
-    address: String,
-
-    cancel: CancellationToken,
-}
-
-impl Subscriber {
-    /// Creates a Push subscriber (for Exclusive and Broadcast)
-    pub(crate) fn new_push(
-        rx: Arc<Mutex<MessageReceiver>>,
-        address: String,
-        cancel: CancellationToken,
-    ) -> Self {
-        Self {
-            mode: SubscriberMode::Push(rx),
-            address,
-            cancel,
-        }
-    } 
-
-    /// Creates a Pull subscriber (for LoadBalanced)
-    pub(crate) fn new_pull(
-        req_sender: Arc<RequestSender>,
-        address: String,
-        cancel: CancellationToken,
-    ) -> Self {
-        Self {
-            mode: SubscriberMode::Pull(req_sender),
-            address,
-            cancel,
-        }
-    }       
-
-    /// Asynchronously waits for the next message.
-    ///
-    /// Returns `Some(Message)` on successful receipt.
-    /// Returns `None` if all senders have been destroyed.
-    /// In the Arcella architecture, this is unlikely while the subscription is active,
-    /// since `LocalRegistry` holds at least one strong reference
-    /// to the `MessageSender`, but the method is implemented for completeness of the `tokio::mpsc` API.
-    pub async fn recv(&mut self) -> Option<Message> {
-        match &mut self.mode {
-            SubscriberMode::Push(receiver) => {
-                // 1. Fast path: try to acquire lock and read synchronously
-                let mut rx =  match receiver.try_lock() {
-                    Ok(guard) => guard,
-                    _ => {
-                        receiver.lock().await    
-                    }
-                };
-
-                // 2. Fast path: check if message is already available
-                match rx.try_recv() {
-                    Ok(msg) => return Some(msg),
-                    Err(TryRecvError::Disconnected) => return None,
-                    Err(TryRecvError::Empty) => {}
-                };
-
-                // 3. Slow path: wait for message
-                rx.recv().await
-            }
-            SubscriberMode::Pull(req_sender) => {
-                // 1. Fast path: try to send request token synchronously
-                let mut reply_rx =  match req_sender.try_request() {
-                    Ok(rx) => rx,
-                    Err(TryRequestError::Disconnected) => return None,
-                    Err(TryRequestError::Full) => {
-                        // Queue is full, fallback to async wait for a slot
-                        match req_sender.request().await {
-                            Ok(rx) => rx,
-                            Err(_) => return None,
-                        }
-                    }
-                };
-
-                // 2. Fast path: check if response is already available (rare but possible)
-                match reply_rx.try_recv() {
-                    Ok(msg) => return Some(msg),
-                    Err(oneshot::error::TryRecvError::Closed) => return None,
-                    Err(oneshot::error::TryRecvError::Empty) => {}
-                };
-
-                // 3. Slow path: wait for the actual response
-                reply_rx.await.ok()
-            }
-        }
-    }
-
-    /// A non-blocking attempt to retrieve a message from the queue.
-    ///
-    /// # Importance of the `#[must_use]` attribute
-    /// The attribute requires the calling code to explicitly handle the result.
-    /// Ignoring the return value will result in irretrievable loss of
-    /// the message, which in the broker context could mean losing a critical
-    /// event or request. Use this method only in polling
-    /// loops or when implementing your own non-blocking event handlers.
-    #[must_use = "The result must be handled, otherwise the message will be dropped"]
-    pub async fn try_recv(&mut self) -> Result<Message, TryRecvError> {
-        match &mut self.mode {
-            SubscriberMode::Push(receiver) => {
-                // Try lock to avoid blocking the async task
-                if let Ok(mut rx) = receiver.try_lock() {
-                    return rx.try_recv();
-                }
-
-                // If lock is contended, we have to await it, then try_recv
-                let mut rx = receiver.lock().await;
-                rx.try_recv()
-            },
-            SubscriberMode::Pull(req_sender) => {
-                // Fully synchronous check for LoadBalanced mode
-                let mut reply_rx =  match req_sender.try_request() {
-                    Ok(rx) => rx,
-                    Err(TryRequestError::Disconnected) => return Err(TryRecvError::Disconnected),
-                    Err(TryRequestError::Full) => return Err(TryRecvError::Empty),
-                };
-
-                match reply_rx.try_recv() {
-                    Ok(msg) => Ok(msg),
-                    Err(oneshot::error::TryRecvError::Empty) => Err(TryRecvError::Empty),
-                    Err(oneshot::error::TryRecvError::Closed) => Err(TryRecvError::Disconnected),
-                }
-            },
-        }
-    }  
-
-    /// Returns the logical address this subscription is registered for.
-    ///
-    /// Useful for contextual logging, tracing, and
-    /// debugging routing in multi-component Arcella deployments.
-    pub fn address(&self) -> &str {
-        &self.address
     }
 }

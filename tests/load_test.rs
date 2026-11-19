@@ -118,7 +118,7 @@ async fn test_high_throughput_in_memory_routing() {
 
             let mut count = 0;
             // The loop will terminate when the channel is closed (all senders dropped)
-            while let Some(_msg) = subscriber.recv().await {
+            while let Ok(_msg) = subscriber.recv().await {
                 count += 1;
             }
             tracing::trace!("Test receiver: stop task on {}", addr.clone());

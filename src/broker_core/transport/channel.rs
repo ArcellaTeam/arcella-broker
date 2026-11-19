@@ -310,34 +310,36 @@ pub type MessageSender = Sender<Message>;
 pub type MessageReceiver = Receiver<Message>;
 
 /// Token used by a consumer to receive a reply from a producer.
-pub type RequestToken = oneshot::Sender<Message>;
+pub type ClaimSender = oneshot::Sender<Message>;
+//
+pub type ClaimReceiver = oneshot::Receiver<Message>;
 
 /// Sender for requesting messages from a shared LoadBalanced queue.
 /// (Sends ReplyTokens to the producer).
-pub type RequestSender = Sender<RequestToken>;
+pub type RequestSender = Sender<ClaimSender>;
 /// Receiver for managing incoming pull-requests from consumers.
-pub type RequestReceiver = Receiver<RequestToken>;
+pub type RequestReceiver = Receiver<ClaimSender>;
 
 impl RequestSender {
     /// Asynchronously requests the next message from the shared LoadBalanced queue.
     /// 
     /// This method implements the **"Pull" pattern**: it creates a `oneshot` channel,
-    /// sends the `oneshot::Sender` (as a `RequestToken`) to the producer,
-    /// and returns the `oneshot::Receiver` to the caller.
+    /// sends the `oneshot::Sender` (as a `ClaimSender`) to the producer,
+    /// and returns the `ClaimReceiver` to the caller.
     /// 
     /// This is the primary mechanism for consumers in a LoadBalanced group to
     /// signal readiness and receive messages with natural backpressure, ensuring
     /// that the producer never sends a message to a dead or busy consumer.
     ///
     /// # Returns
-    /// - `Ok(oneshot::Receiver<Message>)` — the request was successfully queued.
+    /// - `Ok(ClaimReceiver)` — the request was successfully queued.
     ///   The caller **MUST** await this receiver to get the response.
-    /// - `Err(SendError<RequestToken>)` — the target component has terminated (channel is closed).
-    ///   The `RequestToken` is returned inside the error, allowing for clean resource drop.
+    /// - `Err(SendError<ClaimSender>)` — the target component has terminated (channel is closed).
+    ///   The `ClaimSender` is returned inside the error, allowing for clean resource drop.
     #[must_use = "The returned receiver must be awaited to receive the message. \
                   Dropping it silently cancels the request and may cause the producer to hang \
                   while trying to send to a dropped receiver."]
-    pub async fn request(&self) -> Result<oneshot::Receiver<Message>, SendError<RequestToken>> {
+    pub async fn request(&self) -> Result<ClaimReceiver, SendError<ClaimSender>> {
         tracing::trace!("RequestSender request");
         let (reply_tx, reply_rx) = oneshot::channel();
         
@@ -357,7 +359,7 @@ impl RequestSender {
     /// when implementing custom scheduling logic).
     ///
     /// # Returns
-    /// - `Ok(oneshot::Receiver<Message>)` — the request was successfully queued.
+    /// - `Ok(ClaimReceiver)` — the request was successfully queued.
     ///   The caller MUST await this receiver to get the response, otherwise the
     ///   response will be lost when the receiver is dropped.
     /// - `Err(TryRequestError::Full)` — the queue is full. The caller should
@@ -384,7 +386,7 @@ impl RequestSender {
     /// }
     /// ```
     #[must_use = "The returned receiver must be awaited to receive the message. Dropping it silently cancels the request."]
-    pub fn try_request(&self) -> Result<oneshot::Receiver<Message>, TryRequestError> {
+    pub fn try_request(&self) -> Result<ClaimReceiver, TryRequestError> {
         // Fast-path: avoid allocating a oneshot channel if the dispatcher is already dead.
         // This is a common scenario in Wasm environments when a component traps.
         if self.is_closed() {
@@ -432,6 +434,13 @@ pub fn create_channel(capacity: usize, cancel_token: CancellationToken) -> (Mess
 
 /// Creates a new linked sender-receiver pair for request routing with the given capacity.
 pub fn create_request_channel(capacity: usize, cancel_token: CancellationToken) -> (RequestSender, RequestReceiver) {
-    let (tx, rx) = mpsc::channel::<RequestToken>(capacity);
+    let (tx, rx) = mpsc::channel::<ClaimSender>(capacity);
     (RequestSender::new(tx), RequestReceiver::new(rx, cancel_token))
+}
+
+
+/// Creates a new linked sender-receiver pair for request routing with the given capacity.
+pub fn create_request_token() -> (ClaimSender, ClaimReceiver) {
+    let (tx, rx) = oneshot::channel();
+    (tx, rx)
 }

@@ -51,15 +51,17 @@ use crate::{
             SubscriptionSlot,
         },
         transport::{
-            create_channel,
             InMemoryTransport, 
             TransportError, 
             TransportResult,
         },
+        subscription::Subscriber
     },
 };
 
-pub use subscriber::{Subscriber, SubscriptionHandle};
+pub use subscriber::{
+    SubscriptionHandle
+};
 use publisher::Publisher;
 use reply_dispatcher::ReplyDispatcher;
 
@@ -354,7 +356,7 @@ mod tests {
 
         // 5. Verification: Receiving the message on the receiver side
         let received_message = subscriber.recv().await;
-        assert!(received_message.is_some(), "Receiver should get a message");
+        assert!(received_message.is_ok(), "Receiver should get a message");
         assert_eq!(
             original_message, 
             received_message.unwrap(), 
@@ -495,7 +497,7 @@ mod tests {
 
         // Now sending should succeed
         assert!(client.send(msg).await.is_ok());
-        assert!(subscriber.recv().await.is_some());
+        assert!(subscriber.recv().await.is_ok());
 
         // Unregistration
         drop(handle);

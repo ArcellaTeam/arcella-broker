@@ -1,4 +1,4 @@
-// arcella-broker/src/l2/ingress_bridge.rs
+// arcella-broker/src/broker_core/ingress_bridge.rs
 //
 // Copyright (c) 2026 Arcella Team
 //

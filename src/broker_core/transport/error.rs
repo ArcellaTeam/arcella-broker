@@ -7,6 +7,8 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use thiserror::Error;
+
 use crate::protocol::{
     ProtocolError,
     payloads::PayloadError,
@@ -23,7 +25,7 @@ use crate::broker_core::{
 /// These errors are critically important for broker management systems, as they
 /// signal the need for rerouting, resource cleanup, or
 /// notifying the client that delivery is impossible.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 pub enum TransportError {
     /// The physical delivery channel is closed.
     ///

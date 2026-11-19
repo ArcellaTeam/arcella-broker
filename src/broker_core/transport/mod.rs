@@ -45,7 +45,10 @@ mod in_memory;
 
 pub use channel::{
     create_channel, 
-    create_request_channel, 
+    create_request_channel,
+    create_request_token, 
+    ClaimSender,
+    ClaimReceiver,
     MessageSender, 
     MessageReceiver, 
     RequestSender,

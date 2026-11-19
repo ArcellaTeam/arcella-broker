@@ -41,4 +41,6 @@ pub enum RegistryError {
     #[error("Routing policy mismatch for address: {0}")]
     PolicyMismatch(String),
 
+    #[error("Reply dispatcher is closed")]
+    ReplyDispatcherClosed,
 }
