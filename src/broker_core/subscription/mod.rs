@@ -40,11 +40,11 @@
 //! address or any other consumer.
 
 mod error;
-//mod guard;
+mod subscription_handle;
 mod subscriber;
 
 pub use error::SubscriptionError;
-//pub use guard::{ExclusiveOccupancy, SubscriptionGuard};
+pub use subscription_handle::SubscriptionHandle;
 pub use subscriber::{
     Subscriber, 
     RecvError,

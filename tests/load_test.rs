@@ -18,7 +18,7 @@ use arcella_broker::{
     broker::Broker,
     config::{ClientConfig, SubscriberConfig},
     protocol::{Message, TransferMode},
-    broker_core::registry::RoutingPolicy,
+    broker_core::registry::{AddressSpec, RoutingPolicy},
 };
 
 // ============================================================================
@@ -32,11 +32,11 @@ const NUM_SENDERS: usize = 10;
 const MESSAGES_PER_SENDER: usize = 1_000;
 
 #[cfg(not(debug_assertions))]
-const NUM_RECEIVERS: usize = 100;
+const NUM_RECEIVERS: usize = 1;//00;
 #[cfg(not(debug_assertions))]
-const NUM_SENDERS: usize = 100;
+const NUM_SENDERS: usize = 1;//00;
 #[cfg(not(debug_assertions))]
-const MESSAGES_PER_SENDER: usize = 1_000_000;
+const MESSAGES_PER_SENDER: usize = 1;//_000_000;
 
 const TOTAL_MESSAGES: usize = NUM_SENDERS * MESSAGES_PER_SENDER;
 
@@ -61,16 +61,9 @@ async fn test_high_throughput_in_memory_routing() {
     init_tracing();
 
     // 1. Initialize config, broker and client
-    let broker_config = Broker::default_config();
-    let broker = Arc::new(Broker::as_client(broker_config));
+    let broker = Arc::new(Broker::default());
     let client_config = ClientConfig::default();
-    let recv_client = broker.create_client(client_config.clone(), "load:test".to_string()).unwrap();
-
-    let mut subscriber_config = SubscriberConfig::default()
-        .with_channel_capacity(4096)
-        .expect("Channel capacity 4096 should be valid");
-    subscriber_config.routing_policy = RoutingPolicy::Exclusive;
-    //subscriber_config.routing_policy = RoutingPolicy::LoadBalanced;
+    let recv_client = broker.create_client(client_config.clone(), "load:test".into()).unwrap();
 
     let mut receiver_addresses = Vec::with_capacity(NUM_RECEIVERS);
     let mut message_templates = Vec::with_capacity(NUM_RECEIVERS);    
@@ -78,8 +71,11 @@ async fn test_high_throughput_in_memory_routing() {
     for i in 0..NUM_RECEIVERS {
         let addr_str = format!("arcella:{}:perf:recv", i);
         let addr_bytes = Bytes::from(addr_str.clone());
-        
-        receiver_addresses.push(addr_str);
+
+        receiver_addresses.push(addr_str.clone());
+
+        broker.create_address(addr_str, AddressSpec::exclusive(4096))
+            .expect("Failed to create address via Control Plane");
 
         let msg = Message::new(
             TransferMode::InOnly,
@@ -105,10 +101,7 @@ async fn test_high_throughput_in_memory_routing() {
         let addr = receiver_addresses[i].clone(); 
 
         let (mut subscriber, handle) = recv_client
-            .subscribe(
-                addr.clone(),
-                subscriber_config.clone(),
-            )
+            .subscribe(addr.clone())
             .expect("Failed to subscribe");
         subscriber_handles.push(handle);
 

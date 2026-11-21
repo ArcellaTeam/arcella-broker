@@ -34,20 +34,25 @@ pub struct SubscriptionSlot {
     pub version: AtomicU64,
 
     /// Token bound to this specific subscription.
-    pub cancel_token: CancellationToken,    
+    pub address_token: CancellationToken,    
 }
 
 impl SubscriptionSlot {
-    pub fn new(capacity: usize, cancel_token: CancellationToken) -> Arc<Self> {
-        let (sender, receiver) = create_channel(capacity, cancel_token.clone());
+    pub fn new(capacity: usize, address_token: CancellationToken) -> Arc<Self> {
+        let (sender, receiver) = create_channel(capacity, address_token.clone());
         Arc::new(Self {
             sender: ArcSwap::from(Arc::new(Some(sender))),
             receiver: Arc::new(Mutex::new(receiver)),
             version: AtomicU64::new(1),
-            cancel_token,
+            address_token,
         })
     }
     
+    /// Returns the address-scoped token (for creating binding tokens).
+    pub fn address_token(&self) -> &CancellationToken {
+        &self.address_token
+    }
+
     /// Marks the slot as deleted and version increment.
     pub fn mark_removed(&self) {
         self.sender.store(Arc::new(None));

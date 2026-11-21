@@ -19,7 +19,6 @@ use crate::broker_core::{
     registry::LocalRegistry,
     transport::{
         create_request_channel,
-        MessageReceiver,
         RequestSender,
     },
 };
@@ -50,7 +49,7 @@ pub struct LoadBalancedGroup {
 
     /// Cancellation token, a child of the main_receiver token.
     /// Allows the group to be cancelled independently, but guarantees cancellation when the main channel is closed.
-    cancel_token: CancellationToken,
+    address_token: CancellationToken,
 }
 
 impl LoadBalancedGroup {
@@ -62,7 +61,7 @@ impl LoadBalancedGroup {
         address: String,
     ) -> Arc<Self> {
 
-        let group_token = slot.cancel_token.child_token();
+        let group_token = slot.address_token().child_token();
         let (req_tx, mut req_rx) = create_request_channel(
             req_channel_capacity,
             group_token.clone()
@@ -75,7 +74,7 @@ impl LoadBalancedGroup {
             req_tx: Arc::new(req_tx),
             address: address.clone(),
             active_consumers: AtomicUsize::new(0),
-            cancel_token: group_token,
+            address_token: group_token,
         });
 
         let slot_for_drop: Arc<SubscriptionSlot> = slot.clone();
@@ -156,22 +155,18 @@ impl LoadBalancedGroup {
     }
 
     pub fn remove_consumer(&self) {
-        let prev_count = self.active_consumers.fetch_sub(1, Ordering::AcqRel);
-        
-        if prev_count == 1 {
-            // This was the last consumer — initiate group termination
-            tracing::debug!(
-                address = %self.address,
-                "LoadBalancedGroup: last consumer removed, shutting down"
-            );
-            self.shutdown();
-        }
+        self.active_consumers.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Returns the current number of active consumers.
     pub fn consumer_count(&self) -> usize {
         self.active_consumers.load(Ordering::Acquire)
     }            
+    
+    /// Returns the address-scoped token (for creating binding tokens).
+    pub fn address_token(&self) -> &CancellationToken {
+        &self.address_token
+    }
 
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
@@ -186,7 +181,7 @@ impl LoadBalancedGroup {
     /// would lead to a deadlock on register_mutex.
     pub fn shutdown(&self) {
         // 1. Cancel the token. This will instantly wake up any pending `recv()` inside the dispatcher.
-        self.cancel_token.cancel();
+        self.address_token.cancel();
 
         // 2. Abort the background task. This will instantly interrupt any .await inside it
         // and lead to dropping main_receiver, closing the main channel.

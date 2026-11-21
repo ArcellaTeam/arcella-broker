@@ -36,7 +36,13 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::broker_core::registry::LocalRegistry;
+use crate::broker_core::registry::{
+    AddressSpec, 
+    LocalRegistry, 
+    RoutingPolicy, 
+    RouteTarget, 
+    SubscriptionSlot
+};
 use crate::config::BrokerConfig;
 use crate::error::BrokerError;
 
@@ -139,6 +145,77 @@ pub struct Broker {
 // ============================================================================
 
 impl Broker {
+    /// Creates an address in the registry with the given specification.
+    ///
+    /// # Errors
+    ///
+    /// - `AddressAlreadyOccupied` - the address already exists
+    /// - `WildcardConflict`- conflict with a wildcard pattern
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// broker.create_address(
+    ///     "arcella:workers:tasks".into(),
+    ///     AddressSpec::load_balanced(1024, 100)
+    /// )?;
+    /// ```  
+    pub fn create_address(
+        &self,
+        name: String,
+        spec: AddressSpec,
+    ) -> Result<Arc<SubscriptionSlot>, BrokerError> {
+        let address_token = CancellationToken::new();
+
+        let slot = SubscriptionSlot::new(spec.queue_capacity, address_token.clone());
+
+        let target = match spec.routing_policy {
+            RoutingPolicy::Exclusive => {
+                RouteTarget::new_exclusive(slot.clone())
+            }
+            RoutingPolicy::LoadBalanced{claim_capacity} => {
+                RouteTarget::new_load_balanced(
+                    slot.clone(),
+                    claim_capacity,
+                    Arc::downgrade(&self.registry),
+                    name.clone(),
+                )
+            }
+        };
+
+        self.registry.register(name, target)?;
+
+        Ok(slot)
+    }
+
+    // Removes an address from the registry.
+    ///
+    /// Cancels the address_token, which results in:
+    /// - Detaching all bound consumers
+    /// - Stopping the dispatcher for LoadBalanced groups
+    /// - Invalidating the `InMemoryEndpoint` cache
+    ///
+    /// Buffered messages are lost (for graceful shutdown,
+    /// first detach the consumers and wait for drain).
+    ///
+    /// # Errors
+    /// - `AddressNotFound` - the address does not exist
+    pub fn delete_address(&self, name: &str) -> Result<(), BrokerError> {
+        // Get the target, cancel the address_token, then unregister
+        let target: Arc<RouteTarget> = self.registry.lookup(name)
+            .ok_or_else(|| BrokerError::RegistryError(crate::broker_core::registry::RegistryError::AddressNotFound(name.to_string())))?;
+        
+        if let Some(token) = target.address_token() {
+            token.cancel();
+        }
+        
+        self.registry.remove_by_name(name)?;
+        Ok(())
+    }
+
+    pub fn has_address(&self, name: &str) -> bool {
+        self.registry.has_local(name)
+    }
+
     /// Creates a new broker instance in **client mode** with the given configuration.
     ///
     /// # Initialization

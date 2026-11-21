@@ -36,14 +36,15 @@ use tokio_util::sync::CancellationToken;
 
 mod publisher;
 mod reply_dispatcher;
-mod subscriber;
 
 use crate::{
     broker::Broker,
+    error::BrokerError,
     config::{ClientConfig, SubscriberConfig},
     protocol::Message,
     broker_core::{
         registry::{
+            AddressSpec,
             RegistryError, 
             RegisterResult,
             RoutingPolicy,
@@ -55,13 +56,10 @@ use crate::{
             TransportError, 
             TransportResult,
         },
-        subscription::Subscriber
+        subscription::{Subscriber, SubscriptionHandle}
     },
 };
 
-pub use subscriber::{
-    SubscriptionHandle
-};
 use publisher::Publisher;
 use reply_dispatcher::ReplyDispatcher;
 
@@ -94,7 +92,7 @@ pub struct BrokerClient {
     /// Guarantees the absence of memory leaks upon abnormal termination of the component.
     reply_dispatcher: Arc<ReplyDispatcher>,
 
-    cancel_token: CancellationToken,
+    binding_token: CancellationToken,
 }
 
 impl BrokerClient {
@@ -110,35 +108,26 @@ impl BrokerClient {
     /// # Errors
     /// Returns `RegistryError` if the `client_address` is already occupied
     /// by another active component (guaranteeing binding exclusivity).
-    pub(crate) fn new(broker: Arc<Broker>, config: ClientConfig, client_address: String) -> Result<Self, RegistryError> {
-        let cancel_token = CancellationToken::new();
+    pub(crate) fn new(broker: Arc<Broker>, config: ClientConfig, client_address: String) -> Result<Self, BrokerError> {
+        // 1. Create reply address from control plane
+        let reply_spec = AddressSpec::reply_channel(config.reply_channel_capacity);
+        let reply_slot = broker.create_address(client_address.clone(), reply_spec)?;  
+
+        // 2. Extracting the reply_address_token from the slot
+        let reply_address_token = reply_slot.address_token().clone();
+        let binding_token = reply_address_token.child_token();     
         
-        // 1. Create the slot, which internally creates the channel (Sender + Receiver)
-        let reply_slot = SubscriptionSlot::new(
-            config.reply_channel_capacity, 
-            cancel_token.clone()
-        );
-
-        // 2. Create the RouteTarget and register it in the registry
-        let target = RouteTarget::new_exclusive(reply_slot.clone());
-        broker.registry.register(client_address.clone(), target)?;
-
         // 3. Extracting the receiver from the slot for the ReplyDispatcher
         let reply_receiver = reply_slot.receiver();        
 
         // 4. Create the subscriber and dispatcher to handle responses
-        let reply_subscriber = Subscriber::new_push(
-            reply_receiver, client_address.clone(), 
-            cancel_token.clone()
+        let (reply_subscriber, reply_cancel_token) = Subscriber::new_push(
+            reply_receiver,
+            client_address.clone(), 
+            reply_address_token
         );
         let reply_dispatcher = Arc::new(ReplyDispatcher::new(reply_subscriber));
-
-        let reply_handle = SubscriptionHandle::new_exclusive(
-            client_address.clone(),
-            reply_slot,
-            broker.registry.clone(),
-            cancel_token.clone(),
-        );
+        let reply_handle = SubscriptionHandle::new(client_address.clone(), reply_cancel_token);
 
         let transport = InMemoryTransport::new(broker.registry.clone());
         let local = Arc::new(transport);
@@ -149,7 +138,7 @@ impl BrokerClient {
             client_address,
             _reply_handle: reply_handle,
             reply_dispatcher,
-            cancel_token,
+            binding_token,
         })
     }
 
@@ -173,72 +162,38 @@ impl BrokerClient {
     pub fn subscribe(
         &self,
         address: String,
-        config: SubscriberConfig,
-    ) -> Result<(Subscriber, SubscriptionHandle), RegistryError> {
-        let sub_cancel_token = self.cancel_token.child_token();
+    ) -> Result<(Subscriber, SubscriptionHandle), BrokerError> {
+        let target = self.broker.registry.lookup(&address)
+            .ok_or_else(|| BrokerError::RegistryError(RegistryError::AddressNotFound(address.clone())))?;
 
-        match config.routing_policy {
-            RoutingPolicy::Exclusive => { 
-                let slot = SubscriptionSlot::new(config.channel_capacity, sub_cancel_token.clone());
-                
-                let target = RouteTarget::new_exclusive(slot.clone());
-                self.broker.registry.register(address.clone(), target)?;
+        // 2. Get address_token from the target and create binding child token
+        let address_token = target.address_token()
+            .ok_or_else(|| BrokerError::RegistryError(RegistryError::AddressNotFound(address.clone())))?
+            .clone();
+        let binding_token = address_token.child_token();
 
+        match target.as_ref() {
+            RouteTarget::Single(slot) => {
                 let receiver = slot.receiver();
-                let subscriber = Subscriber::new_push(receiver, address.clone(), sub_cancel_token.clone());
-
-                let handle = SubscriptionHandle::new_exclusive(
-                    address,
-                    slot,
-                    self.broker.registry.clone(),
-                    sub_cancel_token,
-                );
-
-                Ok((subscriber, handle))
-            }
-            RoutingPolicy::LoadBalanced => {
-                let registry = self.broker.registry.clone();
-                let address_for_factory = address.clone();
-                let req_capacity = 1000; // TODO: need to remove magic
-
-                // ATOMIC operation: check and register under a single mutex.
-                // The factory is called ONLY if the address is free, eliminating races and task leaks.
-                let result = registry.get_existing_or_register(
+                let (subscriber, _) = Subscriber::new_push(
+                    receiver,
                     address.clone(),
-                    || {
-                        let slot = SubscriptionSlot::new(config.channel_capacity, sub_cancel_token.clone());
-                        Ok(RouteTarget::new_load_balanced(
-                            slot,
-                            req_capacity,
-                            Arc::downgrade(&registry),
-                            address_for_factory.clone(),
-                        ))
-                    },
-                )?;
-
-                // Extract the RouteTarget (whether new or already existing)
-                let target = match result {
-                    RegisterResult::Registered(t) => t,
-                    RegisterResult::AlreadyExists(t) => t,
-                };
-
-                let group = target.load_balanced_group()
-                    .ok_or_else(|| RegistryError::PolicyMismatch(address.clone()))?
-                    .clone();
-                let req_sender = group.subscribe();
-
-                // Create a unified Subscriber type (in Pull mode).
-                // For the calling code, the API is no different from Exclusive!
-                let subscriber = Subscriber::new_pull(req_sender, address.clone(), sub_cancel_token.clone());
-                
-                // Create a passive handle. It will not call unregister on drop,
-                // since the group's lifecycle is managed by the background task via the RequestSender refcount.
-                let handle = SubscriptionHandle::new_load_balanced(address, group, sub_cancel_token);
-
-                Ok((subscriber, handle))
+                    address_token,
+                );
+                let handle = SubscriptionHandle::new(address, binding_token);
+                Ok((subscriber, handle))    
             }
+            RouteTarget::LoadBalanced(group) => {
+                let req_sender = group.subscribe(); // Увеличивает счетчик потребителей
+                let (subscriber, _) = Subscriber::new_pull(
+                    req_sender,
+                    address.clone(),
+                    address_token,
+                );
+                let handle = SubscriptionHandle::new(address, binding_token);
+                Ok((subscriber, handle))
+            }    
         }
-
     }
     
     /// Creates a high-performance `Publisher` for the specified address.
@@ -318,97 +273,154 @@ impl BrokerClient {
 
 impl Drop for BrokerClient {
     fn drop(&mut self) {
-        self.cancel_token.cancel();
+        self.binding_token.cancel();
+        
+        if let Err(e) = self.broker.delete_address(&self.client_address) {
+            tracing::warn!(
+                address = %self.client_address,
+                error = %e,
+                "Failed to delete reply address on client drop"
+            );
+        }
     }    
 }
 
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use tokio::test;
 
     use super::*;
     use crate::test_utils;
 
-    #[tokio::test]
-    async fn test_in_memory_message_delivery_in_only() {
-        // 1. Initialize client
-        let client = test_utils::test_client("test".to_string()).unwrap();
+    #[test]
+    async fn test_dynamic_registration() {
+        // 1. Initialize the broker and the client
+        let broker = Arc::new(Broker::default());
+        let client = broker.create_client(ClientConfig::default(), "test".into()).unwrap();
+        let address = "arcella:test";
 
-        // 2. Prepare the receiver (Actor pattern)
-        let target_address = "arcella:core:test:receiver".to_string();
-        let subscriber_config = SubscriberConfig::default();
-        let (mut subscriber, _handle) = client
-            .subscribe(
-                target_address.clone(),
-                subscriber_config
-            ).expect("Subscription should succeed");
-
-        // 3. Create a test message
-        let original_message = test_utils::dummy_in_only_message(
-            Bytes::from("test:ping"),
-            Bytes::from(target_address.clone()),
-            Bytes::from("hello from sender")
+        let msg = test_utils::dummy_in_only_message(
+            Bytes::from_static(b"test"),
+            Bytes::from_static(address.as_bytes()),
+            Bytes::from_static(b""),
         );
+        
+        // Sending before the address is created -> error
+        assert!(client.send(msg.clone()).await.is_err());
 
-        // 4. Action: Send the message
+        // 2. CONTROL PLANE: Explicitly create the address
+        broker.create_address(
+            address.to_string(),
+            AddressSpec::exclusive(1024)
+        ).unwrap();
+
+        // 3. DATA PLANE: Attaching
+        let (mut subscriber, handle) = client
+            .subscribe(address.to_string())
+            .expect("Subscription should succeed");
+
+        // Now sending works
+        assert!(client.send(msg).await.is_ok());
+        assert!(subscriber.recv().await.is_ok());
+
+        // 4. Detaching. The address remains in the registry!
+        drop(handle);
+
+        // 5. CONTROL PLANE: Explicitly remove the address
+        broker.delete_address(address).unwrap();
+
+        // Now sending should return an error again
+        let msg2 = test_utils::dummy_in_only_message(
+            Bytes::from_static(b"test2"),
+            Bytes::from_static(address.as_bytes()),
+            Bytes::from_static(b""),
+        );
+        assert!(client.send(msg2).await.is_err());
+    }
+
+    #[test]
+    async fn test_subscription_cleanup_and_re_registration() {
+        // 1. Initialize the broker and the client
+        let broker = Arc::new(Broker::default());
+        let client = broker.create_client(ClientConfig::default(), "test".into()).unwrap();
+        let addr = "arcella:test:duplicate";
+
+        // 1. CONTROL PLANE: Explicitly create the address
+        broker.create_address(
+            addr.to_string(),
+            AddressSpec::exclusive(1024)
+        ).unwrap();
+
+        // 2. DATA PLANE: First attaching
+        let (_sub1, hdl1) = client
+            .subscribe(addr.to_string())
+            .expect("First subscription should succeed");
+        
+        // 3. DATA PLANE: Detaching first address
+        drop(hdl1);
+
+        // 4. DATA PLANE: Second attaching
+        let (mut subscriber, _hdl) = client
+            .subscribe(addr.to_string())
+            .expect("Subscription after drop should succeed");
+
+        // 5.  Now sending works
+        let original_message = test_utils::dummy_in_only_message(
+            Bytes::from("test"), 
+            Bytes::from(addr), 
+            Bytes::from("hello")
+        );
+        
         let send_result = client.send(original_message.clone()).await;
-        assert!(send_result.is_ok(), "Send operation should succeed");
+        assert!(send_result.is_ok());
 
-        // 5. Verification: Receiving the message on the receiver side
         let received_message = subscriber.recv().await;
-        assert!(received_message.is_ok(), "Receiver should get a message");
+        assert!(received_message.is_ok(), "sub3 received the message");
+
         assert_eq!(
             original_message, 
             received_message.unwrap(), 
             "Received message should exactly match the sent message"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_in_memory_message_delivery_to_unknown_address() {
-        // 1. Initialize client
-        let client = test_utils::test_client("test".to_string()).unwrap();
-
-        let msg = test_utils::dummy_in_only_message(
-            Bytes::from("test:ping"),
-            Bytes::from("arcella:unknown:address"),
-            Bytes::from("")
-        );
-
-        // Attempt to send to an unregistered address
-        let result = client.send(msg).await;
-
-        // Expect a `RecipientNotFound` error
-        assert!(matches!(result, Err(TransportError::RecipientNotFound(_))));
-    }
+        );        
+        
+        // 6. CONTROL PLANE: Explicitly remove the address
+        broker.delete_address(addr).unwrap();
+    }    
 
     #[tokio::test]
     async fn test_multi_recipient_routing() {
-        // 1. Initialize client
-        let client = test_utils::test_client("test".to_string()).unwrap();
+        // 1. Initialize the broker and the client
+        let broker = Arc::new(Broker::default());
+        let client = broker.create_client(ClientConfig::default(), "test".into()).unwrap();
 
-        // 2. Register multiple receivers with different addresses
+        // 2. Addresses for testing
         let addresses = vec![
             "arcella:core:users",
             "arcella:web:api",
             "arcella:batch:processor",
         ];
 
-        let subscriber_config = SubscriberConfig::default();
+        // 3. CONTROL PLANE: Create address over Broker
+        for addr in &addresses {
+            broker
+                .create_address(addr.to_string(), AddressSpec::exclusive(1024))
+                .expect(&format!("Failed to create address {}", addr));
+        }
 
+        // 4. DATA PLANE: Subscribe at addresses
         let mut subscribers = Vec::new();
         let mut handles = Vec::new();
+        
         for addr in &addresses {
-            let (subscriber, handle)  = client
-                .subscribe(
-                    addr.to_string(),
-                    subscriber_config.clone()
-                ).expect("Subscription should succeed");
+            let (subscriber, handle) = client
+                .subscribe(addr.to_string())
+                .expect(&format!("Subscription to {} should succeed", addr));
             subscribers.push(subscriber);
             handles.push(handle);
         }
 
-        // 3. Send mixed messages to different addresses
+        // 5. Send messages to all addresses
         let test_messages = vec![
             ("arcella:core:users", "user:created", Bytes::from("user1")),
             ("arcella:web:api", "http:request", Bytes::from("GET /api")),
@@ -420,15 +432,17 @@ mod tests {
         ];
 
         for (addr, msg_type, payload) in &test_messages {
-            let msg = test_utils::dummy_in_only_message(Bytes::from(*msg_type),
+            let msg = test_utils::dummy_in_only_message(
+                Bytes::from(*msg_type),
                 Bytes::from(*addr),
-                payload.clone());
+                payload.clone(),
+            );
 
             let result = client.send(msg).await;
             assert!(result.is_ok(), "Send to {} should succeed", addr);
         }
 
-        // 4. Verification: each receiver got only its messages in the correct order
+        // 6. Check: each receiver get only own messages at right order
         // Receiver 0: arcella:core:users
         let msg1 = subscribers[0].recv().await.unwrap();
         assert_eq!(msg1.msg_type, "user:created");
@@ -460,108 +474,17 @@ mod tests {
         assert_eq!(msg7.msg_type, "batch:complete");
         assert_eq!(msg7.payload, Bytes::from("job1:done"));
 
-        // 5. Verification: channels are empty (no more messages)
-        assert!(subscribers[0].try_recv().await.is_err(), "users channel should be empty");
-        assert!(subscribers[1].try_recv().await.is_err(), "api channel should be empty");
-        assert!(subscribers[2].try_recv().await.is_err(), "processor channel should be empty");
+        // 8. Check: channels is empty
+        assert!(subscribers[0].try_recv().is_err(), "users channel should be empty");
+        assert!(subscribers[1].try_recv().is_err(), "api channel should be empty");
+        assert!(subscribers[2].try_recv().is_err(), "processor channel should be empty");
 
+        // 9. Detaching. The address remains in the registry!
         drop(handles);
-    }
 
-    #[tokio::test]
-    async fn test_dynamic_registration() {
-        // 1. Initialize client
-        let client = test_utils::test_client("test".to_string()).unwrap();
-
-        let address = Bytes::from_static(b"arcella:test");
-        let payload = Bytes::from_static(b"");
-
-        // Sending before registration should return an error
-        let msg = test_utils::dummy_in_only_message(
-            Bytes::from_static(b"test"),
-            address.clone(),
-            payload.clone()
-        );
-        
-        assert!(client.send(msg.clone()).await.is_err());
-
-        let subscriber_config = SubscriberConfig::default();
-
-        // Registration
-        let (mut subscriber, handle) = client
-            .subscribe(
-                "arcella:test".to_string(),
-                subscriber_config,
-            )
-            .expect("Subscription should succeed");
-
-        // Now sending should succeed
-        assert!(client.send(msg).await.is_ok());
-        assert!(subscriber.recv().await.is_ok());
-
-        // Unregistration
-        drop(handle);
-
-        // Should return an error again
-        let msg2 = test_utils::dummy_in_only_message(Bytes::from_static(b"test2"),
-            address.clone(),
-            payload.clone());
-        assert!(client.send(msg2).await.is_err());
+        // 10. CONTROL PLANE: delete address from broker
+        for addr in &addresses {
+            broker.delete_address(addr).expect(&format!("Failed to delete address {}", addr));
+        }
     }    
-
-    #[tokio::test]
-async fn test_subscription_cleanup_and_re_registration() {
-        // 1. Initialize client
-        let client = test_utils::test_client("test".to_string()).unwrap();
-																		  
-        let addr = "arcella:test:duplicate";
-
-        let subscriber_config = SubscriberConfig::default();
-
-        // 1. First subscription
-        let (_sub1, hdl1) = client
-            .subscribe(
-                addr.to_string(),
-                subscriber_config.clone(),
-            )
-            .expect("First subscription should succeed");
-        
-        // 2. Second subscription to the same address 
-        let sub2_result = client
-            .subscribe(
-                addr.to_string(),
-                subscriber_config.clone(),
-            );
-        assert!(
-            matches!(sub2_result, Err(RegistryError::AddressAlreadyOccupied(_))),
-            "Second subscription to the same address must be rejected with AddressAlreadyOccupied"
-        );
-
-        // 3. sub1 goes out of scope
-        drop(hdl1);
-        // Drop triggers: self.registry.unregister(&self.address);
-        // Registry is now empty! tx2 (owned by sub2) is removed from the registry.
-
-													 
-        let (mut sub3, _hdl3) = client
-            .subscribe(
-                addr.to_string(),
-                subscriber_config.clone(),
-            )
-            .expect("Subscription after drop should succeed");
-
-        // 4. Attempt to send a message
-        let msg = test_utils::dummy_in_only_message(
-            Bytes::from("test"), 
-            Bytes::from(addr), 
-            Bytes::from("hello")
-        );
-        
-        // Send should succeed, as sub3 is alive and ready to receive.
-        let result = client.send(msg).await;
-        
-        assert!(!result.is_err());
-        assert!(!sub3.try_recv().await.is_err(), "sub3 received the message");
-    }
-
 }
