@@ -178,7 +178,7 @@ impl BrokerClient {
                 let (subscriber, _) = Subscriber::new_push(
                     receiver,
                     address.clone(),
-                    address_token,
+                    binding_token.clone(),
                 );
                 let handle = SubscriptionHandle::new(address, binding_token);
                 Ok((subscriber, handle))    
@@ -188,7 +188,7 @@ impl BrokerClient {
                 let (subscriber, _) = Subscriber::new_pull(
                     req_sender,
                     address.clone(),
-                    address_token,
+                    binding_token.clone(),
                 );
                 let handle = SubscriptionHandle::new(address, binding_token);
                 Ok((subscriber, handle))

@@ -29,20 +29,24 @@ const NUM_RECEIVERS: usize = 10;
 #[cfg(debug_assertions)]
 const NUM_SENDERS: usize = 10;
 #[cfg(debug_assertions)]
-const MESSAGES_PER_SENDER: usize = 1_000;
+const MESSAGES_PER_SENDER: usize = 10;
 
 #[cfg(not(debug_assertions))]
-const NUM_RECEIVERS: usize = 1;//00;
+const NUM_RECEIVERS: usize = 100;
 #[cfg(not(debug_assertions))]
-const NUM_SENDERS: usize = 1;//00;
+const NUM_SENDERS: usize = 100;
 #[cfg(not(debug_assertions))]
-const MESSAGES_PER_SENDER: usize = 1;//_000_000;
+const MESSAGES_PER_SENDER: usize = 1_000_000;
 
 const TOTAL_MESSAGES: usize = NUM_SENDERS * MESSAGES_PER_SENDER;
 
 pub fn init_tracing() {
     // Attempt to read the logging level from RUST_LOG,
     // if not set, default to "info"
+    #[cfg(debug_assertions)]
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("trace"));
+    #[cfg(not(debug_assertions))]
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("error"));
 
@@ -69,7 +73,7 @@ async fn test_high_throughput_in_memory_routing() {
     let mut message_templates = Vec::with_capacity(NUM_RECEIVERS);    
         
     for i in 0..NUM_RECEIVERS {
-        let addr_str = format!("arcella:{}:perf:recv", i);
+        let addr_str = format!("arcella:{}:receiver", i);
         let addr_bytes = Bytes::from(addr_str.clone());
 
         receiver_addresses.push(addr_str.clone());
@@ -125,14 +129,14 @@ async fn test_high_throughput_in_memory_routing() {
     
     for sender_id in 0..NUM_SENDERS {
         let target_idx = (sender_id + 50) % NUM_RECEIVERS;
-        let addr_str = format!("arcella:{}:perf:recv", target_idx);
+        let addr_str = format!("arcella:{}:receiver", target_idx);
 
         let broker = Arc::clone(&broker);
         let client_config = client_config.clone();
         let base_msg = message_templates[target_idx].clone();        
 
         sender_task_handles.spawn(async move {
-            let sender_addr = format!("arcella:load:test:{}", sender_id);
+            let sender_addr = format!("arcella:{}:sender", sender_id);
             tracing::trace!("Test sender: start task on {}", sender_addr);
             let client = broker.create_client(client_config.clone(), sender_addr.clone()).unwrap();
 
