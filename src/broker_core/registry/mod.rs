@@ -37,11 +37,13 @@ use std::sync::{
     Mutex,
 };
 
+mod address_spec;
 mod error;
 mod load_balanced_group;
 mod routing;
 mod slot;
 
+pub use address_spec::AddressSpec;
 pub use error::RegistryError;
 pub use slot::SubscriptionSlot;
 pub use routing::{RoutingPolicy, RouteTarget};
@@ -74,6 +76,55 @@ enum LookupResult {
     NotFound,
 }
 
+/// Represents the type of address found in the registry.
+/// 
+/// This enum is returned by `lookup()` to indicate not just whether an address
+/// was found, but also what kind of routing rule matched.
+#[derive(Clone)]
+pub enum ResolvedAddress {
+    /// Exact match: the address was registered as a concrete endpoint
+    /// (e.g., "arcella:core:users")
+    Exact(Arc<RouteTarget>),
+    
+    /// Prefix wildcard match: the address matched a pattern ending with "**"
+    /// (e.g., "arcella:core:**" matched "arcella:core:users:profile")
+    PrefixWildcard(Arc<RouteTarget>),
+    
+    /// Single-segment wildcard match: the address matched a pattern with "*"
+    /// (e.g., "arcella:*:users" matched "arcella:core:users")
+    SingleWildcard(Arc<RouteTarget>),
+
+    None,
+}
+
+impl ResolvedAddress {
+    /// Returns the underlying RouteTarget regardless of address type.
+    pub fn target(&self) -> Option<Arc<RouteTarget>>{
+        match self {
+            ResolvedAddress::Exact(t) => Some(t.clone()),
+            ResolvedAddress::PrefixWildcard(t) => Some(t.clone()),
+            ResolvedAddress::SingleWildcard(t) => Some(t.clone()),
+            ResolvedAddress::None => None,
+        }
+    }
+
+    pub(crate) fn remove_self(&self) {
+        if let Some(target) = self.target() {
+            target.remove_self();
+        }
+    }
+    
+    /// Returns true if this is an exact match (no wildcards).
+    pub fn is_exact(&self) -> bool {
+        matches!(self, ResolvedAddress::Exact(_))
+    }
+    
+    /// Returns true if this matched via a wildcard pattern.
+    pub fn is_wildcard(&self) -> bool {
+        !self.is_exact()
+    }
+}
+
 /// Registry of local recipients (within a single process).
 ///
 /// Supports two subscription types:
@@ -97,7 +148,8 @@ pub enum RegisterResult {
 
 impl LocalRegistry {
     /// Creates a new, empty `LocalRegistry`.
-    pub(crate) fn new() -> Self {
+    //pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
 
         Self {
             inner: ArcSwap::from(Arc::new(RegistryInner {
@@ -108,167 +160,6 @@ impl LocalRegistry {
             register_mutex: Mutex::new(()),
         }
     }
-
-    /// Returns `true` if the address contains wildcard characters (`*`).
-    /// This is a fast, pre-validation check to route to the correct registration logic.
-    #[inline]
-    fn is_wildcard(address: &str) -> bool {
-        address.contains('*')
-    }
-
-    /// Validates wildcard pattern syntax according to Arcella routing rules.
-    ///
-    /// # Rules enforced:
-    /// 1. Pattern cannot be empty.
-    /// 2. No empty segments allowed (e.g., `a::b` or trailing `:`).
-    /// 3. `**` can only appear as the very last segment.
-    /// 4. Partial wildcards (e.g., `a*`, `*b`, `a*b`) are forbidden; `*` must be the entire segment.
-    fn validate_wildcard_pattern(pattern: &str) -> Result<(), RegistryError> {
-        if pattern.is_empty() {
-            return Err(RegistryError::InvalidWildcardFormat(
-                "Pattern cannot be empty".to_string(),
-            ));
-        }
-
-        // Prohibit global catch-all "**"
-        if pattern == "**" {
-            return Err(RegistryError::InvalidWildcardFormat(
-                "Global '**' wildcard is not allowed; pattern must have at least one static prefix segment".to_string()
-            ));
-        }        
-
-        // Prohibit global "*" and patterns starting with "*"
-        // This guarantees the presence of a static prefix for O(L) search in the Radix Tree
-        if pattern.starts_with('*') {
-            return Err(RegistryError::InvalidWildcardFormat(
-                "Pattern cannot start with '*' or be a global '*' wildcard; must have a static prefix".to_string()
-            ));
-        }     
-
-        let mut found_starstar = false;
-
-        for segment in pattern.split(':') {
-            // Check for empty segments (e.g., "arcella::*" or "*::users")
-            if segment.is_empty() {
-                return Err(RegistryError::InvalidWildcardFormat(
-                    format!("Empty segment in pattern '{}'", pattern),
-                ));
-            }
-
-            // If we already found "**", any subsequent segment is invalid
-            if found_starstar {
-                return Err(RegistryError::InvalidWildcardFormat(
-                    format!("'**' must be the last segment in pattern '{}'", pattern),
-                ));
-            }
-
-            if segment == "**" {
-                // Mark if we found "**"
-                found_starstar = true;
-            } else if segment == "*" {
-                // Valid single-segment wildcard, continue checking
-            } else if segment.contains('*') {
-                // Found incorrect format, e.g., "a*", "*b", "a*b".
-                return Err(RegistryError::InvalidWildcardFormat(
-                    format!("Invalid wildcard segment '{}' in pattern '{}'", segment, pattern),
-                ));
-            }
-        }
-
-        Ok(())
-    }
-        
-    /// Core segment-by-segment comparison algorithm.
-    ///
-    /// # Arguments
-    /// * `pattern` - The pattern to match against (may contain `*` or `**`).
-    /// * `target` - The concrete address or another pattern to compare with.
-    /// * `allow_wildcard_both_sides` - If `true`, treats `**` in *either* string as a 
-    ///   universal matcher for the remainder of the comparison. Used for detecting 
-    ///   conflicts between two wildcard patterns. If `false`, only `pattern` is 
-    ///   treated as a wildcard, used for matching a concrete `target` address.
-    fn compare_segments_bytes(pattern: &[u8], target: &[u8], allow_wildcard_both_sides: bool) -> bool {
-        let mut pat_iter = pattern.split(|&b| b == b':');
-        let mut tar_iter = target.split(|&b| b == b':');
-
-        loop {
-            let seg1 = pat_iter.next();
-            let seg2 = tar_iter.next();
-
-            match (seg1, seg2) {
-                (None, None) => return true,
-                // Handle ** when checking pattern-to-pattern conflicts
-                (Some(b"**"), _) if allow_wildcard_both_sides => return true,
-                (_, Some(b"**")) if allow_wildcard_both_sides => return true,
-                // Handle ** when matching pattern to concrete address.
-                // Since ** must be at the end (enforced by validation), if we see it 
-                // in the pattern, it automatically matches the rest of the target.
-                (Some(b"**"), _) => return pat_iter.next().is_none(),
-                // Length mismatch: one string has more segments than the other
-                (Some(_), None) | (None, Some(_)) => return false,
-                // Compare individual segments
-                (Some(a), Some(b)) => {
-                    if a != b"*" && b != b"*" && a != b {
-                        return false;
-                    }
-                }
-            }
-        }
-    }         
-
-    fn static_prefix_bytes(pattern: &[u8]) -> &[u8] {
-        if let Some(idx) = pattern.iter().position(|&b| b == b'*') {
-            &pattern[..idx]
-        } else {
-            pattern
-        }
-    }
-
-    fn check_prefix_wildcard_conflicts(
-        prefix_wildcard_tree: &Radix<u8, Arc<RouteTarget>>,
-        pat_bytes: &[u8],
-    ) -> Option<String> {
-        if prefix_wildcard_tree.is_empty() {
-            return None;
-        }
-
-        let mut candidate = Vec::with_capacity(pat_bytes.len() + 3);
-        for segment in pat_bytes.split(|&b| b == b':') {
-            if segment == b"**" {
-                break; // Reached the end of the pattern
-            }
-            if !candidate.is_empty() {
-                candidate.push(b':');
-            }
-            candidate.extend_from_slice(segment);
-
-            // Form the pattern prefix: "a:**", "a:b:**", etc.
-            let mut check_bytes = candidate.clone();
-            check_bytes.extend_from_slice(b":**"); 
-
-            // Targeted O(L) check
-            if prefix_wildcard_tree.get(&check_bytes).is_some() {
-                return Some(String::from_utf8_lossy(&check_bytes).into_owned());
-            }
-        }
-
-        let static_pref = Self::static_prefix_bytes(pat_bytes);
-        let iter = prefix_wildcard_tree.walk_prefix(static_pref);   
-
-        for (k, _) in iter {
-            // Skip the pattern itself (already checked as an exact duplicate)
-            if k == pat_bytes {
-                continue;
-            }
-            
-            // Semantic conflict check
-            if Self::compare_segments_bytes(pat_bytes, &k, true) {
-                return Some(String::from_utf8_lossy(&k).into_owned());
-            }
-        }       
-        
-        None
-    }        
 
     /// Searches for an existing route for an exact address.
     /// Checks for duplicates and conflicts with wildcard patterns.
@@ -282,12 +173,14 @@ impl LocalRegistry {
         
         // 2. Check conflicts with prefix wildcards (O(L) via walk_path)
         if let Some((k, _)) = inner.prefix_wildcard_tree.walk_path(addr_bytes).next() {
-            return LookupResult::Conflict(String::from_utf8_lossy(&k).into_owned());
+            let mut wildcard = k.clone();
+            wildcard.extend_from_slice(b"**");
+            return LookupResult::Conflict(String::from_utf8_lossy(&wildcard).into_owned());
         }
         
         // 3. Check conflicts with single wildcards (O(N))
         for (pattern, _) in &inner.single_wildcards {
-            if Self::compare_segments_bytes(pattern, addr_bytes, false) {
+            if compare_segments_bytes(pattern, addr_bytes, false) {
                 return LookupResult::Conflict(String::from_utf8_lossy(pattern).into_owned());
             }
         }
@@ -303,7 +196,7 @@ impl LocalRegistry {
         
         // 1. Exact duplication (Fast path O(L))
         if is_prefix_wildcard {
-            if let Some(target) = inner.prefix_wildcard_tree.get(pat_bytes) {
+            if let Some(target) = inner.prefix_wildcard_tree.get(prefix_wildcard_key(pat_bytes)) {
                 return LookupResult::Duplicate(target.clone());
             }
         } else {
@@ -314,23 +207,23 @@ impl LocalRegistry {
         
         // 2. Semantic conflict with existing PREFIX wildcards.
         // This check is universal and works both for new "**" and for new "*" patterns.
-        if let Some(existing) = Self::check_prefix_wildcard_conflicts(&inner.prefix_wildcard_tree, pat_bytes) {
+        if let Some(existing) = check_prefix_wildcard_conflicts(&inner.prefix_wildcard_tree, pat_bytes) {
             return LookupResult::Conflict(existing);
         }
         
         // 3. Semantic conflict with existing SINGLE wildcards (*).
         // Iterate over the entire list, since they do not form a prefix hierarchy.
         for (existing_pat, _) in &inner.single_wildcards {
-            if Self::compare_segments_bytes(existing_pat, pat_bytes, true) {
+            if compare_segments_bytes(existing_pat, pat_bytes, true) {
                 return LookupResult::Conflict(String::from_utf8_lossy(existing_pat).into_owned());
             }
         }
 
         // 4. Check conflicts with exact addresses (Optimized: only scan relevant prefix)
-        let static_pref = Self::static_prefix_bytes(pat_bytes);
+        let static_pref = wildcard_static_prefix(pat_bytes);
         let exact_iter = inner.exact_tree.walk_prefix(static_pref);
         for (k, _) in exact_iter {
-            if Self::compare_segments_bytes(pat_bytes, &k, false) {
+            if compare_segments_bytes(pat_bytes, &k, false) {
                 return LookupResult::Conflict(String::from_utf8_lossy(&k).into_owned());
             }
         }
@@ -356,10 +249,10 @@ impl LocalRegistry {
         
         tracing::debug!("LocalRegistry register: {}", address);
 
-        let is_wildcard = Self::is_wildcard(&address);
+        let is_wildcard = is_wildcard(&address);
 
         let lookup_result = if is_wildcard {
-            Self::validate_wildcard_pattern(&address)?;
+            validate_wildcard_pattern(&address)?;
             self.get_wildcard(&current, &address)
         } else {
             self.get_exact(&current, &address) 
@@ -388,7 +281,7 @@ impl LocalRegistry {
             new_inner.exact_tree = txn.commit(); 
         } else if address.ends_with("**") {
             let mut txn = new_inner.prefix_wildcard_tree.txn();
-            txn.insert(addr_bytes, target);
+            txn.insert(prefix_wildcard_key(addr_bytes), target);
             new_inner.prefix_wildcard_tree = txn.commit();
         } else {
             new_inner.single_wildcards.push((addr_bytes.to_vec(), target));
@@ -424,13 +317,13 @@ impl LocalRegistry {
         let _guard = self.register_mutex.lock().unwrap();
         let current = self.inner.load();
         
-        let is_wildcard = Self::is_wildcard(&address);
+        let is_wildcard = is_wildcard(&address);
 
         // 2. Perform the check (duplicates and conflicts) on the current snapshot
         let lookup_result = if is_wildcard {
             // Note: validate_wildcard_pattern is called here to ensure validation happens before get_wildcard
 
-            Self::validate_wildcard_pattern(&address)?; 
+            validate_wildcard_pattern(&address)?; 
             self.get_wildcard(&current, &address)
         } else {
             self.get_exact(&current, &address)
@@ -467,7 +360,7 @@ impl LocalRegistry {
                     new_inner.exact_tree = txn.commit();
                 } else if address.ends_with("**") {
                     let mut txn = new_inner.prefix_wildcard_tree.txn();
-                    txn.insert(addr_bytes, target.clone());
+                    txn.insert(prefix_wildcard_key(addr_bytes), target.clone());
                     new_inner.prefix_wildcard_tree = txn.commit();
                 } else {
                     new_inner.single_wildcards.push((addr_bytes.to_vec(), target.clone()));
@@ -506,31 +399,29 @@ impl LocalRegistry {
 
         let mut needs_update = false;
 
-        if Self::is_wildcard(address) {
-            if address.ends_with("**") {
-                if let Some(target) = new_inner.prefix_wildcard_tree.get(addr_bytes) {
-                    if target.remove_slot(slot) {
-                        let mut txn = new_inner.prefix_wildcard_tree.txn();
-                        txn.remove(addr_bytes); // THEN remove from tree to prevent false wildcard conflicts
-                        new_inner.prefix_wildcard_tree = txn.commit();
-                        needs_update = true;
-                    }
-                }
-            } else {
-                if let Some(idx) = new_inner.single_wildcards.iter().position(|(p, _)| p.as_slice() == addr_bytes) {
-                    let target = new_inner.single_wildcards[idx].1.clone();
-                    if target.remove_slot(slot) {
-                        new_inner.single_wildcards.remove(idx);
-                        needs_update = true;
-                    }
-                }
-            }
-        } else {
+        if !is_wildcard(address) {
             if let Some(target) = new_inner.exact_tree.get(addr_bytes) {
                 if target.remove_slot(slot) {
                     let mut txn = new_inner.exact_tree.txn();
                     txn.remove(addr_bytes); // THEN remove from tree
                     new_inner.exact_tree = txn.commit();
+                    needs_update = true;
+                }
+            }
+        } else if address.ends_with("**") {
+            if let Some(target) = new_inner.prefix_wildcard_tree.get(prefix_wildcard_key(addr_bytes)) {
+                if target.remove_slot(slot) {
+                    let mut txn = new_inner.prefix_wildcard_tree.txn();
+                    txn.remove(prefix_wildcard_key(addr_bytes)); // THEN remove from tree to prevent false wildcard conflicts
+                    new_inner.prefix_wildcard_tree = txn.commit();
+                    needs_update = true;
+                }
+            }
+        } else {
+            if let Some(idx) = new_inner.single_wildcards.iter().position(|(p, _)| p.as_slice() == addr_bytes) {
+                let target = new_inner.single_wildcards[idx].1.clone();
+                if target.remove_slot(slot) {
+                    new_inner.single_wildcards.remove(idx);
                     needs_update = true;
                 }
             }
@@ -557,19 +448,89 @@ impl LocalRegistry {
         }
 
         // 2. Prefix wildcard match - O(L) via get_ancestor
+
         if let Some(slot) = inner.prefix_wildcard_tree.get_ancestor(addr_bytes) {
             return Some(slot.clone());
         }
 
         // 3. Single wildcard match - O(N)
         for (pattern, slot) in &inner.single_wildcards {
-            if Self::compare_segments_bytes(pattern, addr_bytes, false) {
+            if compare_segments_bytes(pattern, addr_bytes, false) {
                 return Some(slot.clone());
             }
         }
 
         None
     }
+
+    pub fn lookup_registered(&self, name: &str) -> ResolvedAddress {
+        let inner = self.inner.load();
+        let addr_bytes = name.as_bytes();
+
+        if !is_wildcard(name) {
+            // 1. Exact match - O(L)
+            if let Some(slot) = inner.exact_tree.get(addr_bytes) {
+                return ResolvedAddress::Exact(slot.clone());
+            }
+        } else if name.ends_with("**") {
+            // 2. Prefix wildcard match - O(L) via get_ancestor
+            if let Some(slot) = inner.prefix_wildcard_tree.get(prefix_wildcard_key(addr_bytes)) {
+                return ResolvedAddress::PrefixWildcard(slot.clone());
+            }
+        } else {
+            // 3. Single wildcard match - O(N)
+            for (pattern, slot) in &inner.single_wildcards {
+                if pattern == addr_bytes {
+                    return ResolvedAddress::SingleWildcard(slot.clone());    
+                }
+            }
+        };
+
+        ResolvedAddress::None
+    }
+
+    pub fn remove_by_name(&self, name: &str) -> Result<(), RegistryError> {
+        let _guard = self.register_mutex.lock().unwrap();
+
+        // Step 1: Find the registered address
+        let target = self.lookup_registered(name);
+        if matches!(target, ResolvedAddress::None) {
+            return Err(RegistryError::AddressNotFound(name.to_string()));
+        }
+
+        // Step 2: Graceful shutdown
+        target.remove_self();
+
+        // Step 3: Remove from the registry tree
+        let inner = self.inner.load();
+        let mut new_inner = (**inner).clone();
+        let addr_bytes = name.as_bytes();
+
+        match target {
+            ResolvedAddress::PrefixWildcard(_) => {
+                let mut txn = new_inner.prefix_wildcard_tree.txn();
+                txn.remove(prefix_wildcard_key(addr_bytes));
+                new_inner.prefix_wildcard_tree = txn.commit();
+            }
+            ResolvedAddress::SingleWildcard(_) => {
+                if let Some(idx) = new_inner.single_wildcards.iter()
+                    .position(|(p, _)| p.as_slice() == addr_bytes) 
+                {
+                    new_inner.single_wildcards.remove(idx);
+                }
+            }
+            ResolvedAddress::Exact(_) => {
+                let mut txn = new_inner.exact_tree.txn();
+                txn.remove(addr_bytes);
+                new_inner.exact_tree = txn.commit();
+            }
+            _ => unreachable!(),
+        }
+
+        self.inner.store(Arc::new(new_inner));
+        tracing::info!(address = %name, "Address removed from registry");
+        Ok(())
+    }        
 
     /// Checks if a local recipient exists for the given address (exact match only).
     /// Useful for quick negative caching or routing decisions.
@@ -586,14 +547,188 @@ impl LocalRegistry {
     }
 }
 
+/// Returns `true` if the address contains wildcard characters (`*`).
+/// This is a fast, pre-validation check to route to the correct registration logic.
+#[inline]
+fn is_wildcard(address: &str) -> bool {
+    address.contains('*')
+}
+/// Static prefix up to the FIRST '*' — used for conflict detection via
+/// `walk_prefix` on both trees. Applies to single-wildcards as well.
+fn wildcard_static_prefix(pattern: &[u8]) -> &[u8] {
+    if let Some(idx) = pattern.iter().position(|&b| b == b'*') {
+        &pattern[..idx]
+    } else {
+        pattern
+    }
+}
+
+/// Key in `prefix_wildcard_tree`: everything before the trailing "**".
+/// Mixed patterns are rejected by validation, so the result contains no '*'.
+/// Invariant: `prefix_wildcard_key(p) + "**" == p` for any valid `p` ending in "**".
+fn prefix_wildcard_key(pattern: &[u8]) -> &[u8] {
+    pattern.strip_suffix(b"**").unwrap_or(pattern)
+}
+
+/// Core segment-by-segment comparison algorithm.
+///
+/// # Arguments
+/// * `pattern` - The pattern to match against (may contain `*` or `**`).
+/// * `target` - The concrete address or another pattern to compare with.
+/// * `allow_wildcard_both_sides` - If `true`, treats `**` in *either* string as a 
+///   universal matcher for the remainder of the comparison. Used for detecting 
+///   conflicts between two wildcard patterns. If `false`, only `pattern` is 
+///   treated as a wildcard, used for matching a concrete `target` address.
+fn compare_segments_bytes(pattern: &[u8], target: &[u8], allow_wildcard_both_sides: bool) -> bool {
+    let mut pat_iter = pattern.split(|&b| b == b':');
+    let mut tar_iter = target.split(|&b| b == b':');
+
+    loop {
+        let seg1 = pat_iter.next();
+        let seg2 = tar_iter.next();
+
+        match (seg1, seg2) {
+            (None, None) => return true,
+            // Handle ** when checking pattern-to-pattern conflicts
+            (Some(b"**"), _) if allow_wildcard_both_sides => return true,
+            (_, Some(b"**")) if allow_wildcard_both_sides => return true,
+            // Handle ** when matching pattern to concrete address.
+            // Since ** must be at the end (enforced by validation), if we see it 
+            // in the pattern, it automatically matches the rest of the target.
+            (Some(b"**"), _) => return pat_iter.next().is_none(),
+            // Length mismatch: one string has more segments than the other
+            (Some(_), None) | (None, Some(_)) => return false,
+            // Compare individual segments
+            (Some(a), Some(b)) => {
+                if a != b"*" && b != b"*" && a != b {
+                    return false;
+                }
+            }
+        }
+    }
+}         
+
+fn check_prefix_wildcard_conflicts(
+    prefix_wildcard_tree: &Radix<u8, Arc<RouteTarget>>,
+    pat_bytes: &[u8],
+) -> Option<String> {
+    if prefix_wildcard_tree.is_empty() {
+        return None;
+    }
+
+    let mut candidate = Vec::with_capacity(pat_bytes.len() + 3);
+    for segment in pat_bytes.split(|&b| b == b':') {
+        if segment == b"**" {
+            break; // Reached the end of the pattern
+        }
+        if !candidate.is_empty() {
+            candidate.push(b':');
+        }
+        candidate.extend_from_slice(segment);
+
+        // Form the pattern prefix: "a:**", "a:b:**", etc.
+        let mut check_bytes = candidate.clone();
+        check_bytes.extend_from_slice(b":"); 
+
+        // Targeted O(L) check
+        if prefix_wildcard_tree.get(&check_bytes).is_some() {
+            return Some(String::from_utf8_lossy(&check_bytes).into_owned());
+        }
+    }
+
+    let static_pref = wildcard_static_prefix(pat_bytes);
+    let iter = prefix_wildcard_tree.walk_prefix(static_pref);   
+
+    for (k, _) in iter {
+        // Skip the pattern itself (already checked as an exact duplicate)
+        if k == pat_bytes {
+            continue;
+        }
+        
+        // Semantic conflict check
+        if compare_segments_bytes(pat_bytes, &k, true) {
+            return Some(String::from_utf8_lossy(&k).into_owned());
+        }
+    }       
+    
+    None
+}        
+
+/// Validates wildcard pattern syntax according to Arcella routing rules.
+///
+/// # Rules enforced:
+/// 1. Pattern cannot be empty.
+/// 2. No empty segments allowed (e.g., `a::b` or trailing `:`).
+/// 3. `**` can only appear as the very last segment.
+/// 4. Partial wildcards (e.g., `a*`, `*b`, `a*b`) are forbidden; `*` must be the entire segment.
+fn validate_wildcard_pattern(pattern: &str) -> Result<(), RegistryError> {
+    if pattern.is_empty() {
+        return Err(RegistryError::InvalidWildcardFormat(
+            "Pattern cannot be empty".to_string(),
+        ));
+    }
+
+    // Prohibit global catch-all "**"
+    if pattern == "**" {
+        return Err(RegistryError::InvalidWildcardFormat(
+            "Global '**' wildcard is not allowed; pattern must have at least one static prefix segment".to_string()
+        ));
+    }        
+
+    // Prohibit global "*" and patterns starting with "*"
+    // This guarantees the presence of a static prefix for O(L) search in the Radix Tree
+    if pattern.starts_with('*') {
+        return Err(RegistryError::InvalidWildcardFormat(
+            "Pattern cannot start with '*' or be a global '*' wildcard; must have a static prefix".to_string()
+        ));
+    }     
+
+    let mut seen_star = false;
+    let mut found_starstar = false;
+
+    for segment in pattern.split(':') {
+        // Check for empty segments (e.g., "arcella::*" or "*::users")
+        if segment.is_empty() {
+            return Err(RegistryError::InvalidWildcardFormat(
+                format!("Empty segment in pattern '{}'", pattern),
+            ));
+        }
+
+        // If we already found "**", any subsequent segment is invalid
+        if found_starstar {
+            return Err(RegistryError::InvalidWildcardFormat(
+                format!("'**' must be the last segment in pattern '{}'", pattern),
+            ));
+        }
+
+        if segment == "**" {
+            if seen_star {
+                return Err(RegistryError::InvalidWildcardFormat(
+                    format!("Mixed '*' and '**' are not supported: '{}'", pattern)
+                ));
+            }
+            found_starstar = true;
+        } else if segment == "*" {
+            seen_star = true;
+        } else if segment.contains('*') {
+            // Found incorrect format, e.g., "a*", "*b", "a*b".
+            return Err(RegistryError::InvalidWildcardFormat(
+                format!("Invalid wildcard segment '{}' in pattern '{}'", segment, pattern),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::transport::{create_channel, MessageSender};
+    use tokio_util::sync::CancellationToken;
 
-    fn create_dummy_sender() -> MessageSender {
-        let (tx, _rx) = create_channel(10);
-        tx
+    use super::*;
+
+    fn slot() -> Arc<SubscriptionSlot> {
+        SubscriptionSlot::new(10, CancellationToken::new())  // свой токен!
     }
 
     mod matches {
@@ -607,7 +742,7 @@ mod tests {
         /// matches("arcella:*:*",        "arcella:core:users")   - true
         /// matches("*:core:users",       "arcella:core:users")   - true
         /// matches("arcella:core:**",    "arcella:core:users")   - true
-        /// matches("arcella:core:**",    "arcella:core")         - true  (zero extra segments)
+        /// matches("arcella:core:**",    "arcella:core")         - false (zero extra segments)
         /// matches("arcella:core:**",    "arcella")              - false (too short)
         /// matches("arcella:core:*",     "arcella:core:users")   - true
         /// matches("arcella:core:*",     "arcella:core:a:b")     - false (length mismatch)
@@ -615,9 +750,9 @@ mod tests {
         /// ```
         fn matches(pattern: &[u8], address: &[u8]) -> Result<bool, RegistryError> {
             let p1 = String::from_utf8_lossy(pattern);
-            LocalRegistry::validate_wildcard_pattern(&p1)?;
+            validate_wildcard_pattern(&p1)?;
 
-            Ok(LocalRegistry::compare_segments_bytes(pattern, address, false))
+            Ok(compare_segments_bytes(pattern, address, false))
         } 
 
         /// Checks whether two wildcard patterns can ever match the same concrete address.
@@ -625,9 +760,9 @@ mod tests {
         fn patterns_conflict_bytes(pattern1: &[u8], pattern2: &[u8]) -> Result<bool, RegistryError> {
             let p1 = String::from_utf8_lossy(pattern1);
             let p2 = String::from_utf8_lossy(pattern2);
-            LocalRegistry::validate_wildcard_pattern(&p1)?;
-            LocalRegistry::validate_wildcard_pattern(&p2)?;
-            Ok(LocalRegistry::compare_segments_bytes(pattern1, pattern2, true))
+            validate_wildcard_pattern(&p1)?;
+            validate_wildcard_pattern(&p2)?;
+            Ok(compare_segments_bytes(pattern1, pattern2, true))
         }
 
         // ============================================================
@@ -713,10 +848,9 @@ mod tests {
 
         #[test]
         fn star_and_starstar_combined() {
-            assert!(matches(b"a:*:c:**", b"a:b:c:d:e").unwrap());
-            //assert!(matches(b"a:*:**", b"x:y:z").unwrap());
-
             // Forbidden patterns must return an error
+            assert!(matches(b"a:*:c:**", b"a:b:c:d:e").is_err());
+            assert!(matches(b"a:*:**", b"x:y:z").is_err());
             assert!(matches(b"*:b:**", b"a:b:c:d:e").is_err());
             assert!(matches(b"*:**", b"x:y:z").is_err());
 
@@ -742,10 +876,11 @@ mod tests {
         fn test_register_lookup_and_unregister() {
             let registry = LocalRegistry::new();
             let address = "arcella:core:users".to_string();
-            let sender = create_dummy_sender();
+
+            let cancel_token = CancellationToken::new();
 
             // 1. Registration
-            let slot = SubscriptionSlot::new(sender);
+            let slot = SubscriptionSlot::new(10, cancel_token);
             let target = RouteTarget::new_exclusive(slot.clone());
             
             assert!(registry.register(address.clone(), target).is_ok());
@@ -771,45 +906,98 @@ mod tests {
         }
 
         #[test]
-        fn test_conflict_exact_vs_wildcard() {
+        fn test_conflict_exact_vs_simple_wildcard() {
             let registry = LocalRegistry::new();
             let exact_addr = "arcella:core:users".to_string();
             let wildcard_addr = "arcella:core:*".to_string();
 
             // Register the exact address
-            let slot = SubscriptionSlot::new(create_dummy_sender());
-            let target = RouteTarget::new_exclusive(slot.clone());
+            let target = RouteTarget::new_exclusive(slot());
             registry.register(exact_addr.clone(), target).unwrap();
 
             // Attempting to register an overlapping wildcard must fail
-            let slot = SubscriptionSlot::new(create_dummy_sender());
-            let target = RouteTarget::new_exclusive(slot.clone());
+            let target = RouteTarget::new_exclusive(slot());
             let err = registry.register(wildcard_addr.clone(), target).unwrap_err();
             assert!(matches!(err, RegistryError::WildcardConflict(_, _)));
 
             // And vice versa: first wildcard, then exact address
             let registry2 = LocalRegistry::new();
-            let slot = SubscriptionSlot::new(create_dummy_sender());
-            let target = RouteTarget::new_exclusive(slot.clone());
+            let target = RouteTarget::new_exclusive(slot());
             registry2.register(wildcard_addr.clone(), target).unwrap();
             
-            let slot = SubscriptionSlot::new(create_dummy_sender());
-            let target = RouteTarget::new_exclusive(slot.clone());
+            let target = RouteTarget::new_exclusive(slot());
             let err2 = registry2.register(exact_addr.clone(), target).unwrap_err();
             assert!(matches!(err2, RegistryError::ConflictsWithWildcard(_, _)));
         }
 
         #[test]
-        fn test_lookup_priority_exact_over_wildcard() {
+        fn test_conflict_exact_vs_prefix_wildcard() {
+            let registry = LocalRegistry::new();
+            let exact_addr = "arcella:core:users".to_string();
+            let wildcard_addr = "arcella:**".to_string();
+
+            // Register the exact address
+            let target = RouteTarget::new_exclusive(slot());
+            registry.register(exact_addr.clone(), target).unwrap();
+
+            // Attempting to register an overlapping wildcard must fail
+            let target = RouteTarget::new_exclusive(slot());
+            let err = registry.register(wildcard_addr.clone(), target).unwrap_err();
+            assert!(matches!(err, RegistryError::WildcardConflict(_, _)));
+
+            // And vice versa: first wildcard, then exact address
+            let registry2 = LocalRegistry::new();
+            let target = RouteTarget::new_exclusive(slot());
+            registry2.register(wildcard_addr.clone(), target).unwrap();
+            
+            let target = RouteTarget::new_exclusive(slot());
+            let err2 = registry2.register(exact_addr.clone(), target).unwrap_err();
+            assert!(matches!(err2, RegistryError::ConflictsWithWildcard(_, _)));
+        }
+
+        #[test]
+        fn test_conflict_exact_vs_simple_wildcard_bidirectional() {
             let registry = LocalRegistry::new();
             let exact_addr = "arcella:core:users".to_string();
             let wildcard_addr = "arcella:core:*".to_string();
 
-            let slot = SubscriptionSlot::new(create_dummy_sender());
-            let target1 = RouteTarget::new_exclusive(slot.clone());
+            let target1 = RouteTarget::new_exclusive(slot());
             
-            let slot = SubscriptionSlot::new(create_dummy_sender());
-            let target2 = RouteTarget::new_exclusive(slot.clone());
+            let target2 = RouteTarget::new_exclusive(slot());
+
+            // 1. Register the wildcard first
+            registry.register(wildcard_addr.clone(), target1.clone()).unwrap();
+
+            // 2. Attempting to register an exact address that falls under the wildcard MUST fail
+            let err = registry.register(exact_addr.clone(), target2.clone()).unwrap_err();
+            assert!(
+                matches!(err, RegistryError::ConflictsWithWildcard(_, _)),
+                "Expected ConflictsWithWildcard error, got: {:?}",
+                err
+            );
+
+            // 3. The reverse situation: register the exact address first
+            let registry2 = LocalRegistry::new();
+            registry2.register(exact_addr.clone(), target2.clone()).unwrap();
+
+            // 4. Attempting to register a wildcard that covers the exact address MUST fail
+            let err2 = registry2.register(wildcard_addr.clone(), target1).unwrap_err();
+            assert!(
+                matches!(err2, RegistryError::WildcardConflict(_, _)),
+                "Expected WildcardConflict error, got: {:?}",
+                err2
+            );
+        }
+        
+        #[test]
+        fn test_lookup_priority_exact_over_prefix_wildcard() {
+            let registry = LocalRegistry::new();
+            let exact_addr = "arcella:core:users".to_string();
+            let wildcard_addr = "arcella:**".to_string();
+
+            let target1 = RouteTarget::new_exclusive(slot());
+            
+            let target2 = RouteTarget::new_exclusive(slot());
 
             // 1. Register the wildcard first
             registry.register(wildcard_addr.clone(), target1.clone()).unwrap();
@@ -839,12 +1027,14 @@ mod tests {
         fn test_get_existing_or_register_atomic() {
             let registry = LocalRegistry::new();
             let address = "arcella:lb:group".to_string();
+            let cancel_token = CancellationToken::new();
             let mut factory_call_count = 0;
 
             // 1. First call: the address is free, the factory must be invoked
             let result1 = registry.get_existing_or_register(address.clone(), || {
                 factory_call_count += 1;
-                Ok(RouteTarget::new_exclusive(SubscriptionSlot::new(create_dummy_sender())))
+                let slot = SubscriptionSlot::new(10, cancel_token.clone());
+                Ok(RouteTarget::new_exclusive(slot))
             }).unwrap();
 
             assert!(matches!(result1, RegisterResult::Registered(_)));
@@ -853,7 +1043,8 @@ mod tests {
             // 2. Second call: the address is taken, the factory must NOT be invoked, Existing is returned
             let result2 = registry.get_existing_or_register(address.clone(), || {
                 factory_call_count += 1; // This must not execute
-                Ok(RouteTarget::new_exclusive(SubscriptionSlot::new(create_dummy_sender())))
+                let slot = SubscriptionSlot::new(10, cancel_token.clone());
+                Ok(RouteTarget::new_exclusive(slot))
             }).unwrap();
 
             assert!(matches!(result2, RegisterResult::AlreadyExists(_)));
@@ -864,11 +1055,12 @@ mod tests {
         fn test_unregister_with_wrong_slot_is_noop() {
             let registry = LocalRegistry::new();
             let address = "arcella:test".to_string();
+            let cancel_token = CancellationToken::new();
             
-            let slot1 = SubscriptionSlot::new(create_dummy_sender());
+            let slot1 = SubscriptionSlot::new(10, cancel_token.clone());
             let target1 = RouteTarget::new_exclusive(slot1.clone());
             
-            let slot2 = SubscriptionSlot::new(create_dummy_sender());
+            let slot2 = SubscriptionSlot::new(10, cancel_token.clone());
 
             registry.register(address.clone(), target1.clone()).unwrap();
 
@@ -880,6 +1072,81 @@ mod tests {
             assert!(registry.lookup(&address).is_some());
             assert!(Arc::ptr_eq(&registry.lookup(&address).unwrap(), &target1));
         } 
+    
+        #[test]
+        fn duplicate_prefix_wildcard_is_occupied() {
+            let registry = LocalRegistry::new();
+            registry.register("a:b:**".into(), RouteTarget::new_exclusive(slot())).unwrap();
+            let err = registry.register("a:b:**".into(), RouteTarget::new_exclusive(slot())).unwrap_err();
+            assert!(matches!(err, RegistryError::AddressAlreadyOccupied(_)), "got {err:?}");
+        }
+
+        #[test]
+        fn nested_prefix_wildcards_conflict() {
+            let registry = LocalRegistry::new();
+            registry.register("a:**".into(), RouteTarget::new_exclusive(slot())).unwrap();
+            let err = registry.register("a:b:**".into(), RouteTarget::new_exclusive(slot())).unwrap_err();
+            assert!(matches!(err, RegistryError::WildcardConflict(_, _)), "got {err:?}");
+        }
+
+        #[test]
+        fn nested_prefix_wildcards_conflict_reversed() {
+            let registry = LocalRegistry::new();
+            registry.register("a:b:**".into(), RouteTarget::new_exclusive(slot())).unwrap();
+            let err = registry.register("a:**".into(), RouteTarget::new_exclusive(slot())).unwrap_err();
+            assert!(matches!(err, RegistryError::WildcardConflict(_, _)), "got {err:?}");
+        }
+
+        #[test]
+        fn prefix_and_single_wildcard_conflict() {
+            let registry = LocalRegistry::new();
+            registry.register("a:**".into(), RouteTarget::new_exclusive(slot())).unwrap();
+            let err = registry.register("a:*:c".into(), RouteTarget::new_exclusive(slot())).unwrap_err();
+            assert!(matches!(err, RegistryError::WildcardConflict(_, _)), "got {err:?}");
+        }
+
+        #[test]
+        fn prefix_wildcard_matches_zero_segments() {
+            let registry = LocalRegistry::new();
+            registry.register("a:b:**".into(), RouteTarget::new_exclusive(slot())).unwrap();
+            assert!(registry.has_route("a:b:c"));
+            assert!(registry.has_route("a:b:c:d"));
+            assert!(!registry.has_route("a:b"),      "zero segments");
+            assert!(!registry.has_route("a:bc"),     "must not over-match sibling");
+            assert!(!registry.has_route("a"));
+        }
+
+        #[test]
+        fn register_paths_are_consistent_for_prefix_wildcard() {
+            let registry = LocalRegistry::new();
+            registry.get_existing_or_register("a:b:**".into(),
+                || Ok(RouteTarget::new_exclusive(slot()))).unwrap();
+
+            assert!(registry.has_route("a:b:c"), "must be routable");
+            assert!(matches!(registry.lookup_registered("a:b:**"), ResolvedAddress::PrefixWildcard(_)));
+            assert!(registry.remove_by_name("a:b:**").is_ok(), "must be removable");
+        }
+
+        #[test]
+        fn conflict_message_contains_full_pattern() {
+            let registry = LocalRegistry::new();
+            registry.register("a:**".into(), RouteTarget::new_exclusive(slot())).unwrap();
+            let err = registry.register("a:b:c".into(), RouteTarget::new_exclusive(slot())).unwrap_err();
+            match err {
+                RegistryError::ConflictsWithWildcard(_, wc) => assert_eq!(wc, "a:**"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        /// unregister для wildcard
+        #[test]
+        fn unregister_prefix_wildcard_by_slot() {
+            let registry = LocalRegistry::new();
+            let slot = slot();
+            registry.register("a:b:**".into(), RouteTarget::new_exclusive(slot.clone())).unwrap();
+            registry.unregister("a:b:**", &slot).unwrap();
+            assert!(!registry.has_route("a:b:c"));
+        }
     }
 
     mod multithread {
@@ -894,17 +1161,20 @@ mod tests {
             let address = "arcella:lb:race_test".to_string();
             let factory_calls = Arc::new(AtomicUsize::new(0));
             let mut handles = vec![];
+            let cancel_token = CancellationToken::new();
 
             // Spawn 100 threads that simultaneously try to register the same address
             for _ in 0..100 {
                 let registry_clone = registry.clone();
                 let addr = address.clone();
                 let calls = factory_calls.clone();
+                let child_cancel_token = cancel_token.clone();
                 
                 handles.push(thread::spawn(move || {
                     registry_clone.get_existing_or_register(addr, || {
                         calls.fetch_add(1, Ordering::SeqCst);
-                        Ok(RouteTarget::new_exclusive(SubscriptionSlot::new(create_dummy_sender())))
+                        let slot  =SubscriptionSlot::new(10, child_cancel_token.clone());
+                        Ok(RouteTarget::new_exclusive(slot))
                     })
                 }));
             }
@@ -929,5 +1199,178 @@ mod tests {
             // 3. Ensure no errors occurred
             assert!(results.iter().all(|r| r.is_ok()), "All threads should complete without RegistryError");
         }        
+    }
+
+    mod remove_by_name {
+        use super::*;
+
+        /// Removal of an exact address (does not contain `*`)
+        #[test]
+        fn test_remove_exact_address() {
+            let registry = LocalRegistry::new();
+            let addr = "arcella:core:users";
+
+            // Register the address
+            let target = RouteTarget::new_exclusive(slot());
+            registry.register(addr.to_string(), target).unwrap();
+
+            // Verify that the address is registered
+            assert!(registry.has_route(addr));
+            assert!(registry.has_local(addr));
+
+            // Remove
+            assert!(registry.remove_by_name(addr).is_ok());
+
+            // Verify that the address has been removed
+            assert!(!registry.has_route(addr));
+            assert!(!registry.has_local(addr));
+        }
+
+        /// Удаление prefix wildcard адреса (заканчивается на `**`)
+        #[test]
+        fn test_remove_prefix_wildcard_address() {
+            let registry = LocalRegistry::new();
+            let wildcard = "arcella:core:**";
+
+            let target = RouteTarget::new_exclusive(slot());
+            registry.register(wildcard.to_string(), target).unwrap();
+
+            // Wildcard матчит конкретные адреса
+            assert!(registry.has_route("arcella:core:users"));
+            assert!(registry.has_route("arcella:core:events:created"));
+
+            // Удаляем сам wildcard
+            assert!(registry.remove_by_name(wildcard).is_ok());
+
+            // Конкретные адреса больше не матчатся
+            assert!(!registry.has_route("arcella:core:users"));
+            assert!(!registry.has_route("arcella:core:events:created"));
+        }
+
+        /// Удаление single wildcard адреса (содержит `*` в середине)
+        #[test]
+        fn test_remove_single_wildcard_address() {
+            let registry = LocalRegistry::new();
+            let wildcard = "arcella:*:users";
+
+            let target = RouteTarget::new_exclusive(slot());
+            registry.register(wildcard.to_string(), target).unwrap();
+
+            // Wildcard матчит конкретные адреса
+            assert!(registry.has_route("arcella:core:users"));
+            assert!(registry.has_route("arcella:web:users"));
+
+            // Удаляем
+            assert!(registry.remove_by_name(wildcard).is_ok());
+
+            // Конкретные адреса больше не матчатся
+            assert!(!registry.has_route("arcella:core:users"));
+            assert!(!registry.has_route("arcella:web:users"));
+        }
+
+        /// Попытка удаления несуществующего адреса
+        #[test]
+        fn test_remove_nonexistent_address() {
+            let registry = LocalRegistry::new();
+
+            let result = registry.remove_by_name("arcella:nonexistent");
+            assert!(matches!(result, Err(RegistryError::AddressNotFound(_))));
+        }
+
+        /// Удаление конкретного адреса, который матчится через wildcard,
+        /// НЕ должно удалять сам wildcard
+        #[test]
+        fn test_remove_exact_does_not_affect_wildcard() {
+            let registry = LocalRegistry::new();
+            let wildcard = "arcella:core:**";
+            let exact = "arcella:core:users";
+
+            let target = RouteTarget::new_exclusive(slot());
+            registry.register(wildcard.to_string(), target).unwrap();
+
+            // Пытаемся удалить точный адрес, который не зарегистрирован
+            // (зарегистрирован только wildcard)
+            let result = registry.remove_by_name(exact);
+            assert!(matches!(result, Err(RegistryError::AddressNotFound(_))));
+
+            // Wildcard всё ещё существует
+            assert!(registry.has_route(exact));
+        }
+
+        /// Удаление одного адреса не влияет на другие адреса
+        #[test]
+        fn test_remove_one_does_not_affect_others() {
+            let registry = LocalRegistry::new();
+            let addr1 = "arcella:core:users";
+            let addr2 = "arcella:core:events";
+            let cancel_token = CancellationToken::new();
+
+            let slot1 = SubscriptionSlot::new(10, cancel_token.clone());
+            let target1 = RouteTarget::new_exclusive(slot1.clone());
+            registry.register(addr1.to_string(), target1).unwrap();
+
+            let slot2 = SubscriptionSlot::new(10, cancel_token.clone());
+            let target2 = RouteTarget::new_exclusive(slot2.clone());
+            registry.register(addr2.to_string(), target2).unwrap();
+
+            // Удаляем первый адрес
+            assert!(registry.remove_by_name(addr1).is_ok());
+
+            // Первый удалён, второй остался
+            assert!(!registry.has_route(addr1));
+            assert!(registry.has_route(addr2));
+        }
+
+        /// Удаление адреса с несколькими сегментами
+        #[test]
+        fn test_remove_deeply_nested_address() {
+            let registry = LocalRegistry::new();
+            let addr = "arcella:core:users:profile:settings";
+
+            let target = RouteTarget::new_exclusive(slot());
+            registry.register(addr.to_string(), target).unwrap();
+
+            assert!(registry.has_route(addr));
+            assert!(registry.remove_by_name(addr).is_ok());
+            assert!(!registry.has_route(addr));
+        }
+
+        /// Повторное удаление того же адреса
+        #[test]
+        fn test_remove_twice() {
+            let registry = LocalRegistry::new();
+            let addr = "arcella:test";
+
+            let target = RouteTarget::new_exclusive(slot());
+            registry.register(addr.to_string(), target).unwrap();
+
+            // Первое удаление успешно
+            assert!(registry.remove_by_name(addr).is_ok());
+
+            // Второе удаление — ошибка
+            let result = registry.remove_by_name(addr);
+            assert!(matches!(result, Err(RegistryError::AddressNotFound(_))));
+        }
+
+        /// Регистрация после удаления должна работать
+        #[test]
+        fn test_register_after_remove() {
+            let registry = LocalRegistry::new();
+            let addr = "arcella:test";
+            let cancel_token = CancellationToken::new();
+
+            let slot1 = SubscriptionSlot::new(10, cancel_token.clone());
+            let target1 = RouteTarget::new_exclusive(slot1.clone());
+            registry.register(addr.to_string(), target1).unwrap();
+
+            assert!(registry.remove_by_name(addr).is_ok());
+
+            // Повторная регистрация того же адреса должна работать
+            let slot2 = SubscriptionSlot::new(20, cancel_token.clone());
+            let target2 = RouteTarget::new_exclusive(slot2.clone());
+            assert!(registry.register(addr.to_string(), target2).is_ok());
+
+            assert!(registry.has_route(addr));
+        }
     }
 }

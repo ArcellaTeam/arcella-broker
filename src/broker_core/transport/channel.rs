@@ -40,6 +40,7 @@
 //! if the remote component terminated with an error (trap) or stopped responding.
 
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use thiserror::Error;
 
 use crate::protocol::Message;
@@ -108,6 +109,9 @@ pub enum RecvTimeoutError {
 
     #[error("Receive operation timed out")]
     Timeout,
+
+    #[error("Receive operation was cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -205,20 +209,46 @@ impl<T: Send> Sender<T> {
 /// the channel for all active `Sender`s.
 pub struct Receiver<T> {
     inner: mpsc::Receiver<T>,
+    cancel_token: CancellationToken,
 }
 
 impl<T: Send> Receiver<T> {
-    pub(crate) fn new(inner: mpsc::Receiver<T>) -> Self {
+    pub(crate) fn new(inner: mpsc::Receiver<T>, cancel_token: CancellationToken) -> Self {
         tracing::trace!("Receiver new");
-        Self { inner }
+        Self { inner, cancel_token }
     }
 
     /// Asynchronously receives the next message.
     ///
     /// Returns `None` if all senders have been dropped and the channel is closed.
     pub async fn recv(&mut self) -> Option<T> {
-        tracing::trace!("Receiver recv");
-        self.inner.recv().await
+        match self.inner.try_recv() {
+            Ok(msg) => {
+                tracing::trace!("Receiver recv (fast path)");
+                return Some(msg);
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                // All senders dropped — channel is dead
+                return None;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {
+                // Queue is empty, proceed to slow path
+            }
+        }
+
+        // SLOW PATH: wait for message or cancellation
+        tokio::select! {
+            biased;  // Check cancellation first for fast shutdown
+            
+            _ = self.cancel_token.cancelled() => {
+                tracing::debug!("Receiver cancelled via token");
+                None
+            }
+            msg = self.inner.recv() => {
+                tracing::trace!("Receiver recv (slow path)");
+                msg
+            }
+        }
     }
 
     /// Non-blocking receive attempt.
@@ -233,11 +263,40 @@ impl<T: Send> Receiver<T> {
     /// Guarantees that the broker will not hold resources indefinitely,
     /// correctly interrupting the wait and returning control.
     pub async fn recv_timeout(&mut self, timeout: std::time::Duration) -> Result<T, RecvTimeoutError> {
-        match tokio::time::timeout(timeout, self.inner.recv()).await {
-            Ok(Some(msg)) => Ok(msg),
-            Ok(None) => Err(RecvTimeoutError::Disconnected),
-            Err(_) => Err(RecvTimeoutError::Timeout),
+        match self.inner.try_recv() {
+            Ok(msg) => {
+                tracing::trace!("Receiver recv_timeout (fast path)");
+                return Ok(msg);
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                // All senders dropped — channel is dead
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {
+                // Queue is empty, proceed to slow path
+            }
         }
+
+        // SLOW PATH
+        tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => {
+                Err(RecvTimeoutError::Cancelled)
+            }
+            _ = tokio::time::sleep(timeout) => {
+                Err(RecvTimeoutError::Timeout)
+            }
+            msg = self.inner.recv() => {
+                match msg {
+                    Some(m) => Ok(m),
+                    None => Err(RecvTimeoutError::Disconnected),
+                }
+            }
+        }
+    }
+
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.child_token()
     }
 }
 
@@ -251,34 +310,36 @@ pub type MessageSender = Sender<Message>;
 pub type MessageReceiver = Receiver<Message>;
 
 /// Token used by a consumer to receive a reply from a producer.
-pub type RequestToken = oneshot::Sender<Message>;
+pub type ClaimSender = oneshot::Sender<Message>;
+//
+pub type ClaimReceiver = oneshot::Receiver<Message>;
 
 /// Sender for requesting messages from a shared LoadBalanced queue.
 /// (Sends ReplyTokens to the producer).
-pub type RequestSender = Sender<RequestToken>;
+pub type RequestSender = Sender<ClaimSender>;
 /// Receiver for managing incoming pull-requests from consumers.
-pub type RequestReceiver = Receiver<RequestToken>;
+pub type RequestReceiver = Receiver<ClaimSender>;
 
 impl RequestSender {
     /// Asynchronously requests the next message from the shared LoadBalanced queue.
     /// 
     /// This method implements the **"Pull" pattern**: it creates a `oneshot` channel,
-    /// sends the `oneshot::Sender` (as a `RequestToken`) to the producer,
-    /// and returns the `oneshot::Receiver` to the caller.
+    /// sends the `oneshot::Sender` (as a `ClaimSender`) to the producer,
+    /// and returns the `ClaimReceiver` to the caller.
     /// 
     /// This is the primary mechanism for consumers in a LoadBalanced group to
     /// signal readiness and receive messages with natural backpressure, ensuring
     /// that the producer never sends a message to a dead or busy consumer.
     ///
     /// # Returns
-    /// - `Ok(oneshot::Receiver<Message>)` — the request was successfully queued.
+    /// - `Ok(ClaimReceiver)` — the request was successfully queued.
     ///   The caller **MUST** await this receiver to get the response.
-    /// - `Err(SendError<RequestToken>)` — the target component has terminated (channel is closed).
-    ///   The `RequestToken` is returned inside the error, allowing for clean resource drop.
+    /// - `Err(SendError<ClaimSender>)` — the target component has terminated (channel is closed).
+    ///   The `ClaimSender` is returned inside the error, allowing for clean resource drop.
     #[must_use = "The returned receiver must be awaited to receive the message. \
                   Dropping it silently cancels the request and may cause the producer to hang \
                   while trying to send to a dropped receiver."]
-    pub async fn request(&self) -> Result<oneshot::Receiver<Message>, SendError<RequestToken>> {
+    pub async fn request(&self) -> Result<ClaimReceiver, SendError<ClaimSender>> {
         tracing::trace!("RequestSender request");
         let (reply_tx, reply_rx) = oneshot::channel();
         
@@ -298,7 +359,7 @@ impl RequestSender {
     /// when implementing custom scheduling logic).
     ///
     /// # Returns
-    /// - `Ok(oneshot::Receiver<Message>)` — the request was successfully queued.
+    /// - `Ok(ClaimReceiver)` — the request was successfully queued.
     ///   The caller MUST await this receiver to get the response, otherwise the
     ///   response will be lost when the receiver is dropped.
     /// - `Err(TryRequestError::Full)` — the queue is full. The caller should
@@ -325,7 +386,7 @@ impl RequestSender {
     /// }
     /// ```
     #[must_use = "The returned receiver must be awaited to receive the message. Dropping it silently cancels the request."]
-    pub fn try_request(&self) -> Result<oneshot::Receiver<Message>, TryRequestError> {
+    pub fn try_request(&self) -> Result<ClaimReceiver, TryRequestError> {
         // Fast-path: avoid allocating a oneshot channel if the dispatcher is already dead.
         // This is a common scenario in Wasm environments when a component traps.
         if self.is_closed() {
@@ -356,21 +417,30 @@ impl RequestSender {
 ///
 /// # Example
 /// ```rust
-/// use arcella_broker::transport::create_channel;
+/// use tokio_util::sync::CancellationToken;
+/// use arcella_broker::broker_core::transport::create_channel;
 /// 
 /// // Creating a channel with a capacity of 1024 messages 
-/// let (sender, mut receiver) = create_channel(1024); 
+/// let cancel_token = CancellationToken::new();
+/// let (sender, mut receiver) = create_channel(1024, cancel_token); 
 /// 
 /// assert_eq!(sender.load().max_capacity, 1024); 
 /// assert!(!sender.is_closed()); 
 /// ```
-pub fn create_channel(capacity: usize) -> (MessageSender, MessageReceiver) {
+pub fn create_channel(capacity: usize, cancel_token: CancellationToken) -> (MessageSender, MessageReceiver) {
     let (tx, rx) = mpsc::channel::<Message>(capacity);
-    (MessageSender::new(tx), MessageReceiver::new(rx))
+    (MessageSender::new(tx), MessageReceiver::new(rx, cancel_token))
 }
 
 /// Creates a new linked sender-receiver pair for request routing with the given capacity.
-pub fn create_request_channel(capacity: usize) -> (RequestSender, RequestReceiver) {
-    let (tx, rx) = mpsc::channel::<RequestToken>(capacity);
-    (RequestSender::new(tx), RequestReceiver::new(rx))
+pub fn create_request_channel(capacity: usize, cancel_token: CancellationToken) -> (RequestSender, RequestReceiver) {
+    let (tx, rx) = mpsc::channel::<ClaimSender>(capacity);
+    (RequestSender::new(tx), RequestReceiver::new(rx, cancel_token))
+}
+
+
+/// Creates a new linked sender-receiver pair for request routing with the given capacity.
+pub fn create_request_token() -> (ClaimSender, ClaimReceiver) {
+    let (tx, rx) = oneshot::channel();
+    (tx, rx)
 }

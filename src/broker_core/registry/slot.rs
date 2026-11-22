@@ -12,35 +12,47 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
-use super::super::transport::MessageSender;
+use super::super::transport::{MessageSender, MessageReceiver, create_channel};
 
 pub struct SubscriptionSlot {
     /// Current sender. `None` means the subscription has been removed.
     /// We use `ArcSwap` for lock-free updates.
     pub sender: ArcSwap<Option<MessageSender>>,
+
+    /// The receiver side of the channel.
+    /// Wrapped in Arc<Mutex<>> so it can be safely shared (e.g., with an egress task 
+    /// or LoadBalancedGroup dispatcher) and mutated for `recv()`.
+    pub (crate) receiver: Arc<Mutex<MessageReceiver>>,
     
     /// Subscription version. Increments on ANY change:
     /// - register (initial or re-registration)
     /// - unregister
     /// - replacement of the sender
     pub version: AtomicU64,
+
+    /// Token bound to this specific subscription.
+    pub address_token: CancellationToken,    
 }
 
 impl SubscriptionSlot {
-    pub fn new(sender: MessageSender) -> Arc<Self> {
+    pub fn new(capacity: usize, address_token: CancellationToken) -> Arc<Self> {
+        let (sender, receiver) = create_channel(capacity, address_token.clone());
         Arc::new(Self {
             sender: ArcSwap::from(Arc::new(Some(sender))),
+            receiver: Arc::new(Mutex::new(receiver)),
             version: AtomicU64::new(1),
+            address_token,
         })
     }
     
-    /// Update the sender and version increment.
-    pub fn update(&self, new_sender: MessageSender) {
-        self.sender.store(Arc::new(Some(new_sender)));
-        self.version.fetch_add(1, Ordering::Release);
+    /// Returns the address-scoped token (for creating binding tokens).
+    pub fn address_token(&self) -> &CancellationToken {
+        &self.address_token
     }
-    
+
     /// Marks the slot as deleted and version increment.
     pub fn mark_removed(&self) {
         self.sender.store(Arc::new(None));
@@ -54,6 +66,10 @@ impl SubscriptionSlot {
             Some(sender) => sender.is_closed(),
             None => true, // Slot was deleted explicitly with mark_removed
         }
+    }
+
+    pub fn receiver(&self) -> Arc<Mutex<MessageReceiver>> {
+        Arc::clone(&self.receiver)
     }
 }
 

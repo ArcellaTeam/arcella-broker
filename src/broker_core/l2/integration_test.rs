@@ -1,0 +1,80 @@
+// arcella-broker/src/broker_core/l2/integration_test.rs
+//
+// Copyright (c) 2026 Arcella Team
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE>
+// or the MIT license <LICENSE-MIT>, at your option.
+// This file may not be copied, modified, or distributed
+// except according to those terms.
+
+#[cfg(test)]
+mod integration_tests {
+    use bytes::{Bytes, Buf};
+    use std::sync::Arc;
+    
+    use super::super::{SessionState, UnackedBuffer};
+
+    use crate::protocol::{
+        {Frame, create_ack_frame},
+        payloads::{DataPayload, ParsedDataPayload},
+        test_utils::dummy_in_only_message,
+    };
+
+    fn create_data_frame(sequence: u64, address: Bytes, msg_payload: Bytes) -> Frame {
+
+        let msg = dummy_in_only_message(
+            Bytes::from("test.msg"),
+            address.clone(),
+            msg_payload,
+        );
+        
+        let messages = [msg.clone()];
+        let data_payload = DataPayload::new(sequence, address, &messages);
+        Frame::data(data_payload.encode().unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_stream_transport_simple_flow_control_1000_frames() {
+        let session = Arc::new(SessionState::new(1));
+        let unacked_buffer = UnackedBuffer::new(1024);
+
+        let address = "test:worker:1";
+        let total_frames = 1000;
+
+        for i in 0..total_frames {
+            let seq = session.next_sequence();
+            let payload_str = format!("payload_{}", i);
+            let payload_bytes = Bytes::from(payload_str);
+            let frame = create_data_frame(seq, Bytes::from(address), payload_bytes);
+            
+            unacked_buffer.push(seq, frame).unwrap();
+        }
+
+        assert_eq!(unacked_buffer.len(), total_frames);
+
+        for i in 0..total_frames {
+            let seq = (i + 1) as u64;
+            let payload_str = format!("payload_{}", i);
+            let payload_bytes = Bytes::from(payload_str);
+            let frame = create_data_frame(seq, Bytes::from(address), payload_bytes);
+            
+            let mut payload_buf = frame.payload.clone();
+            let parsed = ParsedDataPayload::decode(&mut payload_buf).unwrap();
+            
+            assert!(session.update_last_received(parsed.session_sequence));
+
+            let ack_frame = create_ack_frame(parsed.session_sequence);
+            
+            let ack_seq = {
+                let mut buf = ack_frame.payload.as_ref();
+                buf.get_u64_le()
+            };
+            
+            assert!(unacked_buffer.acknowledge(ack_seq));
+        }
+
+        assert!(unacked_buffer.is_empty());
+        assert_eq!(session.last_received_sequence(), total_frames as u64);
+        assert_eq!(session.current_send_sequence(), (total_frames + 1) as u64);
+    }
+}

@@ -13,12 +13,12 @@ use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use parking_lot::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::broker_core::{
     registry::LocalRegistry,
     transport::{
         create_request_channel,
-        MessageReceiver,
         RequestSender,
     },
 };
@@ -26,37 +26,46 @@ use crate::broker_core::{
 use super::slot::SubscriptionSlot;
 
 pub struct LoadBalancedGroup {
-    /// Слот в реестре (для управления версией и признаком удаления)
+    /// Slot in the registry (for managing the version and the deletion flag)
     pub(crate) slot: Arc<SubscriptionSlot>,
 
-    /// Управляющий дескриптор фонового задачи-диспетчера
+    /// Control handle for the background dispatcher task
     dispatcher_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
 
-    /// Версия для инвалидации кэша InMemoryEndpoint
+    /// Version for invalidating the InMemoryEndpoint cache
     version: AtomicU64,
 
-    /// Канал запросов. Группа хранит одну сильную ссылку, чтобы `req_rx` не закрылся преждевременно.
-    /// Потребители получают клоны этой ссылки через `subscribe()`.
-    /// Обернут в Arc исключительно для возможности проверки Arc::strong_count в методе is_empty(), 
-    /// чтобы определить наличие активных потребителей.
+    /// Request channel. The group holds one strong reference so that `req_rx` does not close prematurely.
+    /// Consumers receive clones of this reference via `subscribe()`.
+    /// Wrapped in Arc solely to allow checking Arc::strong_count in the is_empty() method,
+    /// in order to determine whether there are active consumers.
     req_tx: Arc<RequestSender>,
 
     address: String,
 
+    /// Counter of active consumers. Used for fast `is_empty()` determination
+    /// and to trigger `shutdown()` when the last consumer leaves.
     active_consumers: AtomicUsize,
+
+    /// Cancellation token, a child of the main_receiver token.
+    /// Allows the group to be cancelled independently, but guarantees cancellation when the main channel is closed.
+    address_token: CancellationToken,
 }
 
 impl LoadBalancedGroup {
     /// Creates a new group and starts a background dispatcher
     pub fn new(
         slot: Arc<SubscriptionSlot>,
-        mut main_receiver: MessageReceiver,
         req_channel_capacity: usize,
         registry: Weak<LocalRegistry>,
         address: String,
     ) -> Arc<Self> {
-        
-        let (req_tx, mut req_rx) = create_request_channel(req_channel_capacity);
+
+        let group_token = slot.address_token().child_token();
+        let (req_tx, mut req_rx) = create_request_channel(
+            req_channel_capacity,
+            group_token.clone()
+        );
 
         let group = Arc::new(Self {
             slot: slot.clone(),
@@ -65,11 +74,13 @@ impl LoadBalancedGroup {
             req_tx: Arc::new(req_tx),
             address: address.clone(),
             active_consumers: AtomicUsize::new(0),
+            address_token: group_token,
         });
 
         let slot_for_drop: Arc<SubscriptionSlot> = slot.clone();
         let registry_for_task = registry;
         let address_for_task = address;
+        let main_receiver_arc = slot.receiver();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -78,12 +89,13 @@ impl LoadBalancedGroup {
                     Some(tx) => tx,
                     None => {
                         tracing::debug!("LoadBalancedGroup dispatcher: no more consumers, shutting down");
-                        break // Все RequestSender'ы уничтожены, группа закрывается
+                        break // All RequestSenders have been destroyed, the group is closing
                     }
                 };
 
                 // 2. Take the next message from the shared queue
-                let mut current_msg = match main_receiver.recv().await {
+                let mut receiver = main_receiver_arc.lock().await;
+                let mut current_msg = match receiver.recv().await {
                     Some(m) => m,
                     None => {
                         tracing::debug!("LoadBalancedGroup dispatcher: main queue closed, shutting down");
@@ -143,42 +155,41 @@ impl LoadBalancedGroup {
     }
 
     pub fn remove_consumer(&self) {
-        let prev_count = self.active_consumers.fetch_sub(1, Ordering::AcqRel);
-        
-        if prev_count == 1 {
-            // This was the last consumer — initiate group termination
-            tracing::debug!(
-                address = %self.address,
-                "LoadBalancedGroup: last consumer removed, shutting down"
-            );
-            self.shutdown();
-        }
+        self.active_consumers.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Returns the current number of active consumers.
     pub fn consumer_count(&self) -> usize {
         self.active_consumers.load(Ordering::Acquire)
     }            
+    
+    /// Returns the address-scoped token (for creating binding tokens).
+    pub fn address_token(&self) -> &CancellationToken {
+        &self.address_token
+    }
 
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
     }
 
     pub fn is_empty(&self) -> bool {
-        Arc::strong_count(&self.req_tx) == 1
+        self.active_consumers.load(Ordering::Acquire) == 0
     }
 
     /// Terminates the dispatcher. Does NOT call unregister —
     /// this method is called FROM unregister, and calling it again
     /// would lead to a deadlock on register_mutex.
     pub fn shutdown(&self) {
-        // 1. Abort the background task. This will instantly interrupt any .await inside it
+        // 1. Cancel the token. This will instantly wake up any pending `recv()` inside the dispatcher.
+        self.address_token.cancel();
+
+        // 2. Abort the background task. This will instantly interrupt any .await inside it
         // and lead to dropping main_receiver, closing the main channel.
         if let Some(handle) = self.dispatcher_handle.write().take() {
             handle.abort();
         }
         
-        // 2. Instant invalidation of all cached InMemoryEndpoint
+        // 3. Instant invalidation of all cached InMemoryEndpoint
         self.slot.mark_removed();
         self.version.fetch_add(1, Ordering::Release);
     }
@@ -187,6 +198,7 @@ impl LoadBalancedGroup {
 impl Drop for LoadBalancedGroup {
     fn drop(&mut self) {
         tracing::debug!("LoadBalancedGroup drop");
+        // `shutdown()` is idempotent, so it is safe to call from Drop
         self.shutdown();
     }
 }

@@ -12,6 +12,10 @@ use thiserror::Error;
 /// Errors that can occur during registry operations.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RegistryError {
+    /// Returned when the address is not found.
+    #[error("Address is not fount '{0}'")]
+    AddressNotFound(String),
+
     /// Returned when attempting to register an address or pattern that is already registered.
     #[error("Address or pattern '{0}' is already occupied")]
     AddressAlreadyOccupied(String),
@@ -41,4 +45,6 @@ pub enum RegistryError {
     #[error("Routing policy mismatch for address: {0}")]
     PolicyMismatch(String),
 
+    #[error("Reply dispatcher is closed")]
+    ReplyDispatcherClosed,
 }

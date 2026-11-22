@@ -28,33 +28,79 @@ use std::{
     collections::HashMap,
     sync::Arc,
 };
-use tokio::{
-    sync::oneshot,
-    task::JoinHandle,
-};
+use tokio::task::JoinHandle;
 
 use crate::{
-    client::subscriber::Subscriber,
-    protocol::Message,
+    //client::subscriber::Subscriber,
+    broker_core::subscription::{
+        RecvError,
+        Subscriber,
+    },
+    broker_core::transport::{
+        ClaimSender, 
+        ClaimReceiver,
+        create_request_token
+    },
 };
 use super::RegistryError;
 
-/// RAII guard for managing the lifetime of a response wait.
-/// 
-/// Upon creation, it registers an `oneshot::Sender` in the waiters map.
-/// Upon destruction (going out of scope or panicking), it automatically 
-/// removes the registration, preventing memory leaks in the `HashMap`.
+// ============================================================================
+// Shared waiter state
+// ============================================================================
+
+/// Pending response waits, protected by a single mutex.
 ///
-/// # Design Note
-/// The structure holds a direct `Arc` reference to the `waiters` map, not to the entire `ReplyDispatcher`.
-/// This eliminates the need to implement `Clone` for the dispatcher and prevents potential
-/// footguns where cloning could lead to premature background task termination.
+/// # Why `closed` lives here and not in a separate atomic
+/// Registration and termination must be serialized. With a standalone
+/// `AtomicBool` the following interleaving is possible:
+///
+/// 1. registrar reads `closed == false`;
+/// 2. listener terminates and clears the map;
+/// 3. registrar inserts its waiter into the now-dead map.
+///
+/// The waiter would then hang until timeout. Keeping the flag under the same
+/// mutex as the map makes the two operations mutually exclusive.
+struct Waiters {
+    /// Set to `true` when the listener has terminated (or the dispatcher dropped).
+    closed: bool,
+    /// `message_id` -> one-shot reply channel.
+    map: HashMap<[u8; 16], ClaimSender>,
+}
+
+impl Waiters {
+    fn new() -> Self {
+        Self { closed: false, map: HashMap::new() }
+    }
+
+    /// Terminates the state: rejects future registrations and fails all pending
+    /// waiters. Idempotent — safe to call from both the listener task and `Drop`.
+    fn close(&mut self) {
+        self.closed = true;
+        // Dropping the `ClaimSender`s resolves every pending `ClaimReceiver`
+        // with `RecvError`, which the caller maps to `ConnectionClosed`.
+        self.map.clear();
+    }
+}
+
+// ============================================================================
+// WaiterGuard
+// ============================================================================
+
+/// RAII guard for managing the lifetime of a response wait.
+///
+/// Registers a `ClaimSender` in the waiters map on creation and removes it on
+/// destruction (normal scope exit, cancellation or panic), preventing leaks.
+///
+/// Holds a direct `Arc` to the shared state rather than to the whole dispatcher:
+/// this avoids the need for `Clone` on `ReplyDispatcher` and prevents premature
+/// termination of the background task.
 pub struct WaiterGuard {
     /// Reference to the waiters map for cleanup upon drop.
-    waiters: Arc<Mutex<HashMap<[u8; 16], oneshot::Sender<Message>>>>,
+    waiters: Arc<Mutex<Waiters>>,
     /// The message identifier for which a response is expected.
     message_id: [u8; 16],
 }
+
 
 impl WaiterGuard {
     /// Creates a new guard and registers the response wait.
@@ -66,24 +112,25 @@ impl WaiterGuard {
     /// # Returns
     /// A tuple containing the created `WaiterGuard` and an `oneshot::Receiver` to receive the response.
     pub fn new(
-        waiters: Arc<Mutex<HashMap<[u8; 16], oneshot::Sender<Message>>>>,
+        waiters: Arc<Mutex<Waiters>>,
         message_id: [u8; 16],
-    ) -> Result<(Self, oneshot::Receiver<Message>), RegistryError> {
-        let (tx, rx) = oneshot::channel();
-        let mut map = waiters.lock();
+    ) -> Result<(Self, ClaimReceiver), RegistryError> {
+        let mut state = waiters.lock();
 
-        tracing::debug!("WaiterGuard new");
-        
-        // Protection against duplicate registrations (unlikely with correct UUID generation, but necessary)
-		if map.contains_key(&message_id) {
+        if state.closed {
+            return Err(RegistryError::ReplyDispatcherClosed);
+        }        
+        if state.map.contains_key(&message_id) {
             return Err(RegistryError::WaiterAlreadyExists);
         }
+
+        let (tx, rx) = create_request_token();
+        state.map.insert(message_id, tx);
+        drop(state);
+
+        tracing::trace!("WaiterGuard registered");
         
-        map.insert(message_id, tx);
-        Ok((Self { 
-            waiters: waiters.clone(),
-            message_id,
-        }, rx))
+        Ok((Self { waiters, message_id }, rx))
     }
 }
 
@@ -91,7 +138,7 @@ impl Drop for WaiterGuard {
     /// Automatically removes the wait from the dispatcher when the guard is destroyed.
     fn drop(&mut self) {
         tracing::debug!("WaiterGuard drop");
-        self.waiters.lock().remove(&self.message_id);
+        self.waiters.lock().map.remove(&self.message_id);
     }
 }
 
@@ -105,11 +152,14 @@ impl Drop for WaiterGuard {
 pub struct ReplyDispatcher {
     /// Map of pending requests: `message_id` -> `oneshot::Sender`.
     /// Uses `parking_lot::Mutex` for high performance during short locks.
-    waiters: Arc<Mutex<HashMap<[u8; 16], oneshot::Sender<Message>>>>,
+    waiters: Arc<Mutex<Waiters>>,
     
     /// Background task that reads responses from the shared wildcard channel and distributes them.
     /// Stored directly (without Arc) to emphasize exclusive ownership and correct Drop behavior.
     listener_task: JoinHandle<()>,
+
+    /// Reply address, kept for diagnostics after the subscriber is moved out.
+    address: String,    
 }
 
 impl ReplyDispatcher {
@@ -121,69 +171,133 @@ impl ReplyDispatcher {
     ///   when the task is aborted, `subscriber` goes out of scope and is destroyed,
     ///   which triggers its `Drop` and automatically cancels the address registration in the registry.
     pub(crate) fn new(mut subscriber: Subscriber) -> Self {
-        let waiters: Arc<Mutex<HashMap<[u8; 16], oneshot::Sender<Message>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let waiters_clone = waiters.clone(); 
 
-        tracing::debug!("ReplyDispatcher new: {}", subscriber.address());
+        let waiters = Arc::new(Mutex::new(Waiters::new()));
+        let waiters_for_task = Arc::clone(&waiters);
+        let address = subscriber.address().to_string(); 
+        let address_for_task = address.clone(); 
+
+        tracing::debug!(address = %address, "ReplyDispatcher new");
 
         // Background task that runs for the entire lifetime of the dispatcher
         let listener_task = tokio::spawn(async move {
-    
-            tracing::debug!("ReplyDispatcher start task: {}", subscriber.address());
+            tracing::debug!(address = %address_for_task, "ReplyDispatcher listener started");
+
             // Read messages from the channel until it is closed
-            while let Some(response) = subscriber.recv().await {
-                let msg_id = response.header.message_id;
-                let mut map = waiters_clone.lock();
-                
-                // Extract the sender and remove it from the map (one-time use)
-                let sender = map.remove(&msg_id);
-                if let Some(sender) = sender {
-                    // Ignore send error if the receiver has already been destroyed (client-side timeout)
-                    let _ = sender.send(response);    
+            loop {
+            //while let Some(response) = subscriber.recv().await {
+                let response = match subscriber.recv().await {
+                    Ok(response) => response,
+                    Err(RecvError::Detached) => {
+                        tracing::debug!(
+                            address = %address_for_task,
+                            "Reply binding detached, listener stopping"
+                        );
+                        break;
+                    }
+                    Err(RecvError::AddressRemoved) => {
+                        tracing::warn!(
+                            address = %address_for_task,
+                            "Reply address removed by control plane, listener stopping"
+                        );
+                        break;
+                    }                    
+                    Err(RecvError::GroupClosed) | Err(RecvError::ChannelClosed) => {
+                        tracing::error!(
+                            address = %address_for_task,
+                            "Reply source lost unexpectedly, listener stopping"
+                        );
+                        break;
+                    }
                 };
+
+                let msg_id = response.header.message_id;
+
+                // Take the sender under the lock, deliver outside of it.
+                let sender = waiters_for_task.lock().map.remove(&msg_id);
+                
+                match sender {
+                    Some(tx) => {
+                        // Ignore the error: the receiver may already be
+                        // gone (client-side timeout / cancelled request).
+                        let _ = tx.send(response);
+                    }
+                    None => {
+                        // Late reply after a timeout, or an unsolicited
+                        // response. Not an error — just an observable event.
+                        tracing::debug!(
+                            address = %address_for_task,
+                            "Reply with no pending waiter (late or unsolicited)"
+                        );
+                    }
+                }
+                
             }
-            tracing::debug!("ReplyDispatcher end task: {}", subscriber.address());
+
+            // Fail-fast: no response can arrive anymore. Resolve every pending
+            // waiter immediately and reject subsequent registrations.
+            waiters_for_task.lock().close();
+
+            tracing::debug!(address = %address_for_task, "ReplyDispatcher listener stopped");
         });
 
-        Self {
-            waiters,
-            listener_task,
+        Self { 
+            waiters, 
+            listener_task, 
+            address 
         }
     }
 
     /// Registers a new request awaiting a response.
-    pub fn register_waiter(&self, message_id: [u8; 16]) -> Result<(WaiterGuard, oneshot::Receiver<Message>), RegistryError> {
+    ///
+    /// Returns `ReplyDispatcherClosed` if the listener has already terminated —
+    /// the caller fails fast instead of waiting for `request_timeout_ms`.
+    pub fn register_waiter(
+        &self, 
+        message_id: [u8; 16]
+    ) -> Result<(WaiterGuard, ClaimReceiver), RegistryError> {
          WaiterGuard::new(self.waiters.clone(), message_id)
     }
 
     /// Removes the response wait by `message_id`.
-    /// Usually called automatically via the `Drop` implementation of `WaiterGuard`.
-    /// but the method is left public for cases of explicit cleanup, should it be needed.
+    ///
+    /// Usually invoked automatically by `WaiterGuard::drop`; kept public for
+    /// explicit cleanup scenarios.
     pub fn remove_waiter(&self, message_id: &[u8; 16]) {
-        self.waiters.lock().remove(message_id);
+        self.waiters.lock().map.remove(message_id);
+    }
+
+    /// Whether the listener has terminated and no further replies can arrive.
+    pub fn is_closed(&self) -> bool {
+        self.waiters.lock().closed
+    }    
+
+    /// Number of currently pending response waits (metrics / diagnostics).
+    pub fn pending_count(&self) -> usize {
+        self.waiters.lock().map.len()
+    }
+
+    /// Reply address this dispatcher serves.
+    pub fn address(&self) -> &str {
+        &self.address
     }
 }
 
 impl Drop for ReplyDispatcher {
     fn drop(&mut self) {
-        // CRITICAL RAII MECHANISM:
-        // 1. Cancel the Tokio background task.
-        //    IMPORTANT: abort() only marks the task for cancellation. The actual destruction
-        //    of captured variables (including `subscriber` and the call to its `Drop` with `unregister`)
-        //    will occur asynchronously, when the Tokio scheduler next processes this task.
+        tracing::debug!(address = %self.address, "ReplyDispatcher drop");
+
+        // 1. Synchronous fail-fast BEFORE aborting.
+        //    `abort()` only marks the task for cancellation; its captured state is
+        //    released asynchronously, when the scheduler next polls it. Clearing
+        //    here guarantees that all hung `ClaimReceiver`s resolve immediately,
+        //    without depending on scheduler timing.
         //
-        // 2. To avoid a race condition when rapidly recreating a client with the same address,
-        //    synchronous cleanup of the address (`registry.unregister`) must be performed
-        //    by the dispatcher owner (e.g., in the `Drop` implementation for `BrokerClient`).
-        //
-        // 3. Immediately clear the pending responses map. This guarantees fail-fast behavior:
-        //    all hung `oneshot::Receiver`s will immediately receive a `RecvError`,
-        //    allowing the client to correctly handle connection breakage (e.g.,
-        //    transforming it into a `TransportError::ConnectionClosed`), without waiting
-        //    for asynchronous completion of the background task and release of the `subscriber`.
-        tracing::debug!("ReplyDispatcher drop");
+        //    Note: this does NOT unregister the address — that is the responsibility
+        //    of the subscription guard / control plane, not of the dispatcher.
+        self.waiters.lock().close();
+
+        // 2. Stop the background task.
         self.listener_task.abort();
-        self.waiters.lock().clear();
     }
 }

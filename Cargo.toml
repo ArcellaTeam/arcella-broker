@@ -16,22 +16,31 @@ path = "src/lib.rs"
 [[bin]]
 name = "arcella-broker"
 path = "src/bin/arcella-broker.rs"
-required-features = ["server"]
+required-features = ["bin"]
 
 [dependencies]
 anyhow = "1"
 arc-swap = "1.9"
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive"] }
+crc32fast = "1.5"
+futures = "0.3.34"
+getrandom = "0.4"
 iradix = "0.3"
-parking_lot = "0.12"
+parking_lot = "0.13"
 serde = { version = "1", features = ["derive"] }
-thiserror = "2.0.20"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54", features = ["signal", "rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "serde"] }
 
+[dev-dependencies]
+tempfile = "3.27"
+
 [features]
-default = ["client"]
+default = ["client", "ipc", "server", "bin"]
 client = []
-server = ["client"] 
+ipc = ["tokio/net"]
+server = [] 
+bin = ["ipc", "server"] 

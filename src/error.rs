@@ -17,6 +17,9 @@ use crate::{
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BrokerError {
 
+    #[error("Invalid broker mode")]
+    InvalidMode(String),
+
     #[error("Channel is closed")]
     ChannelClosed(Message),
 

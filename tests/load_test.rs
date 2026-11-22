@@ -18,20 +18,35 @@ use arcella_broker::{
     broker::Broker,
     config::{ClientConfig, SubscriberConfig},
     protocol::{Message, TransferMode},
-    broker_core::registry::RoutingPolicy,
+    broker_core::registry::{AddressSpec, RoutingPolicy},
 };
 
 // ============================================================================
 // Test Configuration
 // ============================================================================
+#[cfg(debug_assertions)]
+const NUM_RECEIVERS: usize = 10;
+#[cfg(debug_assertions)]
+const NUM_SENDERS: usize = 10;
+#[cfg(debug_assertions)]
+const MESSAGES_PER_SENDER: usize = 10;
+
+#[cfg(not(debug_assertions))]
 const NUM_RECEIVERS: usize = 100;
+#[cfg(not(debug_assertions))]
 const NUM_SENDERS: usize = 100;
+#[cfg(not(debug_assertions))]
 const MESSAGES_PER_SENDER: usize = 1_000_000;
+
 const TOTAL_MESSAGES: usize = NUM_SENDERS * MESSAGES_PER_SENDER;
 
-fn init_tracing() {
+pub fn init_tracing() {
     // Attempt to read the logging level from RUST_LOG,
     // if not set, default to "info"
+    #[cfg(debug_assertions)]
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("trace"));
+    #[cfg(not(debug_assertions))]
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("error"));
 
@@ -50,25 +65,21 @@ async fn test_high_throughput_in_memory_routing() {
     init_tracing();
 
     // 1. Initialize config, broker and client
-    let broker_config = Broker::default_config();
-    let broker = Arc::new(Broker::new(broker_config));
+    let broker = Arc::new(Broker::default());
     let client_config = ClientConfig::default();
-    let recv_client = broker.client(client_config.clone(), "load:test".to_string()).unwrap();
-
-    let mut subscriber_config = SubscriberConfig::default()
-        .with_channel_capacity(4096)
-        .expect("Channel capacity 4096 should be valid");
-    subscriber_config.routing_policy = RoutingPolicy::Exclusive;
-    //subscriber_config.routing_policy = RoutingPolicy::LoadBalanced;
+    let recv_client = broker.create_client(client_config.clone(), "load:test".into()).unwrap();
 
     let mut receiver_addresses = Vec::with_capacity(NUM_RECEIVERS);
     let mut message_templates = Vec::with_capacity(NUM_RECEIVERS);    
         
     for i in 0..NUM_RECEIVERS {
-        let addr_str = format!("arcella:{}:perf:recv", i);
+        let addr_str = format!("arcella:{}:receiver", i);
         let addr_bytes = Bytes::from(addr_str.clone());
-        
-        receiver_addresses.push(addr_str);
+
+        receiver_addresses.push(addr_str.clone());
+
+        broker.create_address(addr_str, AddressSpec::exclusive(4096))
+            .expect("Failed to create address via Control Plane");
 
         let msg = Message::new(
             TransferMode::InOnly,
@@ -94,10 +105,7 @@ async fn test_high_throughput_in_memory_routing() {
         let addr = receiver_addresses[i].clone(); 
 
         let (mut subscriber, handle) = recv_client
-            .subscribe(
-                addr.clone(),
-                subscriber_config.clone(),
-            )
+            .subscribe(addr.clone())
             .expect("Failed to subscribe");
         subscriber_handles.push(handle);
 
@@ -107,7 +115,7 @@ async fn test_high_throughput_in_memory_routing() {
 
             let mut count = 0;
             // The loop will terminate when the channel is closed (all senders dropped)
-            while let Some(_msg) = subscriber.recv().await {
+            while let Ok(_msg) = subscriber.recv().await {
                 count += 1;
             }
             tracing::trace!("Test receiver: stop task on {}", addr.clone());
@@ -121,16 +129,16 @@ async fn test_high_throughput_in_memory_routing() {
     
     for sender_id in 0..NUM_SENDERS {
         let target_idx = (sender_id + 50) % NUM_RECEIVERS;
-        let addr_str = format!("arcella:{}:perf:recv", target_idx);
+        let addr_str = format!("arcella:{}:receiver", target_idx);
 
         let broker = Arc::clone(&broker);
         let client_config = client_config.clone();
         let base_msg = message_templates[target_idx].clone();        
 
         sender_task_handles.spawn(async move {
-            let sender_addr = format!("arcella:load:test:{}", sender_id);
+            let sender_addr = format!("arcella:{}:sender", sender_id);
             tracing::trace!("Test sender: start task on {}", sender_addr);
-            let client = broker.client(client_config.clone(), sender_addr.clone()).unwrap();
+            let client = broker.create_client(client_config.clone(), sender_addr.clone()).unwrap();
 
             // The Publisher is created ONCE per task, which activates and tests its internal cache
             let publisher = client.publisher(addr_str.clone());

@@ -38,9 +38,8 @@ use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 
 use crate::{
     broker_core::transport::{
-        Endpoint,
+        InMemoryTransport,
         ResolvedEndpoint,
-        Transport,
         TransportError,
         TransportResult
     },
@@ -62,16 +61,13 @@ use super::ReplyDispatcher;
 /// occur orders of magnitude more frequently than write operations (cache updates on failure
 /// or first address resolution), and `parking_lot` minimizes
 /// locking overhead in a multi-threaded environment.
-pub struct Publisher<T, E>
-where
-    T: Transport<E>,
-    E: Endpoint,
+pub struct Publisher
 {
     /// The target logical address of the recipient (e.g., "arcella:core:users").
     address: String,
 
     /// A reference to the transport layer used for address resolution and sending.
-    transport: Arc<T>,
+    transport: Arc<InMemoryTransport>,
 
     /// Address of the reply queue (copied from `BrokerClient`).
     /// Used for InOut (Request-Reply) mode to guarantee
@@ -90,13 +86,10 @@ where
 
     /// Cache of the resolved endpoint. `None` means the address has not yet been resolved
     /// or the cache was forcibly invalidated due to a delivery error.
-    cached_endpoint: RwLock<Option<ResolvedEndpoint<E>>>,
+    cached_endpoint: RwLock<Option<ResolvedEndpoint>>,
 }
 
-impl<T, E> Publisher<T, E>
-where
-    T: Transport<E>,
-    E: Endpoint,
+impl Publisher
 {
     /// Creates a new `Publisher` instance for the specified address and transport.
     ///
@@ -104,7 +97,7 @@ where
     /// initiates the "cold path" with full address resolution.
     pub(crate) fn new(
         address: String, 
-        transport: Arc<T>, 
+        transport: Arc<InMemoryTransport>, 
         reply_address: String, 
         reply_dispatcher: Arc<ReplyDispatcher>,
         broker_config: Arc<BrokerConfig>,
@@ -136,7 +129,7 @@ where
     ///
     /// This pattern guarantees the absence of data races when a single `Publisher`
     /// is used concurrently from multiple tasks (e.g., when scaling replicas).
-    async fn get_or_resolve_endpoint(&self) -> TransportResult<ResolvedEndpoint<E>> {
+    async fn get_or_resolve_endpoint(&self) -> TransportResult<ResolvedEndpoint> {
         // 1. Fast endpoint check (read without write lock)
         {
             let guard = self.cached_endpoint.read();

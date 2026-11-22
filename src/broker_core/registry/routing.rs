@@ -12,12 +12,12 @@ use std::sync::{
     Arc,
     Weak,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::protocol::Message;
 
 use super::LocalRegistry;
 use super::super::transport::{
-    MessageReceiver,
     RequestSender,
     TransportError, 
 };
@@ -28,8 +28,16 @@ use super::SubscriptionSlot;
 /// Message Delivery Policy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoutingPolicy {
-    Exclusive,      // Only one subscriber
-    LoadBalanced,   // Round-Robin between subscribers
+    /// Exclusive binding: one consumer per address.
+    Exclusive,
+
+    /// LoadBalanced group: Round-Robin between consumers.
+    /// `claim_capacity` — capacity of the pull-request channel (how many
+    /// consumers can simultaneously wait for a message).
+    LoadBalanced {
+        claim_capacity: usize,
+    },
+    
     //Broadcast,      // Fan-out to all subscribers
 }
 
@@ -49,14 +57,12 @@ impl RouteTarget {
     /// Creates a routing target for a LoadBalanced group.
     pub fn new_load_balanced(
         slot: Arc<SubscriptionSlot>,
-        main_receiver: MessageReceiver,
         req_channel_capacity: usize,
         registry: Weak<LocalRegistry>,
         address: String,
     ) -> Arc<Self> {
         Arc::new(Self::LoadBalanced(LoadBalancedGroup::new(
             slot,
-            main_receiver,
             req_channel_capacity,
             registry,
             address,
@@ -85,6 +91,24 @@ impl RouteTarget {
             //Self::Broadcast(group) => group.send(message).await,
         }
     }
+
+    /// Removes this target from the registry (control plane operation).
+    /// 
+    /// For **Single**: marks the slot as removed, invalidating cached endpoints.
+    /// For **LoadBalanced**: shuts down the dispatcher group, which stops the
+    /// background task and marks the slot as removed.
+    /// 
+    /// This method is idempotent and safe to call multiple times.
+    pub(crate) fn remove_self(&self) {
+        match self {
+            Self::Single(slot) => {
+                slot.mark_removed();
+            }
+            Self::LoadBalanced(group) => {
+                group.shutdown();
+            }
+        }
+    }    
 
     pub fn remove_slot(&self, slot: &Arc<SubscriptionSlot>) -> bool {
         tracing::debug!("RouteTarget remove_slot");
@@ -126,6 +150,14 @@ impl RouteTarget {
             _ => None,
         }
     }            
+
+    // Return address token
+    pub fn address_token(&self) -> Option<&CancellationToken> {
+        match self {
+            RouteTarget::Single(slot) => Some(slot.address_token()),
+            RouteTarget::LoadBalanced(group) => Some(group.address_token()),
+        }
+    }
 
     /// Unique version for cache protection (TOCTOU).
     pub fn version(&self) -> u64 {

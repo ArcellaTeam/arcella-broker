@@ -45,9 +45,9 @@ pub mod client;
 
 /// Server-side components for handling incoming connections (IPC/Network).
 #[cfg(feature = "server")]
-pub(crate) mod server;
+pub mod server;
 
 /// Utility functions and helpers for testing the broker.
 #[allow(missing_docs)]
 #[cfg(test)]
-mod test_utils;
+pub mod test_utils;
