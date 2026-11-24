@@ -21,7 +21,16 @@ mod tests {
         IngressBridge,
         registry::LocalRegistry,
         security::{HandshakeHandler, SessionManager, ClientSessionContext},
-        transport::{IPCConnector, IPCFramedStream, IPCEndpoint, UdsConnector, TransportError},
+        transport::{
+            EndpointStateAccess,
+            EndpointStateExt,
+            EndpointWriterExt,
+            IPCConnector, 
+            IPCFramedStream, 
+            IPCEndpoint, 
+            UdsConnector, 
+            TransportError
+        },
     };
     use crate::config::ServerConfig;
     use crate::protocol::{

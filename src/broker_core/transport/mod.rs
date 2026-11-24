@@ -71,6 +71,11 @@ mod ipc;
 
 #[cfg(all(feature = "ipc", unix))]
 pub use ipc::{
+    EndpointStateAccess,
+    FrameSender,
+    EndpointStateExt,
+    EndpointWriter,
+    EndpointWriterExt,
     IPCConnector,
     IPCEndpoint,
     IPCFramedStream,

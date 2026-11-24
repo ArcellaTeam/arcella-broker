@@ -22,7 +22,14 @@ use crate::broker_core::security::{
     ServerSessionContext, 
     SessionManager
 };
-use crate::broker_core::transport::{IPCEndpoint, IPCFramedStream, TransportError, create_channel};
+use crate::broker_core::transport::{
+    EndpointStateExt,
+    EndpointWriterExt,
+    IPCEndpoint, 
+    IPCFramedStream, 
+    TransportError, 
+    create_channel
+};
 use crate::protocol::{
     Frame, FrameType,
     ProtocolError,

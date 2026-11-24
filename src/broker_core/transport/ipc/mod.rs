@@ -13,7 +13,14 @@ mod transport;
 pub mod uds;
 
 pub use connector::IPCConnector;
-pub use endpoint::IPCEndpoint;
+pub use endpoint::{
+    EndpointStateAccess,
+    FrameSender,
+    EndpointStateExt,
+    EndpointWriter,
+    EndpointWriterExt,
+    IPCEndpoint
+};
 pub use transport::IPCFramedStream;
 pub use uds::UdsConnector;
 

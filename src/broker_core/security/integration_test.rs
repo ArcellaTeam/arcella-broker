@@ -35,7 +35,15 @@ mod handshake_tests {
     };
     use super::super::super::{
         l2::SessionState,
-        transport::{IPCConnector, IPCEndpoint, IPCFramedStream, UdsConnector},
+        transport::{
+            EndpointStateAccess,
+            EndpointStateExt,
+            EndpointWriterExt,
+            IPCConnector, 
+            IPCEndpoint, 
+            IPCFramedStream, 
+            UdsConnector
+        },
     };
     use super::super::{
         SessionContext,
