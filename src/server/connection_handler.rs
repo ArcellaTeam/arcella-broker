@@ -122,13 +122,6 @@ where
     let slot = SubscriptionSlot::new(10, slot_token); // TODO: need to remove magic
     let target = RouteTarget::new_exclusive(slot.clone());
 
-    if let Err(e) = local_registry.register(source_prefix, target) {
-        // Failed before Phase 2 — remove the session now so we don't
-        // accumulate phantom sessions on repeated handshake failures.
-        session_manager.remove_session(session_ctx.session_id());
-        return Err(TransportError::Registry(e));
-    }
-
     // === Phase 2: Supervisor ===
     let result = run_connection_supervisor(
         endpoint,
