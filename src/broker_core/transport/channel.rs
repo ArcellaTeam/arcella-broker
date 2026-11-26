@@ -409,35 +409,35 @@ impl RequestSender {
 // Factories
 // ============================================================================
 
-/// Creates a new linked sender-receiver pair with the given capacity.
+/// Creates a typed sender-receiver pair with the given capacity.
 ///
-/// The capacity (capacity) is strictly controlled by the broker configuration
-/// (SubscriberConfig or ClientConfig) to prevent exhaustion of
-/// system memory and ensure predictable backpressure.
+/// Generic analogue of [`create_channel`] / [`create_request_channel`] for
+/// payloads that are not broker `Message`s. The IPC layer uses this to build
+/// bounded queues for control commands ([`ControlCommand`](crate::broker_core::transport::ipc::ControlCommand))
+/// and liveness replies without exposing `tokio::sync::mpsc` outside this
+/// module.
 ///
-/// # Example
-/// ```rust
-/// use tokio_util::sync::CancellationToken;
-/// use arcella_broker::broker_core::transport::create_channel;
-/// 
-/// // Creating a channel with a capacity of 1024 messages 
-/// let cancel_token = CancellationToken::new();
-/// let (sender, mut receiver) = create_channel(1024, cancel_token); 
-/// 
-/// assert_eq!(sender.load().max_capacity, 1024); 
-/// assert!(!sender.is_closed()); 
-/// ```
-pub fn create_channel(capacity: usize, cancel_token: CancellationToken) -> (MessageSender, MessageReceiver) {
-    let (tx, rx) = mpsc::channel::<Message>(capacity);
-    (MessageSender::new(tx), MessageReceiver::new(rx, cancel_token))
+/// # Cancellation
+///
+/// The receiver observes `cancel_token`, so [`Receiver::recv`] wakes on
+/// shutdown instead of hanging on an empty queue.
+pub fn create_generic_channel<T: Send>(
+    capacity: usize,
+    cancel_token: CancellationToken,
+) -> (Sender<T>, Receiver<T>) {
+    let (tx, rx) = mpsc::channel::<T>(capacity);
+    (Sender::new(tx), Receiver::new(rx, cancel_token))
+}
+
+/// Creates a new linked sender-receiver pair for message with the given capacity.
+pub fn create_message_channel(capacity: usize, cancel_token: CancellationToken) -> (MessageSender, MessageReceiver) {
+   create_generic_channel(capacity, cancel_token)
 }
 
 /// Creates a new linked sender-receiver pair for request routing with the given capacity.
 pub fn create_request_channel(capacity: usize, cancel_token: CancellationToken) -> (RequestSender, RequestReceiver) {
-    let (tx, rx) = mpsc::channel::<ClaimSender>(capacity);
-    (RequestSender::new(tx), RequestReceiver::new(rx, cancel_token))
+    create_generic_channel(capacity, cancel_token)
 }
-
 
 /// Creates a new linked sender-receiver pair for request routing with the given capacity.
 pub fn create_request_token() -> (ClaimSender, ClaimReceiver) {

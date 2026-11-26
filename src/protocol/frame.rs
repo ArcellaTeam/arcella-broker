@@ -683,21 +683,34 @@ impl Frame {
 // Helper functions
 // ============================================================================
 
-/// Helper to build a standardized Error frame.
-/// Format: error_code (u16 LE) + message_length (u16 LE) + message (UTF-8)
-pub fn build_error_frame(code: u16, message: &str) -> Frame {
-    let mut payload = BytesMut::with_capacity(4 + message.len());
-    payload.put_u16_le(code);
-    payload.put_u16_le(message.len() as u16);
-    payload.put_slice(message.as_bytes());
-    Frame::new(FrameType::Error as u8, payload.freeze())
-}
-
 /// Creates an Acknowledge frame payload for the given sequence number.
 pub fn create_ack_frame(sequence: u64) -> Frame {
     let mut payload = BytesMut::with_capacity(8);
     payload.put_u64_le(sequence);
     Frame::new(FrameType::Acknowledge as u8, payload.freeze())
+}
+
+/// Creates a Drop frame (0x04) with payload: `sequence: u64 LE` + `reason: u8`.
+///
+/// Layout per L2 spec §7.5. The `reason` codes are:
+///   * `0` = `ttl_expired`
+///   * `1` = `buffer_overflow`
+///   * `2` = `address_removed`
+pub fn create_drop_frame(sequence: u64, reason: u8) -> Frame {
+    let mut payload = BytesMut::with_capacity(9);
+    payload.put_u64_le(sequence);
+    payload.put_u8(reason);
+    Frame::new(FrameType::Drop as u8, payload.freeze())
+}
+
+/// Creates an Error frame payload
+/// Format: error_code (u16 LE) + message_length (u16 LE) + message (UTF-8)
+pub fn create_error_frame(code: u16, message: &str) -> Frame {
+    let mut payload = BytesMut::with_capacity(4 + message.len());
+    payload.put_u16_le(code);
+    payload.put_u16_le(message.len() as u16);
+    payload.put_slice(message.as_bytes());
+    Frame::new(FrameType::Error as u8, payload.freeze())
 }
 
 #[cfg(test)]

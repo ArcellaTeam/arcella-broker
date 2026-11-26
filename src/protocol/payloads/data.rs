@@ -92,6 +92,7 @@ use thiserror::Error;
 use super::super::{
     Message,
     MAX_ADDRESS_LEN,
+    MAX_DATA_MESSAGES,
 };
 use super::PayloadError;
 
@@ -116,6 +117,10 @@ pub enum DataPayloadError {
     /// Not enough data to read the message count field.
     #[error("Not enough data to read the message count")]
     IncompleteMessageCount,
+
+    /// More messages than the u16 `message_count` field can represent.
+    #[error("Message count ({0}) exceeds the u16 limit 65535")]
+    TooManyMessages(usize),    
 }
 
 // =========================================================
@@ -142,7 +147,7 @@ pub enum DataPayloadError {
 ///
 /// ```rust,ignore
 /// let payload = DataPayload::new(
-///     session.next_sequence(),
+///     session.assign_sequence().unwrap().commit(),
 ///     Bytes::from("worker:1"),
 ///     vec![msg1, msg2],
 /// );
@@ -182,66 +187,65 @@ impl<'a> DataPayload<'a> {
         }
     }
 
-    /// Encodes the `DataPayload` into the binary format expected by the L2 protocol.
+    /// Pre-flight validation. MUST be called **before** assigning `session_sequence`.
     ///
-    /// # Binary Format
-    ///
-    /// ```text
-    /// - session_sequence: u64 LE
-    /// - address_length: u16 LE
-    /// - address: [u8; address_length]
-    /// - message_count: u16 LE
-    /// - messages: [Message; message_count]
-    /// ```
+    /// Checks every condition that can make encoding fail, so that the subsequent
+    /// [`encode_validated`](Self::encode_validated) call is infallible (L2 §13.3:
+    /// validation errors are legal rejections only *before* sequence assignment).
     ///
     /// # Returns
     ///
-    /// `Bytes` with the encoded payload, ready to be inserted into a Frame.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PayloadError::Data`] wrapping a [`DataPayloadError::AddressTooLong`]
-    /// if the address exceeds the maximum allowed length.
-    ///
-    /// # Performance
-    ///
-    /// The method pre-computes the exact size of the output buffer to avoid
-    /// reallocations during encoding. This is critical for the hot path.
-    pub fn encode(&self) -> Result<Bytes, PayloadError> {
+    /// The exact encoded payload size in bytes, usable both for a single-allocation
+    /// encode and for a `max_frame_size` check without touching the counter.
+    pub fn validate(&self) -> Result<usize, PayloadError> {
         if self.address.len() > MAX_ADDRESS_LEN {
             return Err(DataPayloadError::AddressTooLong(self.address.len()).into());
         }
-
-        // Precompute the exact size for a single allocation
-        let mut estimated_size = 8 // session_sequence (u64)
-            + 2 // address_length (u16)
-            + self.address.len()
-            + 2; // message_count (u16)
-
-        for msg in self.messages {
-            estimated_size += msg.size();
+        // Guard against silent truncation of the u16 message_count field.
+        if self.messages.len() > MAX_DATA_MESSAGES {
+            return Err(DataPayloadError::TooManyMessages(self.messages.len()).into());
         }
 
-        let mut buf = BytesMut::with_capacity(estimated_size);
+        let mut size = 8 // session_sequence
+            + 2 // address_length
+            + self.address.len()
+            + 2; // message_count
+        for msg in self.messages {
+            size += msg.size();
+        }
+        Ok(size)
+    } 
 
-        // 1. session_sequence (u64 LE)
+    /// Infallible encoding. The caller MUST have called [`validate`](Self::validate)
+    /// successfully beforehand; `session_sequence` may be patched in between.
+    ///
+    /// This split exists so that no error branch remains after the point of no return.
+    pub fn encode_validated(&self) -> Bytes {
+        debug_assert!(self.address.len() <= MAX_ADDRESS_LEN);
+        debug_assert!(self.messages.len() <= MAX_DATA_MESSAGES);
+
+        let mut buf = BytesMut::with_capacity(
+            8 + 2 + self.address.len() + 2 + self.messages.iter().map(Message::size).sum::<usize>(),
+        );
+
         buf.put_u64_le(self.session_sequence);
-
-        // 2. address_length (u16 LE) + address bytes
-        let address_len = self.address.len();
-        buf.put_u16_le(address_len as u16);
+        buf.put_u16_le(self.address.len() as u16);
         buf.put_slice(&self.address);
-
-        // 3. message_count (u16 LE)
-        let msg_len = self.messages.len();
-        buf.put_u16_le(msg_len as u16);
-
-        // 4. Serialize all messages
+        buf.put_u16_le(self.messages.len() as u16);
         for msg in self.messages {
             msg.encode(&mut buf);
         }
 
-        Ok(buf.freeze())
+        buf.freeze()
+    }       
+
+    /// Convenience: `validate()` + `encode_validated()`.
+    ///
+    /// Prefer the two-step form on the send path, where the sequence number must be
+    /// assigned strictly between validation and encoding.
+    pub fn encode(&self) -> Result<Bytes, PayloadError> {
+        self.validate()?;
+        Ok(self.encode_validated())
     }
 }
 
@@ -666,4 +670,18 @@ mod tests {
         // or a protocol error, but the L2 parser has done its job correctly
         assert!(msg_buf.remaining() > 0);
     }
+
+    #[test]
+    fn test_too_many_messages_rejected_before_encode() {
+        // u16 message_count must not silently truncate.
+        let msg = test_utils::dummy_in_only_message(
+            Bytes::from("t"), Bytes::from("x"), Bytes::from("y"),
+        );
+        let messages = vec![msg; MAX_DATA_MESSAGES + 1];
+        let payload = DataPayload::new(1, Bytes::from("x"), &messages);
+        assert!(matches!(
+            payload.validate().unwrap_err(),
+            PayloadError::Data(DataPayloadError::TooManyMessages(_))
+        ));
+    }    
 }

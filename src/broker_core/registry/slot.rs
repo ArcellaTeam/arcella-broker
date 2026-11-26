@@ -15,7 +15,7 @@ use std::sync::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use super::super::transport::{MessageSender, MessageReceiver, create_channel};
+use super::super::transport::{MessageSender, MessageReceiver, create_message_channel};
 
 pub struct SubscriptionSlot {
     /// Current sender. `None` means the subscription has been removed.
@@ -39,7 +39,7 @@ pub struct SubscriptionSlot {
 
 impl SubscriptionSlot {
     pub fn new(capacity: usize, address_token: CancellationToken) -> Arc<Self> {
-        let (sender, receiver) = create_channel(capacity, address_token.clone());
+        let (sender, receiver) = create_message_channel(capacity, address_token.clone());
         Arc::new(Self {
             sender: ArcSwap::from(Arc::new(Some(sender))),
             receiver: Arc::new(Mutex::new(receiver)),

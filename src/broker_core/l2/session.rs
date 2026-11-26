@@ -7,7 +7,7 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// State of the L2 Frame session.
 ///
@@ -55,8 +55,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// let session = SessionState::new(1);
 ///
 /// // Sender side: generate sequence numbers
-/// let seq1 = session.next_sequence(); // Returns 1, internal counter becomes 2
-/// let seq2 = session.next_sequence(); // Returns 2, internal counter becomes 3
+/// let seq1 = session.assign_sequence().unwrap().commit(); // Returns 1, internal counter becomes 2
+/// let seq2 = session.assign_sequence().unwrap().commit(); // Returns 2, internal counter becomes 3
 ///
 /// // Receiver side: track received sequences
 /// assert!(session.update_last_received(1)); // true: new sequence
@@ -80,6 +80,16 @@ pub struct SessionState {
     /// Updated by `update_last_received()` using `compare_exchange_weak`.
     /// Initialized to `initial_sequence - 1` to indicate "no frames received yet".
     last_received_sequence: AtomicU64,
+
+    /// Fatal latch for the outgoing direction (L2 spec §13.3).
+    ///
+    /// Once a sequence number has been assigned, the only legal outcome other than
+    /// a successful write is a fatal transport failure. This flag records that the
+    /// sequence space may contain a hole, so the connection MUST be torn down and
+    /// recovered via Resume, never reused.
+    ///
+    /// Set by `SequenceGuard::drop` when the guard is not committed.
+    broken: AtomicBool,
 }
 
 impl SessionState {
@@ -118,47 +128,27 @@ impl SessionState {
         Self {
             next_session_sequence: AtomicU64::new(initial_sequence),
             last_received_sequence: AtomicU64::new(initial_sequence.saturating_sub(1)),
+            broken: AtomicBool::new(false),
         }
     }
 
-    /// Generates and returns the next sequence number for an outgoing frame.
+    /// Assigns the next outgoing sequence number and returns a commit guard.
     ///
-    /// This method is called by the L2 sender (e.g., `IPCEndpoint::send_data`) before
-    /// encoding and transmitting a frame. The returned sequence number is embedded in
-    /// the frame payload and used by the receiver for acknowledgment and ordering.
-    ///
-    /// # Returns
-    ///
-    /// The next available sequence number (u64). The internal counter is atomically
-    /// incremented, so subsequent calls will return strictly increasing values.
-    ///
-    /// # Thread Safety
-    ///
-    /// This method is **lock-free** and safe to call concurrently from multiple tasks.
-    /// The `fetch_add` operation with `Ordering::Relaxed` guarantees that each call
-    /// receives a unique sequence number, even under high contention.
-    ///
-    /// # Overflow Behavior
-    ///
-    /// The sequence number is a `u64`, which provides ~18 quintillion unique values.
-    /// In practice, overflow is impossible within the lifetime of any realistic session.
-    /// If overflow were to occur, the counter would wrap around to `0`, which could
-    /// cause protocol errors (duplicate sequence numbers). This is an acceptable
-    /// trade-off for the performance benefits of using a simple atomic counter.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use arcella_broker::broker_core::l2::SessionState;
-    ///
-    /// let session = SessionState::new(1);
-    /// assert_eq!(session.next_sequence(), 1);
-    /// assert_eq!(session.next_sequence(), 2);
-    /// assert_eq!(session.next_sequence(), 3);
-    /// ```
+    /// Returns `None` if the session is already broken: a broken sequence space
+    /// must never be extended (L2 §13.3). This merges the "is sendable" check and
+    /// the assignment into a single operation, so no caller can slip a number in
+    /// between the check and the increment.
     #[inline]
-    pub fn next_sequence(&self) -> u64 {
-        self.next_session_sequence.fetch_add(1, Ordering::Relaxed)
+    pub fn assign_sequence(&self) -> Option<SequenceGuard<'_>> {
+        if self.is_broken() {
+            return None;
+        }
+        let sequence = self.next_session_sequence.fetch_add(1, Ordering::Relaxed);
+        Some(SequenceGuard {
+            session: self,
+            sequence,
+            committed: false,
+        })
     }
 
     /// Returns the next sequence number WITHOUT consuming it.
@@ -179,8 +169,8 @@ impl SessionState {
     /// assert_eq!(session.peek_next_sequence(), 1); // Still 1
     ///
     /// // next_sequence() consumes the number
-    /// assert_eq!(session.next_sequence(), 1); // Returns 1, counter becomes 2
-    /// assert_eq!(session.peek_next_sequence(), 2); // Now peek returns 2
+    /// assert_eq!(session.assign_sequence().unwrap().commit(), 1); // Returns 1, counter becomes 2
+    /// assert_eq!(session.assign_sequence().unwrap().commit(), 2); // Now peek returns 2
     /// ```
     #[inline]
     pub fn peek_next_sequence(&self) -> u64 {
@@ -281,7 +271,7 @@ impl SessionState {
     /// let session = SessionState::new(1);
     /// assert_eq!(session.current_send_sequence(), 1); // Next frame will be 1
     ///
-    /// session.next_sequence(); // Generates 1, counter becomes 2
+    /// session.assign_sequence().unwrap().commit(); // Generates 1, counter becomes 2
     /// assert_eq!(session.current_send_sequence(), 2); // Next frame will be 2
     /// ```
     #[inline]
@@ -321,5 +311,91 @@ impl SessionState {
     #[inline]
     pub fn last_received_sequence(&self) -> u64 {
         self.last_received_sequence.load(Ordering::Relaxed)
+    }
+
+    /// Marks the session as fatally broken: the sequence space may contain a hole.
+    ///
+    /// After this call every subsequent send MUST fail fast (before assigning a new
+    /// sequence number) and the connection MUST be closed.
+    #[inline]
+    pub fn mark_broken(&self) {
+        self.broken.store(true, Ordering::Release);
+    }
+
+    /// Returns `true` if the outgoing sequence space is no longer contiguous.
+    ///
+    /// Checked at the entry of every send path and may also be polled by the reader
+    /// task to trigger shutdown.
+    #[inline]
+    pub fn is_broken(&self) -> bool {
+        self.broken.load(Ordering::Acquire)
+    }    
+}
+
+/// Commit guard for an assigned `session_sequence` (L2 spec §13.3).
+///
+/// Dropping the guard without calling [`commit`](Self::commit) marks the session as
+/// broken. This makes cancellation of a send future *after* sequence assignment a
+/// fatal, observable event instead of a silent hole in the sequence space.
+///
+/// The guard deliberately does **not** roll the counter back: rolling back would
+/// allow a later frame to reuse a number that may already be on the wire.
+#[must_use = "dropping a SequenceGuard without commit() marks the session as broken"]
+#[derive(Debug)]
+pub struct SequenceGuard<'a> {
+    session: &'a SessionState,
+    sequence: u64,
+    committed: bool,
+}
+
+impl SequenceGuard<'_> {
+    /// The assigned sequence number, to be embedded into the frame payload.
+    #[inline]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Confirms that the frame has been successfully handed to the transport.
+    #[inline]
+    pub fn commit(mut self) -> u64 {
+        self.committed = true;
+        self.sequence
+    }
+}
+
+impl Drop for SequenceGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // No rollback: the number is burned. The only legal recovery is teardown.
+            self.session.mark_broken();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn committed_guard_keeps_session_usable() {
+        let s = SessionState::new(1);
+        let g = s.assign_sequence().unwrap();
+        assert_eq!(g.sequence(), 1);
+        assert_eq!(g.commit(), 1);
+        assert!(!s.is_broken());
+        assert_eq!(s.current_send_sequence(), 2);
+    }
+
+    #[test]
+    fn dropped_guard_breaks_session_without_rollback() {
+        let s = SessionState::new(1);
+        {
+            let g = s.assign_sequence().unwrap();
+            assert_eq!(g.sequence(), 1);
+            // Simulates cancellation / early return after assignment.
+        }
+        assert!(s.is_broken());
+        // The number is NOT rolled back.
+        assert_eq!(s.current_send_sequence(), 2);
     }
 }

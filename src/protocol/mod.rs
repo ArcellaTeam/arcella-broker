@@ -23,8 +23,9 @@ pub use frame::{
     FRAME_HEADER_SIZE, 
     FRAME_MAX_PAYLOAD_LENGTH, 
     FRAME_OVERHEAD,
-    build_error_frame,
     create_ack_frame,
+    create_drop_frame,
+    create_error_frame,
 };
 
 use message::{
@@ -62,6 +63,9 @@ pub const TRANSFER_MODE_MASK: u8 = 0x01;
 
 /// Shift for the transfer mode in the flags field
 pub const TRANSFER_MODE_SHIFT: u8 = 0;
+
+/// Maximum number of L3 messages coalesced into a single Data frame.
+pub const MAX_DATA_MESSAGES: usize = u16::MAX as usize;
 
 // ============================================================================
 // Protocol errors

@@ -42,7 +42,7 @@ mod integration_tests {
         let total_frames = 1000;
 
         for i in 0..total_frames {
-            let seq = session.next_sequence();
+            let seq = session.assign_sequence().unwrap().commit();            
             let payload_str = format!("payload_{}", i);
             let payload_bytes = Bytes::from(payload_str);
             let frame = create_data_frame(seq, Bytes::from(address), payload_bytes);

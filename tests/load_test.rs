@@ -45,7 +45,7 @@ pub fn init_tracing() {
     // if not set, default to "info"
     #[cfg(debug_assertions)]
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("trace"));
+        .unwrap_or_else(|_| EnvFilter::new("warn"));
     #[cfg(not(debug_assertions))]
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("error"));

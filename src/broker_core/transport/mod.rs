@@ -44,15 +44,18 @@ mod error;
 mod in_memory;
 
 pub use channel::{
-    create_channel, 
+    create_generic_channel,
+    create_message_channel, 
     create_request_channel,
     create_request_token, 
     ClaimSender,
     ClaimReceiver,
     MessageSender, 
-    MessageReceiver, 
+    MessageReceiver,
     RequestSender,
+    SendError, 
     TryRecvError,
+    TrySendError,
     TryRequestError,
 };
 pub use endpoint::ResolvedEndpoint;
@@ -71,8 +74,20 @@ mod ipc;
 
 #[cfg(all(feature = "ipc", unix))]
 pub use ipc::{
+    create_control_channel,
+    ControlCommand,
+    ControlRx,
+    ControlTx,
+    PongEcho,
+    EndpointStateAccess,
+    EndpointStateExt,
+    EndpointWriter,
+    EndpointWriterExt,
+    FrameSender,
     IPCConnector,
     IPCEndpoint,
+    IPCEndpointReader,
+    IPCEndpointWriter,
     IPCFramedStream,
     UdsConnector,
 };
