@@ -115,12 +115,11 @@ impl CreditGrantPayload {
         Self::new(session_sequence, address, Self::CREDIT_TYPE_COLD, amount)
     }
 
-    /// Encodes the CreditGrant payload into the binary wire format.
+    /// Pre-flight validation. MUST be called **before** assigning `session_sequence`.
     ///
-    /// # Errors
-    /// Returns `CreditGrantPayloadError::AddressTooLong` if the address
-    /// exceeds `MAX_CREDIT_GRANT_ADDRESS_LEN` (1024 bytes).
-    pub fn encode(&self) -> Result<Bytes, CreditGrantPayloadError> {
+    /// Returns the exact encoded size so the caller can also enforce `max_frame_size`
+    /// without consuming a sequence number.
+    pub fn validate(&self) -> Result<usize, CreditGrantPayloadError> {
         let addr_len = self.address.len();
         if addr_len > MAX_CREDIT_GRANT_ADDRESS_LEN {
             return Err(CreditGrantPayloadError::AddressTooLong {
@@ -128,15 +127,27 @@ impl CreditGrantPayload {
                 max: MAX_CREDIT_GRANT_ADDRESS_LEN,
             });
         }
+        Ok(8 + 2 + addr_len + 1 + 4)
+    } 
 
-        // Exact size: 8 (seq) + 2 (addr_len) + addr_len + 1 (type) + 4 (amount)
+    /// Infallible encoding; requires a successful [`validate`](Self::validate) first.
+    pub fn encode_validated(&self) -> Bytes {
+        debug_assert!(self.address.len() <= MAX_CREDIT_GRANT_ADDRESS_LEN);
+
+        let addr_len = self.address.len();
         let mut buf = BytesMut::with_capacity(8 + 2 + addr_len + 1 + 4);
         buf.put_u64_le(self.session_sequence);
         buf.put_u16_le(addr_len as u16);
         buf.put_slice(&self.address);
         buf.put_u8(self.credit_type);
         buf.put_u32_le(self.credit_amount);
-        Ok(buf.freeze())
+        buf.freeze()
+    }       
+
+    /// Convenience: `validate()` + `encode_validated()`.
+    pub fn encode(&self) -> Result<Bytes, CreditGrantPayloadError> {
+        self.validate()?;
+        Ok(self.encode_validated())
     }
 
     /// Decodes a CreditGrant payload from raw bytes.

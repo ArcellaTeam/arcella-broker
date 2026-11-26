@@ -58,6 +58,8 @@ use crate::protocol::{
 };
 use super::super::TransportError;
 
+pub const HANDSHAKE_MAX_PAYLOAD: u32 = 4096;
+
 // ============================================================================
 // IPCFrameReader — read-half of a framed IPC stream
 // ============================================================================
@@ -217,8 +219,10 @@ where
     ///
     /// # What happens inside
     ///
-    /// 1. **Codec instantiation**: A new [`FrameCodec`] is created with default
-    ///    settings (max payload = 16 MB, CRC32C verification enabled).
+    /// 1. **Codec instantiation**: A new [`FrameCodec`] is created with a restricted
+    ///    handshake payload limit (`HANDSHAKE_MAX_PAYLOAD`, 4 KB) to prevent memory
+    ///    exhaustion attacks before authentication is complete. The limit is later
+    ///    upgraded to the negotiated `max_frame_size` via [`set_max_payload_size`].
     /// 2. **Stream splitting**: The byte stream is split into read/write halves
     ///    using `tokio::io::split()`, enabling concurrent I/O.
     /// 3. **Framed wrappers**: Each half is wrapped in `FramedRead`/`FramedWrite`,
@@ -277,12 +281,25 @@ where
     /// - [`FrameCodec`] — The underlying codec responsible for binary encoding/decoding.
     /// - [`IPCConnector`] — The trait for establishing the initial byte stream connection.
     pub fn new(stream: S) -> Self {
-        let codec = FrameCodec::new();
+        let codec = FrameCodec::with_max_payload_size(HANDSHAKE_MAX_PAYLOAD);
         let (read_half, write_half) = split(stream);
         Self {
             reader: FramedRead::new(read_half, codec.clone()),
             writer: FramedWrite::new(write_half, codec),
         }
+    }
+
+    /// Aligns both codec halves with the negotiated payload ceiling.
+    ///
+    /// Must be called before any I/O. `FrameCodec` is stateless, so replacing it
+    /// while the read buffer is empty cannot lose partial frame state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_payload_size > FRAME_MAX_PAYLOAD_LENGTH` (the caller clamps).
+    pub fn set_max_payload_size(&mut self, max_payload_size: u32) {
+        *self.reader.decoder_mut() = FrameCodec::with_max_payload_size(max_payload_size);
+        *self.writer.encoder_mut() = FrameCodec::with_max_payload_size(max_payload_size);
     }
 
     /// Splits the stream into independent read and write halves.

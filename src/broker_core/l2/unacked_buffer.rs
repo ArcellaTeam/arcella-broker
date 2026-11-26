@@ -7,50 +7,196 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! Lock-based ring buffer for storing unacknowledged L2 frames.
+//! Bounded, sequence-ordered buffer of unacknowledged L2 Data frames.
 //!
-//! This module is a key component for implementing the client
-//! backpressure guarantee with O(1) memory consumption (Stage 5.2 of the specification). It ensures
-//! that the client physically cannot allocate memory beyond the `hot_credit` limit, even if
-//! the server "hangs" and does not send acknowledgments (`Acknowledge`).
+//! Guarantees O(1) memory per session: at most `capacity == hot_credit` frames
+//! are stored, which applies natural backpressure to L3 (L2 §8.4).
 //!
-//! # Architectural features
+//! # Why ordered storage instead of `sequence % capacity`
 //!
-//! - Uses a direct index (`sequence % capacity`) to access a slot, which
-//! provides the acknowledge operation in O(1) time without searching.
-//! - Uses `parking_lot::Mutex` to minimize contention. The critical section
-//! is extremely short (access to a single slot), so the locking overhead
-//! is negligible.
-//! - Performs no dynamic allocations (`Vec::with_capacity` is used only during
-//! initialization) on the hot path.
+//! `session_sequence` is shared by `Data` and `CreditGrant` (§13.1), but only
+//! `Data` occupies a slot. The sequence space is therefore **sparse**: with
+//! `hot_credit = 4` a session may legitimately hold `Data(1)` and `Data(6)`.
+//! A ring indexed by `sequence % capacity` assumes a dense space and fails in
+//! three ways:
+//!
+//! 1. `push` rejects a frame while the buffer is NOT full (index collision with
+//!    an older frame). The writer assigns the sequence number before `push`,
+//!    so this rejection lands *after* the point of no return and tears down a
+//!    healthy session (§13.3).
+//! 2. A cached `base_sequence` can become `None` while frames are still stored.
+//! 3. Scanning only `[base, base + capacity)` silently drops frames outside
+//!    that window, breaking Resume replay (§13.7).
+//!
+//! Ascending-order storage removes all three failure modes. `len` and
+//! `base_sequence` are **derived** from the queue, never cached.
+//!
+//! # Contract (L2 §13.3)
+//!
+//! `push` has exactly one rejection reachable in a correct session: *full*.
+//! There is a single pusher (the writer actor, `&mut self`), and
+//! `acknowledge`/`remove` only ever decrease the length. Therefore:
+//!
+//! ```text
+//! !is_full() observed before assign_sequence()  =>  push() cannot fail
+//! ```
+//!
+//! The writer performs that check before assigning a sequence number, so no
+//! non-fatal rejection can occur past the point of no return.
+//!
+//! # Complexity and memory
+//!
+//! | Operation | Cost |
+//! |-----------|------|
+//! | `push` | O(1), no allocation (capacity reserved once) |
+//! | `acknowledge`, in-order (common case on an ordered stream) | O(1) |
+//! | `acknowledge`, out-of-order | O(log n) search + O(n) shift, n <= hot_credit |
+//! | `base_sequence` | O(1) |
+//! | `get_unacked_frames` | O(n), already sorted |
+//!
+//! Retransmission must NOT go through `push`: a replayed frame keeps its
+//! original sequence and its slot (§13.6, §13.7).
 
 use parking_lot::Mutex;
+use std::collections::VecDeque;
+
 use crate::protocol::Frame;
 
-/// Slot in the ring buffer.
+// ============================================================================
+// Slot
+// ============================================================================
+
+/// A sent-but-unacknowledged Data frame.
+///
+/// Extension point: per-slot send timestamp (§13.6 retransmission timer) and
+/// the destination address (§7.4/§7.5 `seq -> address` mapping) belong here.
 #[derive(Debug)]
 struct Slot {
     sequence: u64,
     frame: Frame,
 }
 
+// ============================================================================
+// UnackedBufferInner
+// ============================================================================
+
+/// Locked state of the buffer.
+///
+/// # Invariants
+///
+/// Maintained by the methods below, never by the caller:
+///
+/// 1. `slots` is sorted by strictly ascending `sequence` — the writer assigns
+///    and pushes inside one critical section (§13.2).
+/// 2. `slots.len() <= capacity` — enforced by [`Self::try_push`], so the
+///    allocation performed in `with_capacity` is never exceeded.
+/// 3. The window head is `slots.front()`; the occupancy is `slots.len()`.
+///    Neither is cached: cached copies previously diverged from the contents
+///    whenever `CreditGrant` made the sequence space sparse.
 #[derive(Debug)]
 struct UnackedBufferInner {
-    slots: Vec<Option<Slot>>,
-    occupied_count: usize,
-    base_sequence: Option<u64>,
+    slots: VecDeque<Slot>,
 }
 
-/// Lock-based ring buffer for storing unacknowledged frames.
-/// 
-/// Uses direct indexing: slot index = `sequence % capacity`.
-/// This allows O(1) acknowledge operations without searching.
-/// 
+impl UnackedBufferInner {
+    /// Reserves the whole window up front; the hot path never reallocates.
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            slots: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    #[inline]
+    fn is_full(&self, capacity: usize) -> bool {
+        self.slots.len() >= capacity
+    }
+
+    /// Smallest stored sequence: everything below it has been acknowledged.
+    #[inline]
+    fn base_sequence(&self) -> Option<u64> {
+        self.slots.front().map(|s| s.sequence)
+    }
+
+    /// Appends a frame under an already assigned sequence number.
+    ///
+    /// `Full` is the only rejection reachable in a correct session; the writer
+    /// observes it via `is_full()` *before* assignment (§13.3). A non-monotonic
+    /// sequence is an implementation bug, reported as `SequenceTooOld`.
+    fn try_push(
+        &mut self,
+        sequence: u64,
+        frame: Frame,
+        capacity: usize,
+    ) -> Result<(), UnackedBufferError> {
+        if self.is_full(capacity) {
+            return Err(UnackedBufferError::SlotOccupied {
+                sequence,
+                index: capacity,
+            });
+        }
+
+        // Invariant 1: assignment and push form one critical section, so every
+        // pushed sequence strictly exceeds the newest stored one.
+        if let Some(newest) = self.slots.back() {
+            if sequence <= newest.sequence {
+                return Err(UnackedBufferError::SequenceTooOld {
+                    sequence,
+                    base_sequence: newest.sequence,
+                });
+            }
+        }
+
+        self.slots.push_back(Slot { sequence, frame });
+        Ok(())
+    }
+
+    /// Removes a frame by sequence number; idempotent.
+    fn remove(&mut self, sequence: u64) -> bool {
+        // Fast path: on an ordered stream Acks arrive in send order, so the
+        // acked frame is almost always at the head of the window.
+        if self.slots.front().is_some_and(|s| s.sequence == sequence) {
+            self.slots.pop_front();
+            return true;
+        }
+
+        // Out-of-order Ack (cold path holds an address while later frames are
+        // acked) or a duplicate: binary search over the sorted window.
+        match self.slots.binary_search_by_key(&sequence, |s| s.sequence) {
+            Ok(idx) => {
+                // Shifts the shorter side, at most floor(n / 2) slots.
+                self.slots.remove(idx);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+// ============================================================================
+// UnackedBuffer
+// ============================================================================
+
+/// Bounded buffer of unacknowledged frames, ordered by ascending `sequence`.
+///
+/// # Single-pusher invariant
+///
+/// Only the direction's serialization point (the writer) may call `push`.
+/// `acknowledge`/`remove` are safe to call concurrently from the reader task.
+///
 /// # Performance
-/// 
-/// Uses `parking_lot::Mutex` for minimal lock contention.
-/// The critical section is very short (single slot access),
-/// so lock overhead is negligible in practice.
+///
+/// `parking_lot::Mutex` guards a very short critical section. `capacity` is
+/// immutable and read without locking.
 #[derive(Debug)]
 pub struct UnackedBuffer {
     inner: Mutex<UnackedBufferInner>,
@@ -58,270 +204,156 @@ pub struct UnackedBuffer {
 }
 
 impl UnackedBuffer {
-    /// Creates a new ring buffer with the given capacity.
+    /// Creates a buffer with the given capacity.
     ///
-    /// # Arguments
+    /// * `capacity` — maximum number of stored frames, equal to `hot_credit`
+    ///   from `ServerLimits`. Must be greater than 0.
     ///
-    /// * capacity — the maximum number of frames the buffer can hold.
-    /// Must be strictly greater than 0 and is usually equal to the hot_credit value from ServerLimits.
-    /// 
     /// # Panics
-    /// 
+    ///
     /// Panics if `capacity` is 0.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "UnackedBuffer capacity must be > 0");
         
-        let mut slots = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            slots.push(None);
-        }
-
-        let inner = UnackedBufferInner {
-            slots,
-            occupied_count: 0,
-            base_sequence: None,
-        };
-        
         Self {
-            inner: Mutex::new(inner),
+            inner: Mutex::new(UnackedBufferInner::with_capacity(capacity)),
             capacity,
         }
     }
 
-    /// Pushes a frame into the buffer with the given sequence number.
+    /// Stores a frame under an already assigned sequence number.
     ///
-    /// # Arguments
+    /// # Contract
     ///
-    /// * `sequence` — monotonically increasing frame number within the session.
-    /// * `frame` — the frame itself to store.
-    /// 
-    /// # Return value
+    /// Called strictly after `assign_sequence()` and only by the writer.
+    /// Because the writer checks `is_full()` *before* assignment and is the
+    /// only pusher, `SlotOccupied` is unreachable here in a correct session
+    /// (L2 §13.3). It remains as a defensive guard, and any occurrence must be
+    /// treated as fatal by the caller.
     ///
-    /// * `Ok(())` if the frame was successfully placed into a free slot.
-    /// * `Err(UnackedBufferError::SlotOccupied)` if the target slot is already occupied.
-    /// This signals backpressure: the buffer is full, and the sender must
-    /// stop sending until an Acknowledge is received.
+    /// # Errors
+    ///
+    /// * `SlotOccupied` — buffer is full (backpressure).
+    /// * `SequenceTooOld` — non-monotonic push; an implementation bug.
     ///
     /// # Performance
     ///
-    /// O(1) in time. Performs no dynamic allocations.
+    /// O(1), no dynamic allocations.
     pub fn push(&self, sequence: u64, frame: Frame) -> Result<(), UnackedBufferError> {
-        let idx = (sequence % (self.capacity as u64)) as usize;
-        let mut inner = self.inner.lock();
-
-        if inner.slots[idx].is_some() {
-            return Err(UnackedBufferError::SlotOccupied { sequence, index: idx });
-        }
-        
-        inner.slots[idx] = Some(Slot { sequence, frame });
-        inner.occupied_count += 1;
-
-        // Update base_sequence only if the buffer was empty.
-        // Otherwise, base_sequence is already the minimum (we checked sequence > base above).
-        if inner.base_sequence.is_none() {
-            inner.base_sequence = Some(sequence);
-        }
-
-        Ok(())
+        self.inner.lock().try_push(sequence, frame, self.capacity)
     }
 
-    /// Acknowledges a frame with the given sequence number, removing it from the buffer.
-    /// 
-    /// # Return value
-    /// 
-    /// - `true` if the frame was found and removed.
-    /// - `false` if the slot was empty or the sequence number did not match.
+    /// Acknowledges a frame, removing it from the buffer.
+    ///
+    /// Returns `true` if the frame was found and removed, `false` for a
+    /// duplicate or unknown sequence (idempotent).
     #[inline]
     pub fn acknowledge(&self, sequence: u64) -> bool {
         self.remove(sequence)
     }
 
-    /// Removes a frame from the buffer by sequence number.
+    /// Removes a frame by sequence number.
     ///
-    /// # Returns
-    /// - `true` if the frame was found and removed.
-    /// - `false` if the slot is empty or the sequence does not match.
-    ///
-    /// # Return value
-    ///
-    /// * true if the frame was found and removed.
-    /// * false if the slot is empty or the sequence number does not match.
+    /// Returns `true` if the frame was found and removed.
     pub fn remove(&self, sequence: u64) -> bool {
-        let idx = (sequence % (self.capacity as u64)) as usize;
-        let mut inner = self.inner.lock();
-        
-        if let Some(slot) = &inner.slots[idx] {
-            if slot.sequence == sequence {
-                inner.slots[idx] = None;
-                inner.occupied_count -= 1;
-                
-                if inner.base_sequence == Some(sequence) {
-                    inner.base_sequence = Self::find_next_base_sequence_locked(&inner, sequence);
-                }
-
-                return true;
-            }
-        }
-
-        false
+        self.inner.lock().remove(sequence)
     } 
 
-    /// Returns all unacknowledged frames sorted by sequence
-    /// number in ascending order.
+    /// Returns all unacknowledged frames in ascending sequence order.
     ///
-    /// # Usage
-    ///
-    /// Used primarily during session recovery (the Resume operation),
-    /// when the client needs to resend frames that were sent
-    /// but did not receive acknowledgment from the server before the connection dropped.
+    /// Used by the retransmission timer and by Resume replay (§13.6, §13.7).
+    /// Every stored frame is returned regardless of how sparse the sequence
+    /// space is — `CreditGrant` gaps cannot hide a frame.
     ///
     /// # Performance
     ///
-    /// O(N), where N is the buffer capacity (`capacity`), since the method performs a linear
-    /// pass over the ring buffer to collect and sort the active frames.
+    /// O(n) over stored frames; no sorting pass is needed.
     pub fn get_unacked_frames(&self) -> Vec<(u64, Frame)> {
         let inner = self.inner.lock();
-        
-        if inner.occupied_count == 0 {
-            return Vec::new();
-        }
-        let mut unacked_frames = Vec::with_capacity(inner.occupied_count);
-        let start_sequence = match inner.base_sequence {
-            Some(seq) => seq,
-            None => return Vec::new(),
-        };
 
-        let capacity = inner.slots.len() as u64;
-        let end_sequence = start_sequence + capacity;
-
-        for seq in start_sequence..end_sequence {
-            let idx = (seq % capacity) as usize;
-
-            if let Some(slot) = &inner.slots[idx] {
-                if slot.sequence == seq {
-                    unacked_frames.push((slot.sequence, slot.frame.clone()));
-                }
-            }
-        }
-
-        unacked_frames
+        inner
+            .slots
+            .iter()
+            .map(|s| (s.sequence, s.frame.clone()))
+            .collect()
     }
 
-    /// Returns the smallest sequence number currently stored in the buffer.
+    /// Returns the smallest stored sequence number, or `None` if empty.
     ///
-    /// # Return value
-    ///
-    /// * `Some(u64)` — the "head" of the unacknowledged frame window. Any number below this
-    /// value has already been acknowledged and removed from the buffer.
-    /// * `None` — if the buffer is completely empty.
-    #[inline]
+    /// Any number below it has been acknowledged and removed.
     pub fn base_sequence(&self) -> Option<u64> {
-        let inner = self.inner.lock();
-        inner.base_sequence
+        self.inner.lock().base_sequence()
     }    
 
-    /// Returns the number of occupied slots.
-    #[inline]
+    /// Number of stored frames
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock();
-        inner.occupied_count
+        self.inner.lock().len()
     }
 
-    /// Returns `true` if the buffer is empty.
-    #[inline]
+    /// Returns `true` if no frames are stored.
     pub fn is_empty(&self) -> bool {
-        let inner = self.inner.lock();
-        inner.occupied_count == 0
+        self.inner.lock().is_empty()
     }
 
-    /// Returns true if the buffer has reached its maximum capacity.
+    /// Returns `true` if the buffer holds `capacity` frames.
     ///
-    /// # Performance
-    ///
-    /// O(1) operation, performs no allocations. Used for an instant
-    /// check of whether backpressure needs to be applied before attempting to send.
-    #[inline]
+    /// This is the authoritative pre-flight backpressure gate: the writer MUST
+    /// call it before `assign_sequence()` (L2 §13.3). O(1), no allocations.
     pub fn is_full(&self) -> bool {
-        let inner = self.inner.lock();
-        inner.occupied_count >= self.capacity
+        self.inner.lock().is_full(self.capacity)
     }    
 
-    /// Returns the maximum capacity of the buffer.
+    /// Maximum capacity, bound to `hot_credit` from `Welcome`.
     ///
-    /// This value is strictly bound to the `hot_credit` limit received from the server
-    /// in the `Welcome` packet, which guarantees O(1) memory consumption per session.
+    /// Immutable, therefore lock-free.
     #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
-
-    /// Internal helper method for finding the next valid
-    /// `base_sequence` number after removing the current one.
-    ///
-    /// # Arguments
-    ///
-    /// * `inner` — reference to the locked internal buffer state.
-    /// * `after_sequence` — the sequence number that was just removed.
-    ///
-    /// # Return value
-    ///
-    /// * `Some(u64)` — the new minimum sequence number in the buffer.
-    /// * `None` — if the buffer became completely empty after the removal.
-    fn find_next_base_sequence_locked(inner: &UnackedBufferInner, after_sequence: u64) -> Option<u64> {
-        if inner.occupied_count == 0 {
-            return None;
-        }
-
-        let capacity = inner.slots.len() as u64;
-        let start_sequence = after_sequence + 1;
-        let end_sequence = after_sequence + capacity;
-
-        for seq in start_sequence..end_sequence {
-            let idx = (seq % capacity) as usize;
-
-            if let Some(slot) = &inner.slots[idx] {
-                if slot.sequence == seq {
-                    return Some(seq);
-                }
-            }
-        }
-
-        None   
-    }
 }
+
+// ============================================================================
+// UnackedBufferError
+// ============================================================================
 
 /// Errors that can occur when pushing a frame into the buffer.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UnackedBufferError {
-    /// The sequence number is too old (already acknowledged or in-flight).
-    /// 
-    /// This error indicates a protocol violation:
-    /// - `sequence == base_sequence`: The frame is already in the buffer (duplicate send).
-    /// - `sequence < base_sequence`: The frame was already acknowledged, and the buffer
-    ///   has moved past it. This typically indicates a bug in session state synchronization
-    ///   (e.g., after a failed Resume operation).
-    SequenceTooOld { 
-        sequence: u64, 
-        base_sequence: u64 
-    },
+    /// Non-monotonic push: `sequence` does not exceed the newest stored frame.
+    ///
+    /// The writer assigns and pushes inside one critical section, so this is an
+    /// implementation bug (e.g. a replay path calling `push` instead of reusing
+    /// the stored frame), never backpressure. Reported after assignment, hence
+    /// fatal (§13.3).
+    ///
+    /// `base_sequence` carries the newest stored sequence — the ordering floor
+    /// that `sequence` failed to exceed.
+    SequenceTooOld { sequence: u64, base_sequence: u64 },
     
-    /// The target slot is already occupied (buffer full or protocol error).
+    /// The buffer is full: `capacity` frames await acknowledgment.
+    ///
+    /// This is the backpressure signal. A correct writer observes it via
+    /// `is_full()` BEFORE assigning a sequence number.
+    ///
+    /// `index` is the number of occupied slots at rejection time (== capacity);
+    /// the field is kept for compatibility with the previous ring-based API.
     SlotOccupied { sequence: u64, index: usize },
 }
 
 impl std::fmt::Display for UnackedBufferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnackedBufferError::SequenceTooOld { sequence, base_sequence } => {
-                write!(
-                    f, 
-                    "Sequence {} is too old (base_sequence is {}). Frame already acknowledged or in-flight.",
-                    sequence, base_sequence
-                )
-            }
-            UnackedBufferError::SlotOccupied { sequence, index } => {
-                write!(f, "Slot {} is already occupied for sequence {}", index, sequence)
-            }
+            UnackedBufferError::SequenceTooOld { sequence, base_sequence } => write!(
+                f,
+                "Sequence {} is not newer than the newest buffered sequence {}; \
+                 push must be strictly monotonic.",
+                sequence, base_sequence
+            ),
+            UnackedBufferError::SlotOccupied { sequence, index } => write!(
+                f,
+                "UnackedBuffer is full ({} slots occupied); sequence {} rejected (backpressure).",
+                index, sequence
+            ),
         }
     }
 }
@@ -332,6 +364,9 @@ impl std::error::Error for UnackedBufferError {}
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use std::sync::Arc;
+    use std::thread;
+        
     use crate::protocol::{Frame, FrameType};
 
     fn dummy_frame(payload: &[u8]) -> Frame {
@@ -342,114 +377,169 @@ mod tests {
     fn test_push_and_acknowledge() {
         let buffer = UnackedBuffer::new(4);
         
-        for i in 0..4 {
+        for i in 1..=4 {
             buffer.push(i, dummy_frame(b"test")).unwrap();
         }
         
         assert_eq!(buffer.len(), 4);
         
-        for i in 0..4 {
+        for i in 1..=4 {
             assert!(buffer.acknowledge(i));
         }
         
         assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.base_sequence(), None);
     }
 
     #[test]
-    fn test_wrap_around() {
+    fn credit_grant_gaps_must_not_reject_push() {
         let buffer = UnackedBuffer::new(4);
         
-        for i in 0..4 {
+        for i in 1..=4 {
             buffer.push(i, dummy_frame(b"test")).unwrap();
         }
         
-        assert!(buffer.acknowledge(0));
-        assert!(buffer.acknowledge(1));
+        assert!(buffer.acknowledge(2)); // one slot freed, len = 3
+        assert!(!buffer.is_full());
         
-        buffer.push(4, dummy_frame(b"test")).unwrap();
-        buffer.push(5, dummy_frame(b"test")).unwrap();
-        
+        // seq 5..8 were CreditGrants: numbers consumed, no slots used.
+        // The old ring computed 9 % 4 = 1 and collided with the still-unacked seq 1.
+        assert!(buffer.push(9, dummy_frame(b"next")).is_ok());
         assert_eq!(buffer.len(), 4);
         
-        for i in [2, 3, 4, 5] {
-            assert!(buffer.acknowledge(i));
-        }
-        
-        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.base_sequence(), Some(1));
     }
 
+    /// Regression: removing the head must not orphan frames whose sequence lies
+    /// beyond `base + capacity`.
     #[test]
-    fn test_acknowledge_wrong_sequence() {
+    fn sparse_window_survives_head_removal() {
         let buffer = UnackedBuffer::new(4);
-        
-        buffer.push(0, dummy_frame(b"test")).unwrap();
-        
-        assert!(!buffer.acknowledge(1));
+        buffer.push(1, dummy_frame(b"a")).unwrap();
+        buffer.push(6, dummy_frame(b"b")).unwrap();
+
+        assert!(buffer.remove(1));
         assert_eq!(buffer.len(), 1);
-        assert!(buffer.acknowledge(0));
+        assert_eq!(buffer.base_sequence(), Some(6));
+        assert_eq!(
+            buffer.get_unacked_frames().iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![6]
+        );
     }
 
+    /// Regression: Resume must see every stored frame, however sparse the space.
     #[test]
-    fn test_slot_occupied() {
+    fn get_unacked_frames_returns_all_frames() {
         let buffer = UnackedBuffer::new(4);
-        
-        buffer.push(0, dummy_frame(b"test1")).unwrap();
-        
-        let result = buffer.push(4, dummy_frame(b"test2"));
-        assert!(matches!(result, Err(UnackedBufferError::SlotOccupied { sequence: 4, index: 0 })));
+        for seq in [1u64, 40, 41, 1000] {
+            buffer.push(seq, dummy_frame(b"x")).unwrap();
+        }
+        let seqs: Vec<u64> = buffer.get_unacked_frames().iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, vec![1, 40, 41, 1000]);
     }
 
     #[test]
-    fn test_concurrent_push_acknowledge() {
-        use std::sync::Arc;
-        use std::thread;
-        
-        let buffer = Arc::new(UnackedBuffer::new(1024));
-        let mut handles = vec![];
-        
-        for t in 0..4 {
-            let buffer = Arc::clone(&buffer);
-            handles.push(thread::spawn(move || {
-                for i in 0..256 {
-                    let seq = (t * 256 + i) as u64;
-                    buffer.push(seq, dummy_frame(b"test")).unwrap();
-                }
-                for i in 0..256 {
-                    let seq = (t * 256 + i) as u64;
-                    assert!(buffer.acknowledge(seq));
-                }
-            }));
+    fn out_of_order_acknowledge() {
+        let buffer = UnackedBuffer::new(4);
+        for seq in [1u64, 3, 7, 9] {
+            buffer.push(seq, dummy_frame(b"x")).unwrap();
         }
-        
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        
-        assert_eq!(buffer.len(), 0);
+        assert!(buffer.acknowledge(7));
+        assert_eq!(buffer.base_sequence(), Some(1));
+        assert!(!buffer.acknowledge(7)); // duplicate Ack is idempotent
+        assert!(!buffer.acknowledge(2)); // never sent
+        assert!(buffer.acknowledge(1));
+        assert_eq!(buffer.base_sequence(), Some(3));
+    }
+
+    #[test]
+    fn non_monotonic_push_is_rejected() {
+        let buffer = UnackedBuffer::new(4);
+        buffer.push(10, dummy_frame(b"x")).unwrap();
+        assert!(matches!(
+            buffer.push(9, dummy_frame(b"y")),
+            Err(UnackedBufferError::SequenceTooOld { sequence: 9, base_sequence: 10 })
+        ));
+        assert!(matches!(
+            buffer.push(10, dummy_frame(b"y")),
+            Err(UnackedBufferError::SequenceTooOld { .. })
+        ));
+        assert_eq!(buffer.len(), 1);
     }
 
     #[test]
     fn test_backpressure_at_capacity_o1_guarantee() {
         let capacity = 4;
         let buffer = UnackedBuffer::new(capacity);
-        
-        // 1. Fill the buffer to capacity
-        for i in 0..capacity {
-            assert!(buffer.push(i as u64, dummy_frame(b"test")).is_ok());
+
+        for i in 1..=capacity as u64 {
+            buffer.push(i, dummy_frame(b"test")).unwrap();
         }
+        assert!(buffer.is_full());
+
+        // Full is the only rejection, and the writer sees it BEFORE assignment.
+        let err = buffer.push(5, dummy_frame(b"overflow")).unwrap_err();
+        assert!(matches!(err, UnackedBufferError::SlotOccupied { sequence: 5, .. }));
+        assert_eq!(buffer.len(), capacity); // state unchanged, no allocation
+
+        assert!(buffer.acknowledge(1));
+        assert!(!buffer.is_full());
+        assert!(buffer.push(5, dummy_frame(b"success")).is_ok());
         assert_eq!(buffer.len(), capacity);
-        
-        // 2. The next send should receive backpressure (SlotOccupied)
-        let result = buffer.push(capacity as u64, dummy_frame(b"overflow"));
-        assert!(matches!(result, Err(UnackedBufferError::SlotOccupied { .. })));
-        assert_eq!(buffer.len(), capacity); // State unchanged, no allocations occurred
-        
-        // 3. Free one slot (simulating receipt of an Ack)
-        assert!(buffer.acknowledge(0));
-        assert_eq!(buffer.len(), capacity - 1);
-        
-        // 4. Now the send should succeed (uses the freed slot)
-        assert!(buffer.push(capacity as u64, dummy_frame(b"success")).is_ok());
-        assert_eq!(buffer.len(), capacity);
+    }
+
+    /// Concurrent Ack processing (reader task) against a single pusher (writer).
+    #[test]
+    fn test_single_producer_concurrent_acks() {
+        let buffer = Arc::new(UnackedBuffer::new(8));
+        let acker = {
+            let buffer = Arc::clone(&buffer);
+            thread::spawn(move || {
+                let mut next = 0u64;
+                while next < 1000 {
+                    if buffer.acknowledge(next) {
+                        next += 1;
+                    } else {
+                        thread::yield_now();
+													 
+                    }
+                }
+            })
+        };
+
+        for seq in 0..1000u64 {
+            while buffer.push(seq, dummy_frame(b"test")).is_err() {
+                thread::yield_now();
+            }
+        }
+        acker.join().unwrap();
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.base_sequence(), None);
+    }
+
+    #[test]
+    fn test_concurrent_acknowledge_disjoint_ranges() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let buffer = Arc::new(UnackedBuffer::new(1024));
+        for seq in 0..1024u64 {
+            buffer.push(seq, dummy_frame(b"test")).unwrap();
+        }
+
+        let handles: Vec<_> = (0..4u64)
+            .map(|t| {
+                let buffer = Arc::clone(&buffer);
+                thread::spawn(move || {
+                    for i in 0..256u64 {
+                        assert!(buffer.acknowledge(t * 256 + i));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(buffer.len(), 0);
     }
 }

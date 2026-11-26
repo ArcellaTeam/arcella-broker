@@ -7,8 +7,10 @@
 // This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use bytes::{BytesMut, Buf, BufMut};
+use bytes::{Bytes, Buf};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
@@ -23,12 +25,17 @@ use crate::broker_core::security::{
     SessionManager
 };
 use crate::broker_core::transport::{
-    EndpointStateExt,
     EndpointWriterExt,
     IPCEndpoint, 
+    IPCEndpointReader,
+    IPCEndpointWriter,
+    ControlRx,
+    ControlTx,
+    ControlCommand,
+    PongEcho,
     IPCFramedStream, 
-    TransportError, 
-    create_channel
+    TransportError,
+    create_control_channel, 
 };
 use crate::protocol::{
     Frame, FrameType,
@@ -39,28 +46,45 @@ use crate::protocol::{
         CreditGrantPayload,
         ParsedDataPayload,
     },
-    build_error_frame,
+    create_ack_frame,
+    create_drop_frame,
+    create_error_frame,
     utils::validate_address,
 };
 
 use crate::broker_core::registry::{SubscriptionSlot, RouteTarget};
 
-
 /// Handles a single IPC connection from accept to disconnect.
+///
+/// # Phases
+///
+/// 1. **Handshake** — synchronous exchange of Hello/Welcome/AuthResponse/AuthResult.
+///    On any error the function returns immediately and the caller drops the socket.
+/// 2. **Registration** — the session is stored in `SessionManager` and a routing
+///    binding is created in `LocalRegistry`.
+/// 3. **Supervisor** — spawns the writer actor as a dedicated task and runs the
+///    reader loop inline. On any fatal error or graceful Close, the connection
+///    token is cancelled, both halves are joined, and cleanup runs.
+/// 4. **Cleanup** — `SessionManager::remove_session` runs exactly once, on any
+///    exit path (graceful close, transport error, timeout).
 pub async fn handle_connection<S, B>(
     stream: S,
     peer_addr: String,
     session_manager: Arc<SessionManager>,
     handshake_handler: Arc<HandshakeHandler>,
-    local_registry: Arc<LocalRegistry>, // Will be needed in Stage 6 for the Ingress Bridge
+    local_registry: Arc<LocalRegistry>,
     ingress_bridge: Arc<B>,
 ) -> Result<(), TransportError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-    B: IngressBridge,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: IngressBridge + 'static,
 {
     // === Phase 1: Handshake ===
-    let (mut endpoint, session_ctx) = match perform_handshake(stream, &handshake_handler, &session_manager).await {
+    let (endpoint, session_ctx) = match perform_handshake(
+        stream, 
+        &handshake_handler, 
+        &session_manager
+    ).await {
         Ok(ctx) => ctx,
         Err(e) => {
             tracing::warn!(peer = %peer_addr, error = %e, "Handshake failed, closing connection");
@@ -74,20 +98,51 @@ where
         "Handshake completed, session registered"
     );
 
-    let source_prefix = session_ctx.source_prefix().to_string();
-    let cancel_token = CancellationToken::new();
+    // === Phase 1.5: Connection-level cancellation signal ===
+    //
+    // Hierarchy:
+    //   SessionManager's GC
+    //      │  (calls session_ctx.force_close())
+    //      ▼
+    //   session_ctx.cancellation_token        <- external trigger
+    //      │  (child)
+    //      ▼
+    //   connection_token                      <- observed by reader + writer
+    //
+    // This gives us both directions of shutdown:
+    //   * GC -> session token -> connection token -> both tasks wake up.
+    //   * Fatal error inside reader/writer -> connection_token.cancel()
+    //     wakes the other half AND signals the `select!` in supervisor.
+    let connection_token = session_ctx.cancellation_token.child_token();
 
-    let slot = SubscriptionSlot::new(10, cancel_token); // TODO: need to remove magic
+    // Local routing binding
+    let source_prefix = session_ctx.source_prefix().to_string();
+    let slot_token = CancellationToken::new();
+
+    let slot = SubscriptionSlot::new(10, slot_token); // TODO: need to remove magic
     let target = RouteTarget::new_exclusive(slot.clone());
 
-    local_registry.register(source_prefix, target)?;
+    if let Err(e) = local_registry.register(source_prefix, target) {
+        // Failed before Phase 2 — remove the session now so we don't
+        // accumulate phantom sessions on repeated handshake failures.
+        session_manager.remove_session(session_ctx.session_id());
+        return Err(TransportError::Registry(e));
+    }
 
-    // === Phase 2: Main frame processing loop ===
-    let result = main_loop(&mut endpoint, &session_ctx, ingress_bridge.as_ref()).await; 
+    // === Phase 2: Supervisor ===
+    let result = run_connection_supervisor(
+        endpoint,
+        session_ctx.clone(),
+        ingress_bridge,
+        connection_token,
+    )
+    .await;
 
     // === Phase 3: Mandatory cleanup ===
-    // Remove the session from the manager on ANY exit from the function
-    // (connection drop, timeout, transport error)
+    // Runs exactly once on ANY exit path (close frame, EOF, transport error,
+    // cancellation). The supervisor is responsible for cancelling its own
+    // connection_token before returning, so by the time we get here both
+    // halves (future) are already stopped.
     session_manager.remove_session(session_ctx.session_id());
 
     tracing::info!(
@@ -124,7 +179,7 @@ where
         );
 
         let err_msg = format!("Expected Hello, got frame type 0x{:02x}", hello_frame.frame_type);
-        let err_frame = build_error_frame(400u16, &err_msg);
+        let err_frame = create_error_frame(400u16, &err_msg);
         let _ = transport.send(err_frame).await;
     
         return Err(HandshakeError::UnexpectedFrame(err_msg).into());
@@ -155,7 +210,7 @@ where
             "Unexpected frame during handshake (expected AuthResponse)"
         );
 
-        let err_frame = build_error_frame(400u16, &err_msg);
+        let err_frame = create_error_frame(400u16, &err_msg);
         let _ = transport.send(err_frame).await;
 
         return Err(HandshakeError::UnexpectedFrame(err_msg).into());
@@ -235,10 +290,17 @@ where
             )))?;
 
         if frame.frame_type == FrameType::Ping as u8 {
-            let mut pong_payload = BytesMut::with_capacity(frame.payload.len());
-            pong_payload.put_slice(&frame.payload);
-            let pong_frame = Frame::new(FrameType::Pong as u8, pong_payload.freeze());
-            transport.send(pong_frame).await?;
+            let response_timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let echo = PongEcho::from_ping_payload(&frame.payload, response_timestamp)
+                .ok_or_else(|| {
+                    TransportError::Session(
+                        "malformed Ping payload during handshake".to_string(),
+                    )
+                })?;
+            transport.send(build_pong_frame(echo)).await?;
             tracing::debug!("Replied with Pong during handshake");
             continue;
         }
@@ -247,177 +309,387 @@ where
     }
 }
 
-/// Main frame processing loop after a successful handshake.
+// ============================================================================
+// Supervisor
+// ============================================================================
+
+/// Runs the read and write sides of the connection concurrently.
 ///
-/// Terminates when:
-/// - The client drops the connection (`recv()` returns `None`)
-/// - Cancelled via `CancellationToken` (inactivity timeout from `SessionManager`)
-/// - A transport error occurs (corrupted CRC, socket drop, etc.)
-async fn main_loop<S, B>(
-    endpoint: &mut IPCEndpoint<S>,
-    session_ctx: &ServerSessionContext,
-    ingress_bridge: &B,
+/// # Architecture
+///
+/// ```text
+///                          ┌──────────────────────┐
+///                          │ connection_token     │
+///                          └───────┬──────────────┘
+///                                  │
+///                    ┌─────────────┼─────────────┐
+///                    ▼             ▼             ▼
+///               reader_loop   writer_actor   supervisor select
+///                    │             ▲             │
+///                    │  ControlTx  │             │
+///                    └─────────────┘             │
+///                                                │
+///                       on any fatal: cancel token, join both
+/// ```
+///
+/// 1. Create a bounded control channel (capacity = incoming `hot_credit`).
+/// 2. Split the endpoint into `(reader, writer)`.
+/// 3. Spawn the writer actor as a dedicated task.
+/// 4. Run the reader loop on the supervisor's task.
+/// 5. On reader exit (normal or error), cancel the connection token.
+/// 6. Await the writer handle. The first error wins.
+///
+/// # Cancellation safety
+///
+/// Both tasks observe the same `connection_token`, so a fatal error in
+/// either one tears the whole connection down deterministically. The
+/// supervisor is itself cancel-safe: dropping it drops both halves, which
+/// drops the underlying socket.
+async fn run_connection_supervisor<S, B>(
+    endpoint: IPCEndpoint<S>,
+    session_ctx: Arc<ServerSessionContext>,
+    ingress_bridge: Arc<B>,
+    connection_token: CancellationToken,
 ) -> Result<(), TransportError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-    B: IngressBridge,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: IngressBridge + 'static,
+{
+    // 1. Create the control channel.
+    // Capacity is bounded by the incoming direction's hot_credit: the peer
+    // may hold at most that many unacknowledged Data frames, each producing
+    // at most one Ack command.
+    let incoming_hot_credit = NonZeroUsize::new(session_ctx.limits().hot_credit as usize)
+        .expect("hot_credit > 0 validated at handshake");
+
+    let (ctrl_tx, ctrl_rx) =
+        create_control_channel(incoming_hot_credit, connection_token.clone());
+
+    // 2. Split endpoint into reader + writer halves.
+    let (reader, writer) = endpoint.split();
+
+    // 3. Spawn the writer actor.
+    // The writer owns the sole serialization point of the outgoing
+    // direction (L2 §13.2). All outbound frames — control replies from the
+    // reader and (later) egress Data from the Egress Bridge — flow through
+    // it, which guarantees that `session_sequence` assignment order matches
+    // write order.
+    let writer_ctx = Arc::clone(&session_ctx);
+
+    let writer_token = connection_token.clone();
+    let writer_handle = tokio::spawn(async move {
+        writer_actor(writer, ctrl_rx, writer_ctx, writer_token).await
+    });
+
+    // 4. Run the reader loop inline on the supervisor task.
+    // This keeps one task count lower than spawning both halves. The reader
+    // is the more latency-sensitive side (it drives credit return and Ack
+    // timing) so it gets the supervisor's own scheduler slot.
+    let reader_result = reader_loop(
+        reader,
+        ctrl_tx,
+        ingress_bridge,
+        Arc::clone(&session_ctx),
+        connection_token.clone(),
+    ).await;
+
+    // 5. Reader has exited. Cancel the connection token to wake the writer.
+    // This is idempotent: if the reader exited because the token was
+    // already cancelled (GC, peer Close), this is a no-op. If the reader
+    // exited on a transport error, this is how the writer finds out.
+    connection_token.cancel();
+
+    // 6. Await the writer handle and combine outcomes.
+    // Rule: a fatal transport error in either half is reported; an `Ok(())`
+    // from one half never masks an error from the other.
+    match writer_handle.await {
+        Ok(writer_result) => match (&reader_result, &writer_result) {
+            (Ok(()), Err(_)) => {
+                tracing::error!(
+                    session_id = session_ctx.session_id(),
+                    "Writer task failed while reader exited cleanly"
+                );
+                writer_result
+            }
+            (Err(_), Ok(())) => reader_result,
+            (Err(_), Err(_)) => {
+                // Both failed — reader's error was the trigger, report it.
+                reader_result
+            }
+            (Ok(()), Ok(())) => Ok(()),
+        }
+        Err(join_err) => {
+            // Writer panicked or was cancelled by the runtime. This is a fatal
+            // outcome: a clean reader exit must not mask it.
+            tracing::error!(
+                session_id = session_ctx.session_id(),
+                error = %join_err,
+                "Writer task panicked or was cancelled by the runtime"
+            );
+            match reader_result {
+                Ok(()) => Err(TransportError::Internal(format!(
+                    "writer task failed: {join_err}"
+                ))),
+                err => err,
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Writer actor
+// ============================================================================
+
+/// The single writer task for the outgoing direction (L2 §13.2).
+///
+/// # Inputs
+///
+/// * `writer` — write-half of the split endpoint. Only this task ever touches
+///   it, so `session_sequence` assignment order matches write order by
+///   construction.
+/// * `ctrl_rx` — non-blocking queue of control commands from the reader
+///   (Ack, Drop, Pong). See `ipc::control` for capacity and overflow rules.
+/// * `session_ctx` — for logging and, later, for egress Data dispatch.
+/// * `connection_token` — shared shutdown signal.
+///
+/// # Loop
+///
+/// Awaits `ctrl_rx.recv()` with a biased select against the cancellation
+/// token. On each command it builds the matching frame and transmits it via
+/// `EndpointWriterExt::send_raw_frame`, which enforces the negotiated size
+/// ceiling and the fatal-latch check.
+///
+/// # Fatal outcomes
+///
+/// Any transport error (I/O, codec, post-latch broken session) cancels the
+/// connection token and returns the error to the supervisor. No retry —
+/// §13.3 mandates teardown + Resume for post-assignment failures.
+async fn writer_actor<S>(
+    mut writer: IPCEndpointWriter<S>,
+    mut ctrl_rx: ControlRx,
+    session_ctx: Arc<ServerSessionContext>,
+    connection_token: CancellationToken,
+) -> Result<(), TransportError>
+where
+    S: AsyncWrite + Unpin + Send + 'static,
 {
     loop {
         tokio::select! {
-            // Forced cancellation from SessionManager (inactivity timeout)
-            _ = session_ctx.cancellation_token.cancelled() => {
+            biased;
+
+            // Shutdown: GC-driven, reader fatal, or explicit cancel.
+            //
+            // Biased: checked FIRST so that a cancelled connection does not
+            // dispatch one more command on its way out.
+            _ = connection_token.cancelled() => {
                 tracing::info!(
                     session_id = session_ctx.session_id(),
-                    "Session cancelled by SessionManager (timeout)"
+                    "Writer task cancelled"
                 );
                 return Ok(());
             }
 
-            // Reading frames from the client
-            result = endpoint.recv() => {
-                match result {
-                    Ok(Some(frame)) => {
-                        // Updating the last activity time
-                        session_ctx.touch();
-
-                        match frame.frame_type {
-                            // === CreditGrant frame (0x02) - client granting credits to server ===
-                            t if t == FrameType::CreditGrant as u8 => {
-                                let mut payload_buf = frame.payload.clone();
-                                match CreditGrantPayload::decode(&mut payload_buf) {
-                                    Ok(cg) => {
-                                        match cg.credit_type {
-                                            CreditGrantPayload::CREDIT_TYPE_HOT => {
-                                                tracing::debug!(
-                                                    session_id = session_ctx.session_id(),
-                                                    credit_amount = cg.credit_amount,
-                                                    address = %String::from_utf8_lossy(&cg.address),
-                                                    "Received hot CreditGrant from client (server-side sending not yet implemented)"
-                                                );
-                                            }
-                                            CreditGrantPayload::CREDIT_TYPE_COLD => {
-                                                tracing::debug!(
-                                                    session_id = session_ctx.session_id(),
-                                                    credit_amount = cg.credit_amount,
-                                                    address = %String::from_utf8_lossy(&cg.address),
-                                                    "Received cold CreditGrant from client (server-side sending not yet implemented)"
-                                                );
-                                            }
-                                            _ => {
-                                                tracing::warn!(
-                                                    session_id = session_ctx.session_id(),
-                                                    credit_type = cg.credit_type,
-                                                    "Unknown credit_type in CreditGrant frame"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            session_id = session_ctx.session_id(),
-                                            error = %e,
-                                            "Failed to decode CreditGrant frame"
-                                        );
-                                        // Optionally send Error frame and close connection
-                                        let err_msg = format!("Invalid CreditGrant: {}", e);
-                                        let err_frame = build_error_frame(400u16, &err_msg);
-                                        let _ = endpoint.send_raw_frame(err_frame).await;
-                                        return Err(TransportError::Protocol(e.into()));
-                                    }
-                                }
-                            }
-
-                            // === Acknowledge frame (0x03) - client acknowledging server's frames ===
-                            t if t == FrameType::Acknowledge as u8 => {
-                                if frame.payload.len() < 8 {
-                                    tracing::warn!(
-                                        session_id = session_ctx.session_id(),
-                                        "Malformed Acknowledge frame (too short)"
-                                    );
-                                } else {
-                                    let mut payload = frame.payload.clone();
-                                    let ack_seq = payload.get_u64_le();
-                                    if endpoint.acknowledge(ack_seq) {
-                                        tracing::debug!(
-                                            session_id = session_ctx.session_id(),
-                                            ack_seq,
-                                            "Acknowledged server frame"
-                                        );
-                                    }
-                                }
-                            }
-                            
-                            // === Close frame (0x07) ===
-                            t if t == FrameType::Close as u8 => {
+            // Dispatch next control command from the reader.
+            cmd = ctrl_rx.recv() => {
+                match cmd {
+                    Some(command) => {
+                        let dispatch_fut = dispatch_control_command(
+                            &mut writer,
+                            command,
+                            session_ctx.as_ref(),
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = connection_token.cancelled() => {
                                 tracing::info!(
                                     session_id = session_ctx.session_id(),
-                                    "Client requested graceful close"
+                                    "Writer task cancelled during flush"
                                 );
                                 return Ok(());
                             }
-
-                            // === Ping frame (0x10) ===
-                            t if t == FrameType::Ping as u8 => {
-                                let mut pong_payload = BytesMut::with_capacity(frame.payload.len());
-                                pong_payload.put_slice(&frame.payload);
-                                let pong_frame = Frame::new(FrameType::Pong as u8, pong_payload.freeze());
-                                endpoint.send_raw_frame(pong_frame).await?;
-                                tracing::debug!(
-                                    session_id = session_ctx.session_id(),
-                                    "Responded with Pong"
-														 
-                                );
-                            }
-
-                            // === Data frame (0xfe) ===
-                            t if t == FrameType::Data as u8 => {
-                                if let Err(e) = handle_data_frame(
-                                    endpoint, 
-                                    session_ctx, 
-                                    &frame,
-                                    ingress_bridge,
-                                ).await {
+                            result = dispatch_fut => {
+                                if let Err(e) = result {
                                     tracing::error!(
                                         session_id = session_ctx.session_id(),
                                         error = %e,
-                                        "Data frame handling failed"
+                                        "Writer transport error"
                                     );
+                                    connection_token.cancel();
                                     return Err(e);
                                 }
-                            }                            
-
-                            // === Unknown or unexpected frame ===
-                            _ => {
-                                tracing::warn!(
-                                    session_id = session_ctx.session_id(),
-                                    frame_type = frame.frame_type,
-                                    "Unexpected frame type in main loop"
-                                );
-                                // Send Error and close
-                                let err_msg = format!(
-                                    "Unexpected frame type 0x{:02x}", 
-                                    frame.frame_type
-                                );
-                                let err_frame = build_error_frame(400u16, &err_msg);
-                                let _ = endpoint.send_raw_frame(err_frame).await;
-                                return Err(ProtocolError::UnexpectedFrame(format!("0x{:02x}", frame.frame_type)).into());
-                            }
+                            }    
                         }
                     }
-                    Ok(None) => {
-                        // The client closed the connection gracefully
+                    None => {
+                        // Control channel closed: the reader dropped its
+                        // ControlTx, which only happens when the reader is
+                        // itself exiting. Drain anything left in the Pong
+                        // lane and exit cleanly.
                         tracing::info!(
                             session_id = session_ctx.session_id(),
-                            "Client disconnected gracefully"
+                            "Control channel closed, writer exiting"
                         );
                         return Ok(());
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Translates a single `ControlCommand` into a wire frame and sends it.
+///
+/// All three command types are non-sequenced (L2 §13.1), so they go through
+/// `send_raw_frame`: no `session_sequence` is consumed, no slot in
+/// `UnackedBuffer` is reserved.
+async fn dispatch_control_command<S>(
+    writer: &mut IPCEndpointWriter<S>,
+    command: ControlCommand,
+    session_ctx: &ServerSessionContext,
+) -> Result<(), TransportError>
+where
+    S: AsyncWrite + Unpin + Send,
+{
+    let frame = match command {
+        ControlCommand::Ack { sequence } => {
+            tracing::debug!(
+                session_id = session_ctx.session_id(),
+                sequence,
+                "Sending Ack"
+            );
+            create_ack_frame(sequence)
+        }
+        ControlCommand::Drop { sequence, reason } => {
+            tracing::debug!(
+                session_id = session_ctx.session_id(),
+                sequence,
+                reason,
+                "Sending Drop"
+            );
+            create_drop_frame(sequence, reason)
+        }
+        ControlCommand::Pong(echo) => {
+            tracing::debug!(
+                session_id = session_ctx.session_id(),
+                original_ts = echo.original_timestamp,
+                response_ts = echo.response_timestamp,
+                "Sending Pong"
+            );
+            build_pong_frame(echo)
+        }
+    };
+    writer.send_raw_frame(frame).await
+}
+
+/// Builds a `Pong` frame (0x11) from a [`PongEcho`].
+///
+/// Layout per L2 spec §7.12: `original_timestamp: u64 LE` +
+/// `response_timestamp: u64 LE` + `opaque_data: [u8; 8]` = 24 bytes.
+fn build_pong_frame(echo: PongEcho) -> Frame {
+    Frame::new(FrameType::Pong as u8, Bytes::from(echo.to_bytes().to_vec()))
+}
+
+// ============================================================================
+// Reader task
+// ============================================================================
+
+/// Reader loop: receives frames from the peer and dispatches them.
+///
+/// # Shutdown signal
+///
+/// The caller passes the **connection-level** cancellation token. This is
+/// the only shutdown observer; it covers:
+///
+/// * GC-driven shutdown (via `session_ctx.cancellation_token` → child),
+/// * fatal error in the writer actor,
+/// * explicit cancellation from tests / admin.
+///
+/// On a local fatal outcome the reader cancels the token itself so the
+/// writer wakes up promptly.
+///
+/// # Termination conditions
+///
+/// * Peer drops the connection (`recv()` returns `None`).
+/// * A `Close` frame is received.
+/// * A transport error occurs (CRC mismatch, socket error).
+/// * A protocol violation is detected (credit overflow, malformed Ping).
+/// * `connection_token` is cancelled externally.
+async fn reader_loop<S, B>(
+    mut reader: IPCEndpointReader<S>,
+    ctrl: ControlTx,
+    ingress_bridge: Arc<B>,
+    session_ctx: Arc<ServerSessionContext>,
+    connection_token: CancellationToken,
+) -> Result<(), TransportError>
+where
+    S: AsyncRead + Unpin + Send + 'static,
+    B: IngressBridge + 'static,
+{
+    loop {
+        tokio::select! {
+            biased;
+            
+            // Shutdown: GC-driven, peer Close, or fatal in writer task.
+            _ = connection_token.cancelled() => {
+                tracing::info!(
+                    session_id = session_ctx.session_id(),
+                    "Reader task cancelled"
+                );
+                return Ok(());
+            }
+            
+            // Read next frame from peer.
+            result = reader.recv() => {
+                match result {
+                    Ok(Some(frame)) => {
+                        session_ctx.touch();
+
+                        // Close (0x07) is a terminal signal: cancel the connection
+                        // token and exit. The writer will observe the cancellation
+                        // via its biased select and stop. The supervisor joins both
+                        // halves and performs cleanup.
+                        if frame.frame_type == FrameType::Close as u8 {
+                            tracing::info!(
+                                session_id = session_ctx.session_id(),
+                                "Peer requested graceful close"
+                            );
+                            connection_token.cancel();
+                            return Ok(());
+                        }
+                        
+                        if let Err(e) = dispatch_incoming_frame(
+                            &frame,
+                            &ctrl,
+                            ingress_bridge.as_ref(),
+                            session_ctx.as_ref(),
+                        ).await {
+                            tracing::error!(
+                                session_id = session_ctx.session_id(),
+                                error = %e,
+                                "Frame dispatch failed"
+                            );
+                            // Fatal error: tear down the connection.
+                            connection_token.cancel();
+                            return Err(e);
+                        }
+                    }
+                    Ok(None) => {
+                        // Peer closed the connection gracefully.
+                        tracing::info!(
+                            session_id = session_ctx.session_id(),
+                            "Peer closed connection (EOF)"
+                        );
+                        connection_token.cancel();
+                        return Ok(());
+                    }
                     Err(e) => {
+                        // Transport error: CRC mismatch, I/O failure, etc.
                         tracing::error!(
                             session_id = session_ctx.session_id(),
                             error = %e,
-                            "Transport error in main loop"
+                            "Reader transport error"
                         );
+                        connection_token.cancel();
                         return Err(e);
                     }
                 }
@@ -426,33 +698,95 @@ where
     }
 }
 
+async fn dispatch_incoming_frame<B>(
+    frame: &Frame,
+    ctrl: &ControlTx,
+    ingress_bridge: &B,
+    session_ctx: &ServerSessionContext,
+) -> Result<(), TransportError>
+where
+    B: IngressBridge,
+{
+    match frame.frame_type {
+        t if t == FrameType::Data as u8 => {
+            handle_data_frame_reader(frame, ctrl, ingress_bridge, session_ctx).await
+        }
+        t if t == FrameType::Acknowledge as u8 => {
+            handle_ack_frame(frame, session_ctx)
+        }
+        t if t == FrameType::Drop as u8 => {
+            handle_drop_frame(frame, session_ctx)
+        }
+        t if t == FrameType::CreditGrant as u8 => {
+            handle_credit_grant_frame(frame, session_ctx)
+        }
+        t if t == FrameType::Ping as u8 => {
+            handle_ping_frame(frame, ctrl)
+        }
+        t if t == FrameType::Pong as u8 => {
+            // Pong is a reply to our Ping; no action needed.
+            tracing::debug!(
+                session_id = session_ctx.session_id(),
+                "Received Pong (liveness confirmed)"
+            );
+            Ok(())
+        }
+        _ => {
+            if frame.typed_frame_type().is_none() {
+                tracing::warn!(
+                    session_id = session_ctx.session_id(),
+                    frame_type = frame.frame_type,
+                    "Ignoring unknown frame type in reader loop"
+                );
+                return Ok(());
+            }
 
-/// Handles an incoming Data frame with credit enforcement.
+            tracing::warn!(
+                session_id = session_ctx.session_id(),
+                frame_type = frame.frame_type,
+                "Unexpected frame type in reader loop"
+            );
+            Err(ProtocolError::UnexpectedFrame(
+                format!("0x{:02x}", frame.frame_type),
+            ).into())
+        }
+    }
+}
+
+// ============================================================================
+// Per-frame handlers
+// ============================================================================
+
+/// Handles an incoming `Data` frame with credit enforcement.
 ///
 /// # Algorithm
 ///
-/// 1. Parse the Data payload (zero-copy extraction of address and messages_raw).
-/// 2. Attempt to consume one hot credit from `CreditManager`.
-/// 3. If no credits available → send `Drop` with reason `buffer_overflow` and close.
-/// 4. If credits available → process the frame (TODO: Ingress Bridge in Stage 6).
-/// 5. Send `Acknowledge` to the client.
-/// 6. Replenish the hot credit (credit is returned after processing).
+/// 1. Parse the Data payload (zero-copy extraction of `address` and
+///    `messages_raw`).
+/// 2. Duplicate check via `SessionState::update_last_received`. Duplicates
+///    are Ack'd without consuming a credit or calling the Ingress Bridge.
+/// 3. Attempt to consume one hot credit from `CreditManager`.
+/// 4. If no credits are available → send `Drop` (reason `buffer_overflow`)
+///    via the control queue and return a protocol error.
+/// 5. Pass `(address, messages_raw)` to the Ingress Bridge.
+/// 6. Replenish the hot credit and send `Ack` on `Accepted`; send `Drop`
+///    with the matching reason on `Rejected`.
 ///
-/// # Thread Safety
+/// # Thread safety
 ///
-/// `CreditManager` uses atomic CAS operations, so this function is safe to call
-/// concurrently if needed (though currently only one task processes frames per session).
-pub async fn handle_data_frame<S, B>(
-    endpoint: &mut IPCEndpoint<S>,
-    session_ctx: &ServerSessionContext,
+/// `CreditManager` uses atomic CAS operations, so this function is safe to
+/// call from the reader task while the writer task concurrently observes
+/// the same counters.
+async fn handle_data_frame_reader<B>(
     frame: &Frame,
+    ctrl: &ControlTx,
     ingress_bridge: &B,
+    session_ctx: &ServerSessionContext,
 ) -> Result<(), TransportError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
     B: IngressBridge,
 {
-    // 1. Parse the Data payload (zero-copy)
+    // 1. Parse the Data payload (zero-copy).
     let mut payload_buf = frame.payload.clone();
     let parsed = ParsedDataPayload::decode(&mut payload_buf)
         .map_err(|e| TransportError::Protocol(e.into()))?;
@@ -468,7 +802,7 @@ where
         "Received Data frame"
     );
 
-    // 2. Duplicate check
+    // 2. Duplicate check.
     let is_new_frame = session_ctx.l2_state().update_last_received(session_sequence);
     if !is_new_frame {
         tracing::debug!(
@@ -478,76 +812,83 @@ where
         );
         // We MUST ack it so the client can free its UnackedBuffer slot,
         // but we DO NOT consume a credit and DO NOT pass it to the Ingress Bridge.
-        endpoint.send_ack(session_sequence).await?;
+        ctrl.try_send(ControlCommand::Ack { sequence: session_sequence })
+            .map_err(|e| TransportError::Session(
+                format!("Control queue error on Ack (fatal until §13.6): {:?}", e)
+            ))?;
         return Ok(());
     }
 
-    // 3. Attempt to consume hot credit
+    // 3. Attempt to consume hot credit.
     let credit_manager = session_ctx.incoming_credit_manager();
-    if !credit_manager.consume_hot_credit(){
-        // Protocol violation: client sent Data without available credit
+    if !credit_manager.consume_hot_credit() {
+        // Protocol violation: client sent Data without available credit.
         tracing::warn!(
             session_id = session_ctx.session_id(),
             session_sequence,
             "Client violated credit protocol (no hot credits available)"
         );
 
-        // Send Drop frame with reason = buffer_overflow (1)
-        let _ = endpoint.send_drop(session_sequence, 1).await;
-        tracing::warn!(
-            session_id = session_ctx.session_id(),
-            session_sequence,
-            "Sended Drop"
-        );
+        // Send Drop frame with reason = buffer_overflow (1).
+        ctrl.try_send(ControlCommand::Drop { sequence: session_sequence, reason: 1 })
+            .map_err(|e| TransportError::Session(
+                format!("Control queue error on Drop (fatal until §13.6): {:?}", e)
+            ))?;
 
-        // Close the connection
         return Err(ProtocolError::UnexpectedFrame("Client exceeded hot credit limit".into()).into());
     }
 
-    // 4. Try to push to hot buffer
+    // 4. Try to push to hot buffer.
     let buffered_frame = BufferedFrame {
         session_sequence,
         address: address.clone(),
         messages_raw: parsed.messages_raw.clone(),
-    };  
+    };
 
     let hot_buffer = session_ctx.incoming_hot_buffer();
     if !hot_buffer.try_push(buffered_frame).await {
-        // Hot buffer full — backpressure    
-        credit_manager.replenish_hot_credit(); // Вернуть кредит
+        // Hot buffer full — backpressure.
+        credit_manager.replenish_hot_credit(); // Return the credit.
         tracing::warn!(
             session_id = session_ctx.session_id(),
             session_sequence,
             "Hot buffer full"
         );
-        let _ = endpoint.send_drop(session_sequence, 1).await;
+        let _ = ctrl.try_send(ControlCommand::Drop {
+            sequence: session_sequence,
+            reason: 1,
+        });
         return Err(ProtocolError::UnexpectedFrame("Hot buffer full".into()).into());
     }
 
-    // 5. Frame accepted into hot buffer
-    // Credit remains consumed (will be replenished by background processor)
+    // 5. Frame accepted into hot buffer.
+    // Credit remains consumed (will be replenished after processing).
     let hot_buffer_len = session_ctx.incoming_hot_buffer().len().await;
     tracing::debug!(
         session_id = session_ctx.session_id(),
         session_sequence,
         hot_buffer_len,
         "Frame pushed to hot buffer, credit remains consumed"
-    );     
+    );
 
-   
-    // 6. Process the frame (TODO: Stage 6 - Ingress Bridge)
-    // For now, just log that we would process it
-    let ingress_result = ingress_bridge.process(&address, &parsed.messages_raw, session_ctx).await;
+    // 6. Process the frame via the Ingress Bridge.
+    let ingress_result = ingress_bridge
+        .process(&address, &parsed.messages_raw, session_ctx)
+        .await;
 
     match ingress_result {
         IngressResult::Accepted => {
             credit_manager.replenish_hot_credit();
-            
-            // TODO: get frame from hot buffer
+
+            // TODO: get frame from hot buffer by session_sequence, not FIFO
             let _msg = hot_buffer.pop().await;
 
             let hot_buffer_len = session_ctx.incoming_hot_buffer().len().await;
-            endpoint.send_ack(session_sequence).await?;
+            ctrl.try_send(ControlCommand::Ack { sequence: session_sequence })
+                .map_err(|e| TransportError::Session(
+                    format!("Control queue error on Ack (fatal until §13.6): {:?}", e)
+                ))?;
+
             tracing::debug!(
                 session_id = session_ctx.session_id(),
                 session_sequence,
@@ -558,13 +899,20 @@ where
             Ok(())
         }
         IngressResult::AddressBlocked => {
+            credit_manager.replenish_hot_credit();
+            let _ = hot_buffer.pop().await;
+
             tracing::warn!(
                 session_id = session_ctx.session_id(),
                 session_sequence,
-                "Address blocked, credit remains consumed (TODO: Stage 10 Cold Buffer)"
+                "Address blocked, cold pool not implemented; frame dropped"
             );
-            // TODO: In Stage 10, moving to the Cold Buffer will happen here.
-            // For now, we don't send an Ack and don't return the credit.
+
+            ctrl.try_send(ControlCommand::Drop { sequence: session_sequence, reason: 1 })
+                .map_err(|e| TransportError::Session(
+                    format!("Control queue error on Drop (fatal until §13.6): {:?}", e)
+                ))?;
+
             Ok(())
         }
         IngressResult::Rejected(reason) => {
@@ -574,8 +922,183 @@ where
                 reason = %reason,
                 "Ingress Bridge rejected frame, credit remains consumed"
             );
-            let _ = endpoint.send_drop(session_sequence, 3).await; // 3 = processing_error
+            ctrl.try_send(ControlCommand::Drop { sequence: session_sequence, reason: 2 })
+                .map_err(|e| TransportError::Session(
+                    format!("Control queue error on Drop (fatal until §13.6): {:?}", e)
+                ))?;
             Err(ProtocolError::UnexpectedFrame(reason).into())
+        }
+    }
+}
+
+/// Handles an incoming `Acknowledge` frame (0x03).
+///
+/// Removes the matching frame from our `UnackedBuffer` and replenishes one
+/// outgoing credit. Idempotent: a duplicate Ack for an already-acknowledged
+/// sequence is silently ignored.
+fn handle_ack_frame(
+    frame: &Frame,
+    session_ctx: &ServerSessionContext,
+) -> Result<(), TransportError> {
+    if frame.payload.len() < 8 {
+        return Err(TransportError::Session(
+            "Malformed Acknowledge frame (too short)".to_string(),
+        ));
+    }
+
+    let mut payload = frame.payload.clone();
+    let ack_seq = payload.get_u64_le();
+
+    // `acknowledge` removes the frame from UnackedBuffer and replenishes
+    // one outgoing credit.
+    if session_ctx.outgoing_unacked_buffer().acknowledge(ack_seq) {
+        session_ctx.outgoing_credit_pool().replenish();
+        tracing::debug!(
+            session_id = session_ctx.session_id(),
+            ack_seq,
+            "Acknowledged outgoing frame"
+        );
+    } else {
+        tracing::warn!(
+            session_id = session_ctx.session_id(),
+            ack_seq,
+            "Received Ack for unknown or already acknowledged sequence"
+        );
+    }
+
+    Ok(())
+}
+
+/// Handles an incoming `Drop` frame (0x04).
+///
+/// Removes the matching frame from our `UnackedBuffer` and replenishes one
+/// outgoing credit. TODO (Stage 10): start `drop_cooldown_ms` for the
+/// affected address.
+fn handle_drop_frame(
+    frame: &Frame,
+    session_ctx: &ServerSessionContext,
+) -> Result<(), TransportError> {
+    if frame.payload.len() < 9 {
+        return Err(TransportError::Session(
+            "Malformed Drop frame (too short)".to_string(),
+        ));
+    }
+
+    let mut payload = frame.payload.clone();
+    let drop_seq = payload.get_u64_le();
+    let reason = payload.get_u8();
+
+    // `remove` frees the slot; credit replenishment is done here for
+    // consistency with Ack handling.
+    if session_ctx.outgoing_unacked_buffer().remove(drop_seq) {
+        session_ctx.outgoing_credit_pool().replenish();
+        tracing::debug!(
+            session_id = session_ctx.session_id(),
+            drop_seq,
+            reason,
+            "Peer dropped our frame"
+        );
+        // TODO: start drop_cooldown_ms for the affected address (L2 §8.4)
+    } else {
+        tracing::warn!(
+            session_id = session_ctx.session_id(),
+            drop_seq,
+            "Received Drop for unknown or already removed sequence"
+        );
+    }
+
+    Ok(())
+}
+
+/// Handles an incoming `CreditGrant` frame (0x02).
+///
+/// Hot grants are applied to `outgoing_credit_pool` via
+/// `SessionContext::grant_outgoing_credits`. Cold grants are logged for now
+/// (Stage 10 will route them into the cold pool).
+fn handle_credit_grant_frame(
+    frame: &Frame,
+    session_ctx: &ServerSessionContext,
+) -> Result<(), TransportError> {
+    let mut payload_buf = frame.payload.clone();
+    match CreditGrantPayload::decode(&mut payload_buf) {
+        Ok(cg) => {
+            let is_new = session_ctx.l2_state().update_last_received(cg.session_sequence);
+            if !is_new {
+                tracing::debug!(
+                    session_id = session_ctx.session_id(),
+                    seq = cg.session_sequence,
+                    "Duplicate CreditGrant received, ignoring"
+                );
+                return Ok(());
+            }
+
+            match cg.credit_type {
+                CreditGrantPayload::CREDIT_TYPE_HOT => {
+                    session_ctx.grant_outgoing_credits(cg.credit_amount);
+                    tracing::debug!(
+                        session_id = session_ctx.session_id(),
+                        credit_amount = cg.credit_amount,
+                        address = %String::from_utf8_lossy(&cg.address),
+                        "Received hot CreditGrant from peer"
+                    );
+                }
+                CreditGrantPayload::CREDIT_TYPE_COLD => {
+                    tracing::debug!(
+                        session_id = session_ctx.session_id(),
+                        credit_amount = cg.credit_amount,
+                        address = %String::from_utf8_lossy(&cg.address),
+                        "Received cold CreditGrant from peer (not yet implemented)"
+                    );
+                }
+                _ => {
+                    tracing::warn!(
+                        session_id = session_ctx.session_id(),
+                        credit_type = cg.credit_type,
+                        "Unknown credit_type in CreditGrant frame"
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(
+                session_id = session_ctx.session_id(),
+                error = %e,
+                "Failed to decode CreditGrant frame"
+            );
+            Err(TransportError::Protocol(e.into()))
+        }
+    }
+}
+
+/// Handles an incoming `Ping` frame (0x10) by enqueuing a `Pong` reply.
+///
+/// The reply is dispatched via `ControlTx::try_pong`, which is
+/// non-blocking and silently drops the reply if the pong lane is full
+/// (the prober will re-ping on its own schedule).
+///
+/// A malformed Ping (payload size != 16) is reported as a session error
+/// and tears the connection down.
+fn handle_ping_frame(
+    frame: &Frame,
+    ctrl: &ControlTx,
+) -> Result<(), TransportError> {
+    let response_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    match PongEcho::from_ping_payload(&frame.payload, response_timestamp) {
+        Some(echo) => {
+            ctrl.try_pong(echo);
+            tracing::debug!("Enqueued Pong reply");
+            Ok(())
+        }
+        None => {
+            tracing::warn!("Malformed Ping frame (payload size != 16)");
+            Err(TransportError::Session(
+                "Malformed Ping frame".to_string(),
+            ))
         }
     }
 }

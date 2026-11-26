@@ -8,18 +8,28 @@
 // except according to those terms.
 
 mod connector;
+mod control;
 mod endpoint;
 mod transport;
-pub mod uds;
+mod uds;
 
 pub use connector::IPCConnector;
+pub use control::{
+    create_control_channel,
+    ControlCommand,
+    ControlRx,
+    ControlTx,
+    PongEcho,
+};
 pub use endpoint::{
     EndpointStateAccess,
-    FrameSender,
     EndpointStateExt,
     EndpointWriter,
     EndpointWriterExt,
-    IPCEndpoint
+    IPCEndpoint,
+    IPCEndpointReader,
+    IPCEndpointWriter,
+    FrameSender,
 };
 pub use transport::IPCFramedStream;
 pub use uds::UdsConnector;
