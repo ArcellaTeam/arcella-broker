@@ -45,8 +45,8 @@ mod slot;
 
 pub use address_spec::AddressSpec;
 pub use error::RegistryError;
-pub use slot::SubscriptionSlot;
-pub use routing::{RoutingPolicy, RouteTarget};
+pub use slot::{SubscriptionSlot, AttachError};
+pub use routing::{RoutingPolicy, RouteTarget, Attachment};
 pub use load_balanced_group::LoadBalancedGroup;
 
 /// Internal state of the registry, protected by a `RwLock`.
@@ -1226,7 +1226,7 @@ mod tests {
             assert!(!registry.has_local(addr));
         }
 
-        /// Удаление prefix wildcard адреса (заканчивается на `**`)
+        /// Removal of a prefix wildcard address (ends with `**`)
         #[test]
         fn test_remove_prefix_wildcard_address() {
             let registry = LocalRegistry::new();
@@ -1235,19 +1235,19 @@ mod tests {
             let target = RouteTarget::new_exclusive(slot());
             registry.register(wildcard.to_string(), target).unwrap();
 
-            // Wildcard матчит конкретные адреса
+            // Wildcard matches concrete addresses
             assert!(registry.has_route("arcella:core:users"));
             assert!(registry.has_route("arcella:core:events:created"));
 
-            // Удаляем сам wildcard
+            // Removing the wildcard itself
             assert!(registry.remove_by_name(wildcard).is_ok());
 
-            // Конкретные адреса больше не матчатся
+            // Concrete addresses are no longer matched
             assert!(!registry.has_route("arcella:core:users"));
             assert!(!registry.has_route("arcella:core:events:created"));
         }
 
-        /// Удаление single wildcard адреса (содержит `*` в середине)
+        /// Removal of a single wildcard address (contains `*` in the middle)
         #[test]
         fn test_remove_single_wildcard_address() {
             let registry = LocalRegistry::new();
@@ -1256,7 +1256,7 @@ mod tests {
             let target = RouteTarget::new_exclusive(slot());
             registry.register(wildcard.to_string(), target).unwrap();
 
-            // Wildcard матчит конкретные адреса
+            // Wildcard matches concrete addresses
             assert!(registry.has_route("arcella:core:users"));
             assert!(registry.has_route("arcella:web:users"));
 

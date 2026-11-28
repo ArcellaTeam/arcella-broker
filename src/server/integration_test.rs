@@ -914,5 +914,5 @@ mod tests {
 
         server.shutdown();
         let _ = server_handle.await;
-    }    
+    }
 }

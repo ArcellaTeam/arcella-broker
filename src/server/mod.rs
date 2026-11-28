@@ -20,6 +20,7 @@ use crate::broker_core::security::{
 
 mod listener;
 mod connection_handler;
+mod subscription_bridge;
 
 pub use listener::run_listener;
 pub use connection_handler::handle_connection;

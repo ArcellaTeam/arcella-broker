@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::broker_core::{IngressBridge, IngressResult};
 use crate::broker_core::l2::{SessionState, BufferedFrame};
-use crate::broker_core::registry::LocalRegistry;
+use crate::broker_core::registry::{LocalRegistry, RouteTarget, SubscriptionSlot};
 use crate::broker_core::security::{
     HandshakeError, 
     HandshakeHandler, 
@@ -25,6 +25,12 @@ use crate::broker_core::security::{
     SessionManager
 };
 use crate::broker_core::transport::{
+    create_control_channel, 
+    create_egress_channel,
+    CreditCoalescer,
+    EgressRx,
+    EgressTx,
+    EgressCommand,
     EndpointWriterExt,
     IPCEndpoint, 
     IPCEndpointReader,
@@ -35,7 +41,6 @@ use crate::broker_core::transport::{
     PongEcho,
     IPCFramedStream, 
     TransportError,
-    create_control_channel, 
 };
 use crate::protocol::{
     Frame, FrameType,
@@ -52,7 +57,24 @@ use crate::protocol::{
     utils::validate_address,
 };
 
-use crate::broker_core::registry::{SubscriptionSlot, RouteTarget};
+struct ConnectionCleanup {
+    connection_token: CancellationToken,
+    session_manager: Arc<SessionManager>,
+    session_id: u64,
+    peer_addr: String,
+}
+
+impl Drop for ConnectionCleanup {
+    fn drop(&mut self) {
+        self.connection_token.cancel();
+        self.session_manager.remove_session(self.session_id);
+        tracing::info!(
+            session_id = self.session_id,
+            peer = %self.peer_addr,
+            "Connection closed, session removed"
+        );
+    }
+}
 
 /// Handles a single IPC connection from accept to disconnect.
 ///
@@ -108,26 +130,18 @@ where
     //      │  (child)
     //      ▼
     //   connection_token                      <- observed by reader + writer
-    //
-    // This gives us both directions of shutdown:
-    //   * GC -> session token -> connection token -> both tasks wake up.
-    //   * Fatal error inside reader/writer -> connection_token.cancel()
-    //     wakes the other half AND signals the `select!` in supervisor.
+    //      │  (child)
+    //      ▼
+    //   binding tokens                        <- subscription lifetime (17.5)
     let connection_token = session_ctx.cancellation_token.child_token();
 
-    // Local routing binding
-    let source_prefix = session_ctx.source_prefix().to_string();
-    let slot_token = CancellationToken::new();
-
-    let slot = SubscriptionSlot::new(10, slot_token); // TODO: need to remove magic
-    let target = RouteTarget::new_exclusive(slot.clone());
-
-    if let Err(e) = local_registry.register(source_prefix, target) {
-        // Failed before Phase 2 — remove the session now so we don't
-        // accumulate phantom sessions on repeated handshake failures.
-        session_manager.remove_session(session_ctx.session_id());
-        return Err(TransportError::Registry(e));
-    }
+        // Arm cleanup BEFORE the supervisor so any exit path removes the session.
+    let _cleanup = ConnectionCleanup {
+        connection_token: connection_token.clone(),
+        session_manager: session_manager.clone(),
+        session_id: session_ctx.session_id(),
+        peer_addr: peer_addr.clone(),
+    };
 
     // === Phase 2: Supervisor ===
     let result = run_connection_supervisor(
@@ -137,19 +151,6 @@ where
         connection_token,
     )
     .await;
-
-    // === Phase 3: Mandatory cleanup ===
-    // Runs exactly once on ANY exit path (close frame, EOF, transport error,
-    // cancellation). The supervisor is responsible for cancelling its own
-    // connection_token before returning, so by the time we get here both
-    // halves (future) are already stopped.
-    session_manager.remove_session(session_ctx.session_id());
-
-    tracing::info!(
-        session_id = session_ctx.session_id(),
-        peer = %peer_addr,
-        "Connection closed, session removed"
-    );             
 
     result
 }

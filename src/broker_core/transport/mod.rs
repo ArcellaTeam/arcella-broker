@@ -75,10 +75,15 @@ mod ipc;
 #[cfg(all(feature = "ipc", unix))]
 pub use ipc::{
     create_control_channel,
+    create_egress_channel,
     ControlCommand,
     ControlRx,
     ControlTx,
+    CreditCoalescer,
     PongEcho,
+    EgressRx,
+    EgressTx,
+    EgressCommand,
     EndpointStateAccess,
     EndpointStateExt,
     EndpointWriter,

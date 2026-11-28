@@ -43,35 +43,41 @@ use super::{PayloadError, SubscribePayloadError};
 // ============================================================================
 
 /// Subscription attached / unsubscription completed successfully.
-pub const SUB_STATUS_SUCCESS: u8 = 0;
+pub const SUB_STATUS_SUCCESS: u8 = 0x00;
 /// No address with the given name is registered.
-pub const SUB_STATUS_ADDRESS_NOT_FOUND: u8 = 1;
-/// Exclusive address already has an active consumer (another session).
-pub const SUB_STATUS_EXCLUSIVE_OCCUPIED: u8 = 2;
-/// This session is already subscribed to the given address.
-pub const SUB_STATUS_ALREADY_SUBSCRIBED: u8 = 3;
+pub const SUB_STATUS_ADDRESS_NOT_FOUND: u8 = 0x01;
+/// The address is occupied by an Exclusive binding (another session).
+pub const SUB_STATUS_ADDRESS_OCCUPIED: u8 = 0x02;
+/// Routing policy / wildcard pattern conflict.
+pub const SUB_STATUS_POLICY_CONFLICT: u8 = 0x03;
+/// Invalid address or wildcard pattern format. 
+pub const SUB_STATUS_INVALID_ADDRESS: u8 = 0x04;
 /// The session is not allowed to consume this address (ACL / hierarchy).
-pub const SUB_STATUS_PERMISSION_DENIED: u8 = 4;
-/// The address policy is not supported yet (e.g. Broadcast before Stage N).
-pub const SUB_STATUS_POLICY_UNSUPPORTED: u8 = 5;
-/// Internal broker error (registry, channel, task spawn, ...).
-pub const SUB_STATUS_INTERNAL_ERROR: u8 = 6;
-/// Unsubscribe failed: this session has no subscription for the address.
-pub const SUB_STATUS_NOT_SUBSCRIBED: u8 = 7;
+pub const SUB_STATUS_PERMISSION_DENIED: u8 = 0x05;
 /// The session already holds `ServerLimits::max_addresses_per_session`
 /// consumer bindings and cannot attach one more.
-pub const SUB_STATUS_BINDING_LIMIT: u8 = 8;
+pub const SUB_STATUS_QUOTA_EXCEEDED: u8 = 0x06;
+/// Internal broker error (registry, channel, task spawn, ...).
+pub const SUB_STATUS_INTERNAL_ERROR: u8 = 0x07;
+/// This session is already subscribed to the given address.
+pub const SUB_STATUS_ALREADY_SUBSCRIBED: u8 = 0x08;
+/// The address policy is not supported yet (e.g. Broadcast before Stage N).
+pub const SUB_STATUS_POLICY_UNSUPPORTED: u8 = 0x09;
+/// Unsubscribe failed: this session has no subscription for the address.
+pub const SUB_STATUS_NOT_SUBSCRIBED: u8 = 0x0A;
 
 // ============================================================================
 // Routing policy codes (mirror of `RoutingPolicy`, wire-stable)
 // ============================================================================
 
-pub const SUB_POLICY_EXCLUSIVE: u8 = 0;
-pub const SUB_POLICY_LOAD_BALANCED: u8 = 1;
-/// Reserved: fan-out delivery (future stage).
-pub const SUB_POLICY_BROADCAST: u8 = 2;
 /// No policy associated with this response (failure or Unsubscribe).
-pub const SUB_POLICY_NONE: u8 = 0xFF;
+pub const SUB_POLICY_NONE: u8 = 0x00;
+
+pub const SUB_POLICY_EXCLUSIVE: u8 = 0x01;
+
+pub const SUB_POLICY_LOAD_BALANCED: u8 = 0x02;
+/// Reserved: fan-out delivery (future stage).
+pub const SUB_POLICY_BROADCAST: u8 = 0x03;
 
 /// Fixed part of SubscribeAck:
 /// request_id(8) + status(1) + policy(1) + queue_capacity(4) + msg_len(2).
@@ -91,13 +97,15 @@ pub fn is_known_status(status: u8) -> bool {
         status,
         SUB_STATUS_SUCCESS
             | SUB_STATUS_ADDRESS_NOT_FOUND
-            | SUB_STATUS_EXCLUSIVE_OCCUPIED
-            | SUB_STATUS_ALREADY_SUBSCRIBED
+            | SUB_STATUS_ADDRESS_OCCUPIED
+            | SUB_STATUS_POLICY_CONFLICT
+            | SUB_STATUS_INVALID_ADDRESS
             | SUB_STATUS_PERMISSION_DENIED
-            | SUB_STATUS_POLICY_UNSUPPORTED
+            | SUB_STATUS_QUOTA_EXCEEDED
             | SUB_STATUS_INTERNAL_ERROR
+            | SUB_STATUS_ALREADY_SUBSCRIBED
+            | SUB_STATUS_POLICY_UNSUPPORTED
             | SUB_STATUS_NOT_SUBSCRIBED
-            | SUB_STATUS_BINDING_LIMIT
     )
 }
 
@@ -115,13 +123,15 @@ pub fn status_name(status: u8) -> &'static str {
     match status {
         SUB_STATUS_SUCCESS => "success",
         SUB_STATUS_ADDRESS_NOT_FOUND => "address_not_found",
-        SUB_STATUS_EXCLUSIVE_OCCUPIED => "exclusive_occupied",
-        SUB_STATUS_ALREADY_SUBSCRIBED => "already_subscribed",
+        SUB_STATUS_ADDRESS_OCCUPIED => "address_occupied",
+        SUB_STATUS_POLICY_CONFLICT => "policy_conflict",
+        SUB_STATUS_INVALID_ADDRESS => "invalid_address",
         SUB_STATUS_PERMISSION_DENIED => "permission_denied",
-        SUB_STATUS_POLICY_UNSUPPORTED => "policy_unsupported",
+        SUB_STATUS_QUOTA_EXCEEDED => "quota_exceeded",
         SUB_STATUS_INTERNAL_ERROR => "internal_error",
+        SUB_STATUS_ALREADY_SUBSCRIBED => "already_subscribed",
+        SUB_STATUS_POLICY_UNSUPPORTED => "policy_unsupported",
         SUB_STATUS_NOT_SUBSCRIBED => "not_subscribed",
-        SUB_STATUS_BINDING_LIMIT => "binding_limit",
         _ => "unknown",
     }
 }
@@ -307,7 +317,6 @@ impl SubscribeAckPayload {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,13 +350,15 @@ mod tests {
     fn failure_roundtrip_all_statuses() {
         for status in [
             SUB_STATUS_ADDRESS_NOT_FOUND,
-            SUB_STATUS_EXCLUSIVE_OCCUPIED,
-            SUB_STATUS_ALREADY_SUBSCRIBED,
+            SUB_STATUS_ADDRESS_OCCUPIED,
+            SUB_STATUS_POLICY_CONFLICT,
+            SUB_STATUS_INVALID_ADDRESS,
             SUB_STATUS_PERMISSION_DENIED,
-            SUB_STATUS_POLICY_UNSUPPORTED,
+            SUB_STATUS_QUOTA_EXCEEDED,
             SUB_STATUS_INTERNAL_ERROR,
+            SUB_STATUS_ALREADY_SUBSCRIBED,
+            SUB_STATUS_POLICY_UNSUPPORTED,
             SUB_STATUS_NOT_SUBSCRIBED,
-            SUB_STATUS_BINDING_LIMIT,
         ] {
             let p = SubscribeAckPayload::failure(9, status, "reason");
             let mut bytes = p.encode().unwrap();
@@ -502,7 +513,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn decode_rejects_success_policy_without_capacity() {
         let p = SubscribeAckPayload::success(1, 1024, SUB_POLICY_EXCLUSIVE);
@@ -559,8 +569,8 @@ mod tests {
     #[test]
     fn status_names_are_defined() {
         assert_eq!(status_name(SUB_STATUS_SUCCESS), "success");
-        assert_eq!(status_name(SUB_STATUS_EXCLUSIVE_OCCUPIED), "exclusive_occupied");
-        assert_eq!(status_name(SUB_STATUS_BINDING_LIMIT), "binding_limit");
+        assert_eq!(status_name(SUB_STATUS_ADDRESS_OCCUPIED), "address_occupied");
+        assert_eq!(status_name(SUB_STATUS_QUOTA_EXCEEDED), "quota_exceeded");
         assert_eq!(status_name(200), "unknown");
     }
 }

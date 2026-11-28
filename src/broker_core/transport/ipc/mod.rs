@@ -9,6 +9,7 @@
 
 mod connector;
 mod control;
+mod egress;
 mod endpoint;
 mod transport;
 mod uds;
@@ -20,6 +21,13 @@ pub use control::{
     ControlRx,
     ControlTx,
     PongEcho,
+};
+pub use egress::{
+    create_egress_channel,
+    CreditCoalescer,
+    EgressRx,
+    EgressTx,
+    EgressCommand,
 };
 pub use endpoint::{
     EndpointStateAccess,

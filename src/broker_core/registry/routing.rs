@@ -12,18 +12,68 @@ use std::sync::{
     Arc,
     Weak,
 };
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::protocol::Message;
 
 use super::LocalRegistry;
 use super::super::transport::{
+    MessageReceiver,
     RequestSender,
     TransportError, 
 };
 
 use super::load_balanced_group::LoadBalancedGroup;
+use super::slot::AttachError;
 use super::SubscriptionSlot;
+
+/// A successfully claimed consumer binding on a routing target.
+///
+/// Carries everything needed to build a consumer's read engine without reaching
+/// into the target's internals. The registry stays unaware of `Subscriber`: it
+/// hands out read handles, not read engines.
+///
+/// # Contract
+///
+/// This is a claimed resource, not a passive value. Dropping it does NOT release
+/// anything: the owner MUST call [`RouteTarget::detach`] exactly once, otherwise
+/// the Exclusive flag stays set forever or the LoadBalanced consumer counter
+/// leaks (and the group never observes emptiness).
+#[must_use = "a claimed binding must be released with RouteTarget::detach"]
+pub enum Attachment {
+    /// Exclusive: read the address queue directly (Push).
+    Push {
+        receiver: Arc<Mutex<MessageReceiver>>,
+        address_token: CancellationToken,
+        queue_capacity: usize,
+    },
+
+    /// LoadBalanced: request messages from the group dispatcher (Pull).
+    Pull {
+        req_sender: Arc<RequestSender>,
+        address_token: CancellationToken,
+        queue_capacity: usize,
+    },
+}
+
+impl Attachment {
+    /// Address-scoped token the binding token must be derived from.
+    #[inline]
+    pub fn address_token(&self) -> &CancellationToken {
+        match self {
+            Self::Push { address_token, .. } | Self::Pull { address_token, .. } => address_token,
+        }
+    }
+
+    /// Configured queue capacity of the address (for metrics / protocol acks).
+    #[inline]
+    pub fn queue_capacity(&self) -> usize {
+        match self {
+            Self::Push { queue_capacity, .. } | Self::Pull { queue_capacity, .. } => *queue_capacity,
+        }
+    }
+}
 
 /// Message Delivery Policy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +117,69 @@ impl RouteTarget {
             registry,
             address,
         )))
+    }
+
+    /// Atomically registers one consumer on this target according to its policy.
+    ///
+    /// This is the single concurrency-safe entry point for attaching a consumer:
+    ///
+    /// * **Exclusive** — one CAS claims the slot's binding flag. Concurrent
+    ///   callers get [`AttachError::Occupied`]; a removed address yields
+    ///   [`AttachError::Removed`]. Re-attach after detach is allowed.
+    /// * **LoadBalanced** — joins the consumer group; many consumers are legal by
+    ///   definition, so no occupancy check applies.
+    ///
+    /// # Contract
+    ///
+    /// Every `Ok` MUST be paired with exactly one [`Self::detach`] by its owner.
+    /// The claim is not released on drop of [`Attachment`].
+    pub fn try_attach(&self) -> Result<Attachment, AttachError> {
+        match self {
+            Self::Single(slot) => {
+                slot.try_attach_exclusive()?;
+                Ok(Attachment::Push {
+                    receiver: slot.receiver(),
+                    address_token: slot.address_token().clone(),
+                    queue_capacity: slot.capacity(),
+                })
+            }
+            Self::LoadBalanced(group) => {
+                // A group with zero consumers is alive, so `is_empty` is NOT a
+                // removal signal. The group token is: `shutdown` cancels it, and
+                // it is a child of the slot token, so control-plane removal
+                // propagates here as well.
+                if group.address_token().is_cancelled() {
+                    return Err(AttachError::Removed);
+                }
+                Ok(Attachment::Pull {
+                    req_sender: group.subscribe(),
+                    address_token: group.address_token().clone(),
+                    queue_capacity: group.slot.capacity(),
+                })
+            }
+        }
+    }
+
+    /// Releases a claim obtained from [`Self::try_attach`].
+    ///
+    /// # Contract
+    ///
+    /// Exactly once per successful attach, by its owner. Calling it without a
+    /// claim releases somebody else's Exclusive binding or underflows the group's
+    /// consumer counter.
+    pub fn detach(&self) {
+        match self {
+            Self::Single(slot) => slot.detach_exclusive(),
+            Self::LoadBalanced(group) => group.remove_consumer(),
+        }
+    }
+
+    /// Configured queue capacity of the underlying address.
+    pub fn capacity(&self) -> usize {
+        match self {
+            Self::Single(slot) => slot.capacity(),
+            Self::LoadBalanced(group) => group.slot.capacity(),
+        }
     }
 
     /// Sends a message. Delegates either directly to the channel or to the group.
@@ -175,5 +288,91 @@ impl RouteTarget {
             Self::LoadBalanced(group) => group.is_empty(),
             //Self::Broadcast(group) => group.is_empty(),
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot() -> Arc<SubscriptionSlot> {
+        SubscriptionSlot::new(8, CancellationToken::new())
+    }
+
+    #[test]
+    fn exclusive_attach_is_exclusive_and_reattachable() {
+        let target = RouteTarget::new_exclusive(slot());
+
+        let first = target.try_attach().unwrap();
+        assert!(matches!(first, Attachment::Push { .. }));
+        assert_eq!(first.queue_capacity(), 8);
+
+        assert_eq!(target.try_attach().err(), Some(AttachError::Occupied));
+
+        target.detach();
+        assert!(target.try_attach().is_ok());
+        target.detach();
+    }
+
+    #[test]
+    fn removed_target_refuses_attach() {
+        let target = RouteTarget::new_exclusive(slot());
+        target.remove_self();
+        assert_eq!(target.try_attach().err(), Some(AttachError::Removed));
+    }
+
+    #[test]
+    fn concurrent_exclusive_attach_has_one_winner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let target = RouteTarget::new_exclusive(slot());
+        let winners = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..32 {
+            let target = Arc::clone(&target);
+            let winners = Arc::clone(&winners);
+            handles.push(thread::spawn(move || {
+                if target.try_attach().is_ok() {
+                    winners.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(winners.load(Ordering::SeqCst), 1);
+        target.detach();
+        assert!(target.try_attach().is_ok());
+        target.detach();
+    }
+
+    #[tokio::test]
+    async fn load_balanced_allows_many_consumers() {
+        let target = RouteTarget::new_load_balanced(
+            slot(),
+            4,
+            Weak::new(),
+            "arcella:lb:test".to_string(),
+        );
+
+        let a = target.try_attach().unwrap();
+        let b = target.try_attach().unwrap();
+        assert!(matches!(a, Attachment::Pull { .. }));
+        assert!(matches!(b, Attachment::Pull { .. }));
+
+        let group = target.load_balanced_group().unwrap();
+        assert_eq!(group.consumer_count(), 2);
+
+        target.detach();
+        assert_eq!(group.consumer_count(), 1);
+        target.detach();
+        assert_eq!(group.consumer_count(), 0);
+
+        target.remove_self();
+        assert_eq!(target.try_attach().err(), Some(AttachError::Removed));
     }
 }
