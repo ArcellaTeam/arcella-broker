@@ -45,8 +45,8 @@ mod slot;
 
 pub use address_spec::AddressSpec;
 pub use error::RegistryError;
-pub use slot::SubscriptionSlot;
-pub use routing::{RoutingPolicy, RouteTarget};
+pub use slot::{SubscriptionSlot, AttachError};
+pub use routing::{RoutingPolicy, RouteTarget, Attachment};
 pub use load_balanced_group::LoadBalancedGroup;
 
 /// Internal state of the registry, protected by a `RwLock`.
