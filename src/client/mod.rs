@@ -45,6 +45,8 @@ use crate::{
     broker_core::{
         registry::{
             AddressSpec,
+            AttachError,
+            Attachment,
             RegistryError, 
             RegisterResult,
             RoutingPolicy,
@@ -62,6 +64,60 @@ use crate::{
 
 use publisher::Publisher;
 use reply_dispatcher::ReplyDispatcher;
+
+/// RAII guard for a client consumer binding.
+///
+/// Owns two things that must be released together:
+/// - the `SubscriptionHandle` (binding-scoped cancellation token);
+/// - the claim taken by [`RouteTarget::try_attach`] on the address.
+///
+/// Dropping this guard detaches the consumer AND releases the claim: the
+/// Exclusive attach flag is cleared, or the LoadBalanced consumer counter is
+/// decremented. The address itself, its queue and buffered messages are never
+/// touched — address lifecycle belongs to the control plane.
+///
+/// Without this pairing the claim would leak: an Exclusive address would stay
+/// permanently occupied, and a LoadBalanced group would never observe emptiness.
+#[must_use = "dropping the handle immediately detaches the consumer"]
+pub struct ClientSubscriptionHandle {
+    handle: SubscriptionHandle,
+    target: Arc<RouteTarget>,
+}
+
+impl ClientSubscriptionHandle {
+    fn new(handle: SubscriptionHandle, target: Arc<RouteTarget>) -> Self {
+        Self { handle, target }
+    }
+
+    /// Returns the logical address this binding is attached to.
+    #[inline]
+    pub fn address(&self) -> &str {
+        self.handle.address()
+    }
+
+    /// Returns a reference to the binding-scoped cancellation token.
+    #[inline]
+    pub fn cancel_token(&self) -> &CancellationToken {
+        self.handle.cancel_token()
+    }
+
+    /// Whether this binding has been detached.
+    #[inline]
+    pub fn is_detached(&self) -> bool {
+        self.handle.is_detached()
+    }
+}
+
+impl Drop for ClientSubscriptionHandle {
+    fn drop(&mut self) {
+        // Stop the consumer FIRST, then release the claim. The reverse order
+        // would let a new Exclusive consumer attach while this one is still
+        // reading from the same queue.
+        self.handle.cancel_token().cancel();
+        self.target.detach();
+        // `handle` drops next; its own cancel is idempotent.
+    }
+}
 
 /// The primary client interface for interacting with the Arcella message broker.
 ///
@@ -92,7 +148,8 @@ pub struct BrokerClient {
     /// Guarantees the absence of memory leaks upon abnormal termination of the component.
     reply_dispatcher: Arc<ReplyDispatcher>,
 
-    binding_token: CancellationToken,
+    /// Reply channel slot, held to release the Exclusive consumer claim on drop.
+    reply_slot: Arc<SubscriptionSlot>,    
 }
 
 impl BrokerClient {
@@ -113,18 +170,29 @@ impl BrokerClient {
         let reply_spec = AddressSpec::reply_channel(config.reply_channel_capacity);
         let reply_slot = broker.create_address(client_address.clone(), reply_spec)?;  
 
-        // 2. Extracting the reply_address_token from the slot
-        let reply_address_token = reply_slot.address_token().clone();
-        let binding_token = reply_address_token.child_token();     
+        // 2. Claim the Exclusive consumer binding of the reply channel, so that
+        //    no other consumer (including `subscribe(client_address)`) can attach
+        //    to it. The slot is freshly created, so this normally succeeds.
+        if reply_slot.try_attach_exclusive().is_err() {
+            // Roll back the control-plane registration: leaving the route
+            // registered without an owner would leak a zombie address.
+            let _ = broker.delete_address(&client_address);
+            return Err(BrokerError::RegistryError(
+                RegistryError::AddressAlreadyOccupied(client_address.clone()),
+            ));
+        }
         
         // 3. Extracting the receiver from the slot for the ReplyDispatcher
         let reply_receiver = reply_slot.receiver();        
 
-        // 4. Create the subscriber and dispatcher to handle responses
+        // 4. Create the subscriber and dispatcher to handle responses.
+        //    The REAL address token is passed: the constructor derives the
+        //    binding token from it, keeping `Detached` distinguishable from
+        //    `AddressRemoved`.
         let (reply_subscriber, reply_cancel_token) = Subscriber::new_push(
             reply_receiver,
             client_address.clone(), 
-            reply_address_token
+            reply_slot.address_token().clone(),
         );
         let reply_dispatcher = Arc::new(ReplyDispatcher::new(reply_subscriber));
         let reply_handle = SubscriptionHandle::new(client_address.clone(), reply_cancel_token);
@@ -138,7 +206,7 @@ impl BrokerClient {
             client_address,
             _reply_handle: reply_handle,
             reply_dispatcher,
-            binding_token,
+            reply_slot,
         })
     }
 
@@ -151,49 +219,55 @@ impl BrokerClient {
     ///
     /// Returns a tuple of:
     /// - `Subscriber`: the data receiver (move into a background task).
-    /// - `SubscriptionHandle`: the RAII guard (keep in the parent scope).
-    ///   Dropping the handle unregisters the subscription.
+    /// - `ClientSubscriptionHandle`: the RAII guard (keep in the parent scope).
+    ///   Dropping it detaches the consumer and releases the address claim; the
+    ///   address and its queue are never unregistered.
     ///
     /// # Routing Policy
-    /// The subscription type is determined by `SubscriberConfig::routing_policy`:
-    /// - `Exclusive` (default): Exclusive binding. Fails if address is occupied.
-    /// - `LoadBalanced`: Adds to a Round-Robin group. Fails if address is registered as Exclusive or Broadcast
-    /// - `Broadcast`: Adds to a Fan-out group. Fails if address is registered as Exclusive or LoadBalanced.
+    /// The delivery model is a property of the address, fixed by the control
+    /// plane at creation time — the client cannot choose it:
+    /// - `Exclusive`: a single attached consumer. A second attach fails with
+    ///   `AddressAlreadyOccupied`; re-attach after detach is allowed.
+    /// - `LoadBalanced`: joins the Round-Robin consumer group.
+    ///
+    /// # Errors
+    /// - `AddressNotFound`: no route for the address, or it was removed by the
+    ///   control plane.
+    /// - `AddressAlreadyOccupied`: the Exclusive binding is held by another
+    ///   consumer.
     pub fn subscribe(
         &self,
         address: String,
-    ) -> Result<(Subscriber, SubscriptionHandle), BrokerError> {
+    ) -> Result<(Subscriber, ClientSubscriptionHandle), BrokerError> {
         let target = self.broker.registry.lookup(&address)
             .ok_or_else(|| BrokerError::RegistryError(RegistryError::AddressNotFound(address.clone())))?;
 
-        // 2. Get address_token from the target and create binding child token
-        let address_token = target.address_token()
-            .ok_or_else(|| BrokerError::RegistryError(RegistryError::AddressNotFound(address.clone())))?
-            .clone();
-        let binding_token = address_token.child_token();
+        // Atomically claim the consumer binding according to the address policy:
+        // CAS on the Exclusive flag, or a group join for LoadBalanced. From here
+        // on the claim MUST be paired with exactly one `detach`, which the
+        // returned guard performs on drop.
+        let attachment = target.try_attach().map_err(|e| match e {
+            AttachError::Occupied => BrokerError::RegistryError(
+                RegistryError::AddressAlreadyOccupied(address.clone()),
+            ),
+            AttachError::Removed => BrokerError::RegistryError(
+                RegistryError::AddressNotFound(address.clone()),
+            ),
+        })?;
 
-        match target.as_ref() {
-            RouteTarget::Single(slot) => {
-                let receiver = slot.receiver();
-                let (subscriber, _) = Subscriber::new_push(
-                    receiver,
-                    address.clone(),
-                    binding_token.clone(),
-                );
-                let handle = SubscriptionHandle::new(address, binding_token);
-                Ok((subscriber, handle))    
+        // The constructors derive the binding token from the address token
+        // internally; that token is what the guard must own.
+        let (subscriber, binding_token) = match attachment {
+            Attachment::Push { receiver, address_token, .. } => {
+                Subscriber::new_push(receiver, address.clone(), address_token)
             }
-            RouteTarget::LoadBalanced(group) => {
-                let req_sender = group.subscribe(); // Увеличивает счетчик потребителей
-                let (subscriber, _) = Subscriber::new_pull(
-                    req_sender,
-                    address.clone(),
-                    binding_token.clone(),
-                );
-                let handle = SubscriptionHandle::new(address, binding_token);
-                Ok((subscriber, handle))
-            }    
-        }
+            Attachment::Pull { req_sender, address_token, .. } => {
+                Subscriber::new_pull(req_sender, address.clone(), address_token)
+            }
+        };
+
+        let handle = SubscriptionHandle::new(address, binding_token);
+        Ok((subscriber, ClientSubscriptionHandle::new(handle, target)))
     }
     
     /// Creates a high-performance `Publisher` for the specified address.
@@ -273,7 +347,10 @@ impl BrokerClient {
 
 impl Drop for BrokerClient {
     fn drop(&mut self) {
-        self.binding_token.cancel();
+        // Detach the reply consumer first, then release its claim, and only
+        // then let the control plane remove the address itself.
+        self._reply_handle.cancel_token().cancel();
+        self.reply_slot.detach_exclusive();
         
         if let Err(e) = self.broker.delete_address(&self.client_address) {
             tracing::warn!(

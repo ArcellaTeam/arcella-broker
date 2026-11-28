@@ -10,6 +10,18 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
+use super::payloads::{
+    HelloPayload,
+    WelcomePayload,
+    AuthResponsePayload,
+    AuthResultPayload,
+    CreditGrantPayload,
+    SubscribePayload,
+    SubscribeAckPayload,
+    UnsubscribePayload,
+    DataPayload,
+};
+
 /// Maximum payload size in bytes(16).
 /// Corresponds to the maximum value of u24 (0x00FF_FFFF).
 pub const FRAME_MAX_PAYLOAD_LENGTH: u32 = 0x00FF_FFFF;
@@ -676,6 +688,89 @@ impl Frame {
     /// ```
     pub fn total_size(&self) -> usize {
         FRAME_OVERHEAD + self.payload.len()
+    }
+}
+
+impl From<HelloPayload> for Frame {
+    fn from(payload: HelloPayload) -> Self {
+        // Infallible encode (assert-based length checks inside).
+        let bytes = payload.encode();
+        Frame::new(FrameType::Hello as u8, bytes)
+    }
+}
+
+impl From<WelcomePayload> for Frame {
+    fn from(payload: WelcomePayload) -> Self {
+        // Infallible encode: WelcomePayload has fixed structure validated at construction.
+        let bytes = payload.encode();
+        Frame::new(FrameType::Welcome as u8, bytes)
+    }
+}
+
+impl From<AuthResponsePayload> for Frame {
+    fn from(payload: AuthResponsePayload) -> Self {
+        // Infallible encode.
+        let bytes = payload.encode();
+        Frame::new(FrameType::AuthResponse as u8, bytes)
+    }
+}
+
+impl From<AuthResultPayload> for Frame {
+    fn from(payload: AuthResultPayload) -> Self {
+        // Infallible encode.
+        let bytes = payload.encode();
+        Frame::new(FrameType::AuthResult as u8, bytes)
+    }
+}
+
+impl From<CreditGrantPayload> for Frame {
+    fn from(payload: CreditGrantPayload) -> Self {
+        // Fallible encode: address length validated at construction time.
+        // Callers must ensure validate() succeeded before converting.
+        let bytes = payload.encode()
+            .expect("CreditGrantPayload must be validated before From<Frame> conversion");
+        Frame::new(FrameType::CreditGrant as u8, bytes)
+    }
+}
+
+impl From<SubscribePayload> for Frame {
+    fn from(payload: SubscribePayload) -> Self {
+        // Fallible encode: address length checked inside.
+        let bytes = payload.encode()
+            .expect("SubscribePayload address length must be within MAX_ADDRESS_LEN");
+        Frame::new(FrameType::Subscribe as u8, bytes)
+    }
+}
+
+impl From<SubscribeAckPayload> for Frame {
+    fn from(payload: SubscribeAckPayload) -> Self {
+        let bytes = payload.encode().expect("SubscribeAck payload must be consistent"); 
+        Frame::new(FrameType::SubscribeAck as u8, bytes)   
+    }
+}
+
+impl From<UnsubscribePayload> for Frame {
+    fn from(payload: UnsubscribePayload) -> Self {
+        // Fallible encode: address length checked inside.
+        let bytes = payload.encode()
+            .expect("UnsubscribePayload address length must be within MAX_ADDRESS_LEN");
+        Frame::new(FrameType::Unsubscribe as u8, bytes)
+    }
+}
+
+impl<'a> From<DataPayload<'a>> for Frame {
+    fn from(payload: DataPayload<'a>) -> Self {
+        // In debug builds, enforce validation to catch protocol violations early.
+        // In release builds, trust the caller to have validated before conversion
+        // to avoid redundant checks on the hot path.
+        #[cfg(debug_assertions)]
+        payload.validate()
+            .expect("DataPayload must pass validate() before From<Frame> conversion");
+
+        // encode_validated() is safe to call in release if the caller guarantees validity.
+        // In debug, it may additionally assert internal consistency.
+        let bytes = payload.encode_validated();
+        Frame::data(bytes)
     }
 }
 
